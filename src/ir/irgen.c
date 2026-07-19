@@ -83,16 +83,52 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         i->dst = new_temp(fn);
         return i->dst;
     }
+    case EXPR_NEG:
+    case EXPR_BNOT: {
+        int v = gen_expr(fn, e->rhs);
+        struct ir_ins *i = emit(fn);
+        i->op = e->kind == EXPR_NEG ? IR_NEG : IR_BNOT;
+        i->a = v;
+        i->dst = new_temp(fn);
+        return i->dst;
+    }
+    case EXPR_INCDEC: {
+        int old = -1;
+        if (e->is_post) {
+            struct ir_ins *save = emit(fn); /* keep the pre-value */
+            save->op = IR_MOV;
+            save->a = e->var_index;
+            save->dst = old = new_temp(fn);
+        }
+        int d = new_temp(fn);
+        emit_const(fn, d, e->delta);
+        struct ir_ins *i = emit(fn);
+        i->op = IR_ADD;
+        i->a = e->var_index;
+        i->b = d;
+        i->dst = e->var_index;
+        return e->is_post ? old : e->var_index;
+    }
     case EXPR_BINOP:
         switch (e->op) {
         case B_ADD:
         case B_SUB:
-        case B_MUL: {
+        case B_MUL:
+        case B_DIV:
+        case B_MOD:
+        case B_AND:
+        case B_OR:
+        case B_XOR:
+        case B_SHL:
+        case B_SHR: {
+            static const enum ir_op map[] = {
+                IR_ADD, IR_SUB, IR_MUL, IR_DIV, IR_MOD,
+                IR_AND, IR_OR, IR_XOR, IR_SHL, IR_SHR,
+            };
             int a = gen_expr(fn, e->lhs);
             int b = gen_expr(fn, e->rhs);
             struct ir_ins *i = emit(fn);
-            i->op = e->op == B_ADD ? IR_ADD :
-                    e->op == B_SUB ? IR_SUB : IR_MUL;
+            i->op = map[e->op - B_ADD];
             i->a = a;
             i->b = b;
             i->dst = new_temp(fn);
@@ -176,10 +212,23 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     return -1; /* unreachable; every kind returns above */
 }
 
-static void gen_stmt(struct ir_func *fn, struct stmt *s)
+/* Innermost enclosing loop's exit and continue targets; sema already
+ * rejected break/continue outside any loop. */
+struct loopctx {
+    int brk, cont;
+};
+
+static void gen_stmt(struct ir_func *fn, struct stmt *s,
+                     const struct loopctx *loop)
 {
     for (; s; s = s->next) {
         switch (s->kind) {
+        case STMT_BREAK:
+            emit_jmp(fn, loop->brk);
+            break;
+        case STMT_CONTINUE:
+            emit_jmp(fn, loop->cont);
+            break;
         case STMT_DECL:
             if (s->expr) {
                 int v = gen_expr(fn, s->expr);
@@ -203,12 +252,12 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s)
             int l_else = new_label(fn);
             int c = gen_expr(fn, s->cond);
             emit_brz(fn, c, l_else);
-            gen_stmt(fn, s->thn);
+            gen_stmt(fn, s->thn, loop);
             if (s->els) {
                 int l_end = new_label(fn);
                 emit_jmp(fn, l_end);
                 emit_label(fn, l_else);
-                gen_stmt(fn, s->els);
+                gen_stmt(fn, s->els, loop);
                 emit_label(fn, l_end);
             } else {
                 emit_label(fn, l_else);
@@ -216,33 +265,41 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s)
             break;
         }
         case STMT_WHILE: {
-            int l_cond = new_label(fn);
-            int l_end = new_label(fn);
-            emit_label(fn, l_cond);
+            struct loopctx lc;
+            lc.cont = new_label(fn); /* while: continue re-tests */
+            lc.brk = new_label(fn);
+            emit_label(fn, lc.cont);
             int c = gen_expr(fn, s->cond);
-            emit_brz(fn, c, l_end);
-            gen_stmt(fn, s->body);
-            emit_jmp(fn, l_cond);
-            emit_label(fn, l_end);
+            emit_brz(fn, c, lc.brk);
+            gen_stmt(fn, s->body, &lc);
+            emit_jmp(fn, lc.cont);
+            emit_label(fn, lc.brk);
             break;
         }
         case STMT_FOR: {
+            /* for: continue jumps to the STEP, not the condition —
+             * the classic off-by-one loop bug, pinned by a test. */
             int l_cond = new_label(fn);
-            int l_end = new_label(fn);
+            struct loopctx lc;
+            lc.cont = new_label(fn);
+            lc.brk = new_label(fn);
             if (s->init)
                 gen_expr(fn, s->init);
             emit_label(fn, l_cond);
-            int c = gen_expr(fn, s->cond);
-            emit_brz(fn, c, l_end);
-            gen_stmt(fn, s->body);
+            if (s->cond) { /* NULL = forever, left by break */
+                int c = gen_expr(fn, s->cond);
+                emit_brz(fn, c, lc.brk);
+            }
+            gen_stmt(fn, s->body, &lc);
+            emit_label(fn, lc.cont);
             if (s->step)
                 gen_expr(fn, s->step);
             emit_jmp(fn, l_cond);
-            emit_label(fn, l_end);
+            emit_label(fn, lc.brk);
             break;
         }
         case STMT_BLOCK:
-            gen_stmt(fn, s->body);
+            gen_stmt(fn, s->body, loop);
             break;
         }
     }
@@ -252,7 +309,7 @@ static void gen_func(struct ir_func *fn, struct func *f)
 {
     fn->src = f;
     fn->nvregs = f->nvars; /* params + locals occupy [0, nvars) */
-    gen_stmt(fn, f->body);
+    gen_stmt(fn, f->body, NULL);
 }
 
 struct ir_unit *irgen(struct unit *u)

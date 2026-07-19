@@ -13,12 +13,15 @@
 #define MAX_PARAMS 6
 
 enum expr_kind { EXPR_NUM, EXPR_VAR, EXPR_BINOP, EXPR_CALL, EXPR_ASSIGN,
-                 EXPR_NOT };
+                 EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
- * never reach codegen as plain binops. Comparisons yield 0/1 ints. */
+ * never reach codegen as plain binops. Comparisons yield 0/1 ints.
+ * Division/modulo truncate toward zero and >> is arithmetic — int is
+ * the only type, and signed is what idiv/sar give. */
 enum binop {
-    B_ADD, B_SUB, B_MUL,
+    B_ADD, B_SUB, B_MUL, B_DIV, B_MOD,
+    B_AND, B_OR, B_XOR, B_SHL, B_SHR,
     B_EQ, B_NE, B_LT, B_LE, B_GT, B_GE,
     B_LAND, B_LOR
 };
@@ -30,14 +33,15 @@ struct expr {
     const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_ASSIGN target */
     int var_index;        /* EXPR_VAR/EXPR_ASSIGN: slot; set by sema */
     enum binop op;        /* EXPR_BINOP */
-    struct expr *lhs, *rhs; /* BINOP; NOT and ASSIGN use rhs only */
+    struct expr *lhs, *rhs; /* BINOP; NOT/NEG/BNOT/ASSIGN use rhs only */
+    int is_post, delta;   /* EXPR_INCDEC: x++/x-- vs ++x/--x, +1/-1 */
     struct expr *args[MAX_PARAMS]; /* EXPR_CALL */
     int nargs;
     struct func *callee;  /* EXPR_CALL: resolved by sema */
 };
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
-                 STMT_FOR, STMT_BLOCK };
+                 STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE };
 
 struct stmt {
     enum stmt_kind kind;

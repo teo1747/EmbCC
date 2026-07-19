@@ -60,6 +60,8 @@ static const struct {
     { "else", TOK_KW_ELSE },
     { "while", TOK_KW_WHILE },
     { "for", TOK_KW_FOR },
+    { "break", TOK_KW_BREAK },
+    { "continue", TOK_KW_CONTINUE },
 };
 
 void lex_next(struct lexer *lx)
@@ -108,6 +110,8 @@ void lex_next(struct lexer *lx)
         return;
     }
 
+    /* Operators that pair with '=' (or double themselves) share one
+     * shape: base, base=, and for some basebase / basebase=. */
     switch (*lx->p) {
     case '(': t->kind = TOK_LPAREN; break;
     case ')': t->kind = TOK_RPAREN; break;
@@ -115,31 +119,59 @@ void lex_next(struct lexer *lx)
     case '}': t->kind = TOK_RBRACE; break;
     case ',': t->kind = TOK_COMMA; break;
     case ';': t->kind = TOK_SEMI; break;
-    case '+': t->kind = TOK_PLUS; break;
-    case '-': t->kind = TOK_MINUS; break;
-    case '*': t->kind = TOK_STAR; break;
+    case '~': t->kind = TOK_TILDE; break;
+    case '+':
+        if (lx->p[1] == '+') { t->kind = TOK_PLUSPLUS; lx->p++; }
+        else if (lx->p[1] == '=') { t->kind = TOK_PLUSEQ; lx->p++; }
+        else t->kind = TOK_PLUS;
+        break;
+    case '-':
+        if (lx->p[1] == '-') { t->kind = TOK_MINUSMINUS; lx->p++; }
+        else if (lx->p[1] == '=') { t->kind = TOK_MINUSEQ; lx->p++; }
+        else t->kind = TOK_MINUS;
+        break;
+    case '*':
+        if (lx->p[1] == '=') { t->kind = TOK_STAREQ; lx->p++; }
+        else t->kind = TOK_STAR;
+        break;
+    case '/':
+        if (lx->p[1] == '=') { t->kind = TOK_SLASHEQ; lx->p++; }
+        else t->kind = TOK_SLASH;
+        break;
+    case '%':
+        if (lx->p[1] == '=') { t->kind = TOK_PERCENTEQ; lx->p++; }
+        else t->kind = TOK_PERCENT;
+        break;
+    case '^':
+        if (lx->p[1] == '=') { t->kind = TOK_CARETEQ; lx->p++; }
+        else t->kind = TOK_CARET;
+        break;
     case '=':
-        if (lx->p[1] == '=') {
-            t->kind = TOK_EQEQ;
-            lx->p++;
-        } else {
-            t->kind = TOK_ASSIGN;
-        }
+        if (lx->p[1] == '=') { t->kind = TOK_EQEQ; lx->p++; }
+        else t->kind = TOK_ASSIGN;
         break;
     case '!':
-        if (lx->p[1] == '=') {
-            t->kind = TOK_NEQ;
-            lx->p++;
-        } else {
-            t->kind = TOK_BANG;
-        }
+        if (lx->p[1] == '=') { t->kind = TOK_NEQ; lx->p++; }
+        else t->kind = TOK_BANG;
+        break;
+    case '&':
+        if (lx->p[1] == '&') { t->kind = TOK_ANDAND; lx->p++; }
+        else if (lx->p[1] == '=') { t->kind = TOK_AMPEQ; lx->p++; }
+        else t->kind = TOK_AMP;
+        break;
+    case '|':
+        if (lx->p[1] == '|') { t->kind = TOK_OROR; lx->p++; }
+        else if (lx->p[1] == '=') { t->kind = TOK_PIPEEQ; lx->p++; }
+        else t->kind = TOK_PIPE;
         break;
     case '<':
-        if (lx->p[1] == '<')
-            diag_fatal(lx->file, lx->line,
-                       "'<<' is not supported yet (bitwise ops come "
-                       "later in M2)");
-        if (lx->p[1] == '=') {
+        if (lx->p[1] == '<' && lx->p[2] == '=') {
+            t->kind = TOK_SHLEQ;
+            lx->p += 2;
+        } else if (lx->p[1] == '<') {
+            t->kind = TOK_SHL;
+            lx->p++;
+        } else if (lx->p[1] == '=') {
             t->kind = TOK_LE;
             lx->p++;
         } else {
@@ -147,32 +179,18 @@ void lex_next(struct lexer *lx)
         }
         break;
     case '>':
-        if (lx->p[1] == '>')
-            diag_fatal(lx->file, lx->line,
-                       "'>>' is not supported yet (bitwise ops come "
-                       "later in M2)");
-        if (lx->p[1] == '=') {
+        if (lx->p[1] == '>' && lx->p[2] == '=') {
+            t->kind = TOK_SHREQ;
+            lx->p += 2;
+        } else if (lx->p[1] == '>') {
+            t->kind = TOK_SHR;
+            lx->p++;
+        } else if (lx->p[1] == '=') {
             t->kind = TOK_GE;
             lx->p++;
         } else {
             t->kind = TOK_GT;
         }
-        break;
-    case '&':
-        if (lx->p[1] != '&')
-            diag_fatal(lx->file, lx->line,
-                       "'&' is not supported yet (bitwise ops and "
-                       "address-of come later in M2)");
-        t->kind = TOK_ANDAND;
-        lx->p++;
-        break;
-    case '|':
-        if (lx->p[1] != '|')
-            diag_fatal(lx->file, lx->line,
-                       "'|' is not supported yet (bitwise ops come "
-                       "later in M2)");
-        t->kind = TOK_OROR;
-        lx->p++;
         break;
     case '#':
         diag_fatal(lx->file, lx->line,
@@ -210,6 +228,8 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_ELSE: return "'else'";
     case TOK_KW_WHILE: return "'while'";
     case TOK_KW_FOR: return "'for'";
+    case TOK_KW_BREAK: return "'break'";
+    case TOK_KW_CONTINUE: return "'continue'";
     case TOK_LPAREN: return "'('";
     case TOK_RPAREN: return "')'";
     case TOK_LBRACE: return "'{'";
@@ -219,6 +239,14 @@ const char *tok_describe(const struct token *t)
     case TOK_PLUS: return "'+'";
     case TOK_MINUS: return "'-'";
     case TOK_STAR: return "'*'";
+    case TOK_SLASH: return "'/'";
+    case TOK_PERCENT: return "'%'";
+    case TOK_AMP: return "'&'";
+    case TOK_PIPE: return "'|'";
+    case TOK_CARET: return "'^'";
+    case TOK_TILDE: return "'~'";
+    case TOK_SHL: return "'<<'";
+    case TOK_SHR: return "'>>'";
     case TOK_ASSIGN: return "'='";
     case TOK_EQEQ: return "'=='";
     case TOK_NEQ: return "'!='";
@@ -229,6 +257,18 @@ const char *tok_describe(const struct token *t)
     case TOK_ANDAND: return "'&&'";
     case TOK_OROR: return "'||'";
     case TOK_BANG: return "'!'";
+    case TOK_PLUSEQ: return "'+='";
+    case TOK_MINUSEQ: return "'-='";
+    case TOK_STAREQ: return "'*='";
+    case TOK_SLASHEQ: return "'/='";
+    case TOK_PERCENTEQ: return "'%='";
+    case TOK_AMPEQ: return "'&='";
+    case TOK_PIPEEQ: return "'|='";
+    case TOK_CARETEQ: return "'^='";
+    case TOK_SHLEQ: return "'<<='";
+    case TOK_SHREQ: return "'>>='";
+    case TOK_PLUSPLUS: return "'++'";
+    case TOK_MINUSMINUS: return "'--'";
     }
     return "?";
 }

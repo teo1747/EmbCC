@@ -25,10 +25,10 @@ static void expect(struct parser *ps, enum tok_kind kind, const char *what)
  * them here turns "'break' is not declared" into an honest "not
  * supported yet". Grows emptier as M2 proceeds. */
 static const char *const reserved_unsupported[] = {
-    "auto", "break", "case", "char", "const", "continue", "default", "do",
-    "double", "enum", "extern", "float", "goto", "long", "register",
-    "short", "signed", "sizeof", "struct", "switch", "typedef", "union",
-    "unsigned", "volatile",
+    "auto", "case", "char", "const", "default", "do", "double", "enum",
+    "extern", "float", "goto", "long", "register", "short", "signed",
+    "sizeof", "struct", "switch", "typedef", "union", "unsigned",
+    "volatile",
 };
 
 static void reject_reserved(struct parser *ps, const char *name, int line)
@@ -96,9 +96,9 @@ static struct expr *parse_primary(struct parser *ps)
         expect(ps, TOK_RPAREN, "')'");
         return e;
     }
-    case TOK_MINUS:
+    case TOK_AMP:
         diag_fatal(ps->lx.file, t->line,
-                   "unary minus is not supported yet; write '0 - x'");
+                   "address-of is not supported yet (no pointers)");
         return NULL;
     default:
         diag_fatal(ps->lx.file, t->line, "expected an expression, got %s",
@@ -107,15 +107,59 @@ static struct expr *parse_primary(struct parser *ps)
     }
 }
 
+static struct expr *incdec(struct parser *ps, struct expr *target,
+                           int line, int is_post, int delta)
+{
+    if (target->kind != EXPR_VAR)
+        diag_fatal(ps->lx.file, line,
+                   "++/-- needs a variable (no other lvalues yet)");
+    struct expr *e = new_expr(EXPR_INCDEC, line);
+    e->name = target->name;
+    e->is_post = is_post;
+    e->delta = delta;
+    return e;
+}
+
 static struct expr *parse_unary(struct parser *ps)
 {
-    if (cur(ps)->kind == TOK_BANG) {
-        struct expr *e = new_expr(EXPR_NOT, cur(ps)->line);
+    struct token *t = cur(ps);
+    struct expr *e;
+
+    switch (t->kind) {
+    case TOK_BANG:
+        e = new_expr(EXPR_NOT, t->line);
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
+    case TOK_MINUS:
+        e = new_expr(EXPR_NEG, t->line);
+        advance(ps);
+        e->rhs = parse_unary(ps);
+        return e;
+    case TOK_TILDE:
+        e = new_expr(EXPR_BNOT, t->line);
+        advance(ps);
+        e->rhs = parse_unary(ps);
+        return e;
+    case TOK_PLUSPLUS:
+    case TOK_MINUSMINUS: {
+        int delta = t->kind == TOK_PLUSPLUS ? 1 : -1;
+        int line = t->line;
+        advance(ps);
+        return incdec(ps, parse_unary(ps), line, 0, delta);
     }
-    return parse_primary(ps);
+    default: {
+        e = parse_primary(ps);
+        while (cur(ps)->kind == TOK_PLUSPLUS ||
+               cur(ps)->kind == TOK_MINUSMINUS) {
+            int delta = cur(ps)->kind == TOK_PLUSPLUS ? 1 : -1;
+            int line = cur(ps)->line;
+            advance(ps);
+            e = incdec(ps, e, line, 1, delta);
+        }
+        return e;
+    }
+    }
 }
 
 static struct expr *binop(enum binop op, struct expr *lhs, struct expr *rhs)
@@ -159,31 +203,65 @@ static struct expr *parse_level(struct parser *ps,
                            (int)(sizeof ops / sizeof ops[0]), tighter);  \
     }
 
-LEVEL(parse_mul, parse_unary, { TOK_STAR, B_MUL })
+/* C's precedence ladder, loosest at the bottom. */
+LEVEL(parse_mul, parse_unary, { TOK_STAR, B_MUL }, { TOK_SLASH, B_DIV },
+      { TOK_PERCENT, B_MOD })
 LEVEL(parse_add, parse_mul, { TOK_PLUS, B_ADD }, { TOK_MINUS, B_SUB })
-LEVEL(parse_rel, parse_add, { TOK_LT, B_LT }, { TOK_LE, B_LE },
+LEVEL(parse_shift, parse_add, { TOK_SHL, B_SHL }, { TOK_SHR, B_SHR })
+LEVEL(parse_rel, parse_shift, { TOK_LT, B_LT }, { TOK_LE, B_LE },
       { TOK_GT, B_GT }, { TOK_GE, B_GE })
 LEVEL(parse_eq, parse_rel, { TOK_EQEQ, B_EQ }, { TOK_NEQ, B_NE })
-LEVEL(parse_land, parse_eq, { TOK_ANDAND, B_LAND })
+LEVEL(parse_band, parse_eq, { TOK_AMP, B_AND })
+LEVEL(parse_bxor, parse_band, { TOK_CARET, B_XOR })
+LEVEL(parse_bor, parse_bxor, { TOK_PIPE, B_OR })
+LEVEL(parse_land, parse_bor, { TOK_ANDAND, B_LAND })
 LEVEL(parse_lor, parse_land, { TOK_OROR, B_LOR })
 
-/* assignment is right-associative and its target must be a variable */
+/* Assignment is right-associative and its target must be a variable.
+ * Compound forms desugar here: a op= b  ==>  a = a op (b). With plain
+ * variables as the only lvalues, evaluating 'a' twice is unobservable,
+ * so the desugaring is exact. */
+static const struct {
+    enum tok_kind tok;
+    enum binop op;
+} compound_assign[] = {
+    { TOK_PLUSEQ, B_ADD },   { TOK_MINUSEQ, B_SUB },
+    { TOK_STAREQ, B_MUL },   { TOK_SLASHEQ, B_DIV },
+    { TOK_PERCENTEQ, B_MOD },{ TOK_AMPEQ, B_AND },
+    { TOK_PIPEEQ, B_OR },    { TOK_CARETEQ, B_XOR },
+    { TOK_SHLEQ, B_SHL },    { TOK_SHREQ, B_SHR },
+};
+
 static struct expr *parse_expr(struct parser *ps)
 {
     struct expr *e = parse_lor(ps);
-    if (cur(ps)->kind == TOK_ASSIGN) {
-        int line = cur(ps)->line;
-        if (e->kind != EXPR_VAR)
-            diag_fatal(ps->lx.file, line,
-                       "assignment target must be a variable "
-                       "(no pointers or array elements yet)");
-        advance(ps);
-        struct expr *a = new_expr(EXPR_ASSIGN, line);
-        a->name = e->name;
+    enum tok_kind k = cur(ps)->kind;
+    int line = cur(ps)->line;
+
+    int comp = -1;
+    for (size_t i = 0;
+         i < sizeof compound_assign / sizeof compound_assign[0]; i++)
+        if (k == compound_assign[i].tok)
+            comp = (int)i;
+
+    if (k != TOK_ASSIGN && comp < 0)
+        return e;
+    if (e->kind != EXPR_VAR)
+        diag_fatal(ps->lx.file, line,
+                   "assignment target must be a variable "
+                   "(no pointers or array elements yet)");
+    advance(ps);
+
+    struct expr *a = new_expr(EXPR_ASSIGN, line);
+    a->name = e->name;
+    if (comp < 0) {
         a->rhs = parse_expr(ps);
-        return a;
+    } else {
+        struct expr *lhs_copy = new_expr(EXPR_VAR, line);
+        lhs_copy->name = e->name;
+        a->rhs = binop(compound_assign[comp].op, lhs_copy, parse_expr(ps));
     }
-    return e;
+    return a;
 }
 
 static struct stmt *new_stmt(enum stmt_kind kind, int line)
@@ -264,16 +342,23 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         if (cur(ps)->kind != TOK_SEMI)
             s->init = parse_expr(ps);
         expect(ps, TOK_SEMI, "';'");
-        if (cur(ps)->kind == TOK_SEMI)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "for-loops need a condition ('for (;;)' has no "
-                       "'break' to leave it yet)");
-        s->cond = parse_expr(ps);
+        if (cur(ps)->kind != TOK_SEMI) /* NULL cond = forever; break exits */
+            s->cond = parse_expr(ps);
         expect(ps, TOK_SEMI, "';'");
         if (cur(ps)->kind != TOK_RPAREN)
             s->step = parse_expr(ps);
         expect(ps, TOK_RPAREN, "')'");
         s->body = parse_controlled(ps);
+        return s;
+    case TOK_KW_BREAK:
+        s = new_stmt(STMT_BREAK, t->line);
+        advance(ps);
+        expect(ps, TOK_SEMI, "';'");
+        return s;
+    case TOK_KW_CONTINUE:
+        s = new_stmt(STMT_CONTINUE, t->line);
+        advance(ps);
+        expect(ps, TOK_SEMI, "';'");
         return s;
     case TOK_KW_INT:
         if (!allow_decl)
@@ -301,7 +386,11 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     case TOK_NUM:
     case TOK_LPAREN:
     case TOK_BANG:
-        /* expression statement: assignment or call */
+    case TOK_MINUS:
+    case TOK_TILDE:
+    case TOK_PLUSPLUS:
+    case TOK_MINUSMINUS:
+        /* expression statement: assignment, call, or ++/-- */
         if (t->kind == TOK_IDENT)
             reject_reserved(ps, t->text, t->line);
         s = new_stmt(STMT_EXPR, t->line);

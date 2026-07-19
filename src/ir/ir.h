@@ -19,6 +19,15 @@ enum ir_op {
     IR_ADD,   /* dst = a + b */
     IR_SUB,   /* dst = a - b */
     IR_MUL,   /* dst = a * b */
+    IR_DIV,   /* dst = a / b   (idiv: truncates toward zero) */
+    IR_MOD,   /* dst = a % b */
+    IR_AND,   /* dst = a & b */
+    IR_OR,    /* dst = a | b */
+    IR_XOR,   /* dst = a ^ b */
+    IR_SHL,   /* dst = a << b */
+    IR_SHR,   /* dst = a >> b  (arithmetic: int is signed) */
+    IR_NEG,   /* dst = -a */
+    IR_BNOT,  /* dst = ~a */
     IR_CMP,   /* dst = (a pred b) as 0/1; pred is B_EQ..B_GE */
     IR_CALL,  /* dst = callee(args...) */
     IR_RET,   /* return a */

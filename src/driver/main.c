@@ -17,15 +17,16 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.2.0-m2.control-flow"
+#define EMBCC_VERSION "0.2.1-m2.operators"
 
 static void print_version(void)
 {
     /* Honest: names what exists and what does not. */
     printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
            EMBCC_VERSION);
-    printf("C subset: int functions, if/else, while, for, comparisons, "
-           "&&/||/!, + - *, assignment, calls within one file; "
+    printf("C subset: int functions, if/else, while, for, break/continue, "
+           "comparisons, &&/||/!, full int arithmetic and bitwise ops, "
+           "assignment incl. compound and ++/--, calls within one file; "
            "compile with -c.\n");
     printf("No preprocessor yet (M2), no linker yet (M3) — "
            "link objects with the existing toolchain.\n");

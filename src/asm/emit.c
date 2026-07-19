@@ -123,11 +123,64 @@ void x86_alu_eax_mem(struct code *c, int op, int disp)
         code_byte(c, 0x0f); /* imul r32, r/m32 */
         code_byte(c, 0xaf);
         break;
+    case '&':
+        code_byte(c, 0x23); /* and r32, r/m32 */
+        break;
+    case '|':
+        code_byte(c, 0x0b); /* or r32, r/m32 */
+        break;
+    case '^':
+        code_byte(c, 0x33); /* xor r32, r/m32 */
+        break;
     default:
         fprintf(stderr, "embcc: internal: no encoding for op '%c'\n", op);
         exit(1);
     }
     modrm_rbp(c, 0, disp);
+}
+
+void x86_cdq(struct code *c) { code_byte(c, 0x99); }
+
+void x86_idiv_mem(struct code *c, int disp)
+{
+    code_byte(c, 0xf7); /* idiv r/m32 is /7 */
+    modrm_rbp(c, 7, disp);
+}
+
+void x86_mov_eax_edx(struct code *c)
+{
+    code_byte(c, 0x89); /* mov eax, edx */
+    code_byte(c, 0xd0);
+}
+
+void x86_mov_ecx_mem(struct code *c, int disp)
+{
+    code_byte(c, 0x8b); /* mov r32, r/m32 */
+    modrm_rbp(c, 1, disp);
+}
+
+void x86_shl_eax_cl(struct code *c)
+{
+    code_byte(c, 0xd3); /* shl r/m32, cl is /4 */
+    code_byte(c, 0xe0);
+}
+
+void x86_sar_eax_cl(struct code *c)
+{
+    code_byte(c, 0xd3); /* sar r/m32, cl is /7 */
+    code_byte(c, 0xf8);
+}
+
+void x86_neg_eax(struct code *c)
+{
+    code_byte(c, 0xf7); /* neg r/m32 is /3 */
+    code_byte(c, 0xd8);
+}
+
+void x86_not_eax(struct code *c)
+{
+    code_byte(c, 0xf7); /* not r/m32 is /2 */
+    code_byte(c, 0xd0);
 }
 
 int x86_call_rel32(struct code *c)

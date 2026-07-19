@@ -32,7 +32,21 @@ void x86_load_arg(struct code *c, int argno, int disp);   /* mov argreg, [rbp+di
 void x86_mov_eax_imm32(struct code *c, long imm);
 void x86_mov_eax_mem(struct code *c, int disp);           /* mov eax, [rbp+disp] */
 void x86_mov_mem_eax(struct code *c, int disp);           /* mov [rbp+disp], eax */
-void x86_alu_eax_mem(struct code *c, int op, int disp);   /* op: '+','-','*' */
+void x86_alu_eax_mem(struct code *c, int op, int disp);   /* '+','-','*','&','|','^' */
+
+/* Signed division: cdq sign-extends eax into edx:eax, idiv leaves the
+ * quotient in eax and the remainder in edx. */
+void x86_cdq(struct code *c);
+void x86_idiv_mem(struct code *c, int disp);              /* idiv dword [rbp+disp] */
+void x86_mov_eax_edx(struct code *c);
+
+/* Shifts take their count in cl; int is signed so >> is sar. */
+void x86_mov_ecx_mem(struct code *c, int disp);
+void x86_shl_eax_cl(struct code *c);
+void x86_sar_eax_cl(struct code *c);
+
+void x86_neg_eax(struct code *c);
+void x86_not_eax(struct code *c);
 
 /* call rel32 with a zero placeholder; returns the offset of the rel32
  * field so the caller can patch it once the target's address is known. */

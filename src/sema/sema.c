@@ -72,8 +72,19 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     }
     case EXPR_NOT:
+    case EXPR_NEG:
+    case EXPR_BNOT:
         check_expr(u, f, sc, e->rhs);
         break;
+    case EXPR_INCDEC: {
+        int i = scope_find(sc, e->name);
+        if (i < 0)
+            diag_fatal(u->file, e->line,
+                       "++/-- on '%s', which is not declared in '%s'",
+                       e->name, f->name);
+        e->var_index = i;
+        break;
+    }
     case EXPR_BINOP:
         check_expr(u, f, sc, e->lhs);
         check_expr(u, f, sc, e->rhs);
@@ -113,10 +124,17 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
  * so the subset stays a subset. Real block scoping arrives with sema's
  * M2 growth. */
 static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
-                       struct stmt *s)
+                       struct stmt *s, int in_loop)
 {
     for (; s; s = s->next) {
         switch (s->kind) {
+        case STMT_BREAK:
+        case STMT_CONTINUE:
+            if (!in_loop)
+                diag_fatal(u->file, s->line,
+                           "'%s' outside of a loop",
+                           s->kind == STMT_BREAK ? "break" : "continue");
+            break;
         case STMT_DECL:
             if (s->expr)
                 check_expr(u, f, sc, s->expr);
@@ -133,24 +151,25 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             break;
         case STMT_IF:
             check_expr(u, f, sc, s->cond);
-            check_stmt(u, f, sc, s->thn);
+            check_stmt(u, f, sc, s->thn, in_loop);
             if (s->els)
-                check_stmt(u, f, sc, s->els);
+                check_stmt(u, f, sc, s->els, in_loop);
             break;
         case STMT_WHILE:
             check_expr(u, f, sc, s->cond);
-            check_stmt(u, f, sc, s->body);
+            check_stmt(u, f, sc, s->body, 1);
             break;
         case STMT_FOR:
             if (s->init)
                 check_expr(u, f, sc, s->init);
-            check_expr(u, f, sc, s->cond);
+            if (s->cond) /* NULL = forever, left by 'break' */
+                check_expr(u, f, sc, s->cond);
             if (s->step)
                 check_expr(u, f, sc, s->step);
-            check_stmt(u, f, sc, s->body);
+            check_stmt(u, f, sc, s->body, 1);
             break;
         case STMT_BLOCK:
-            check_stmt(u, f, sc, s->body);
+            check_stmt(u, f, sc, s->body, in_loop);
             break;
         }
     }
@@ -197,7 +216,7 @@ static void check_func(struct unit *u, struct func *f)
         scope_add(&sc, f->params[i]);
     }
 
-    check_stmt(u, f, &sc, f->body);
+    check_stmt(u, f, &sc, f->body, 0);
 
     if (!list_returns(f->body))
         diag_fatal(u->file, f->line,

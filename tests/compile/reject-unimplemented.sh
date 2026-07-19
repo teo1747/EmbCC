@@ -33,12 +33,18 @@ check() { # name source expected-message-grep
 check switch-stmt \
     'int main(void) { switch (1) { } return 0; }' \
     "not supported"
-check break-stmt \
-    'int main(void) { while (1) { break; } return 0; }' \
+check do-while \
+    'int main(void) { int i = 0; do { i++; } while (i < 3); return 0; }' \
     "not supported"
-check division \
-    'int main(void) { return 84 / 2; }' \
+check ternary \
+    'int main(void) { return 1 ? 42 : 0; }' \
     "not supported"
+check address-of \
+    'int main(void) { int x = 1; return !&x; }' \
+    "address-of is not supported"
+check break-outside-loop \
+    'int main(void) { break; return 0; }' \
+    "outside of a loop"
 check preprocessor \
     '#include <stdio.h>
 int main(void) { return 0; }' \

@@ -21,6 +21,8 @@ enum tok_kind {
     TOK_KW_ELSE,
     TOK_KW_WHILE,
     TOK_KW_FOR,
+    TOK_KW_BREAK,
+    TOK_KW_CONTINUE,
     TOK_LPAREN,
     TOK_RPAREN,
     TOK_LBRACE,
@@ -30,6 +32,14 @@ enum tok_kind {
     TOK_PLUS,
     TOK_MINUS,
     TOK_STAR,
+    TOK_SLASH,
+    TOK_PERCENT,
+    TOK_AMP,
+    TOK_PIPE,
+    TOK_CARET,
+    TOK_TILDE,
+    TOK_SHL,
+    TOK_SHR,
     TOK_ASSIGN,
     TOK_EQEQ,
     TOK_NEQ,
@@ -39,7 +49,20 @@ enum tok_kind {
     TOK_GE,
     TOK_ANDAND,
     TOK_OROR,
-    TOK_BANG
+    TOK_BANG,
+    /* compound assignment; parse desugars 'a op= b' to 'a = a op b' */
+    TOK_PLUSEQ,
+    TOK_MINUSEQ,
+    TOK_STAREQ,
+    TOK_SLASHEQ,
+    TOK_PERCENTEQ,
+    TOK_AMPEQ,
+    TOK_PIPEEQ,
+    TOK_CARETEQ,
+    TOK_SHLEQ,
+    TOK_SHREQ,
+    TOK_PLUSPLUS,
+    TOK_MINUSMINUS
 };
 
 struct token {

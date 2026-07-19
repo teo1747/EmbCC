@@ -78,11 +78,45 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_ADD:
         case IR_SUB:
         case IR_MUL:
+        case IR_AND:
+        case IR_OR:
+        case IR_XOR:
             x86_mov_eax_mem(text, slot_disp(i->a));
             x86_alu_eax_mem(text,
                             i->op == IR_ADD ? '+' :
-                            i->op == IR_SUB ? '-' : '*',
+                            i->op == IR_SUB ? '-' :
+                            i->op == IR_MUL ? '*' :
+                            i->op == IR_AND ? '&' :
+                            i->op == IR_OR ? '|' : '^',
                             slot_disp(i->b));
+            x86_mov_mem_eax(text, slot_disp(i->dst));
+            break;
+        case IR_DIV:
+        case IR_MOD:
+            x86_mov_eax_mem(text, slot_disp(i->a));
+            x86_cdq(text);
+            x86_idiv_mem(text, slot_disp(i->b));
+            if (i->op == IR_MOD)
+                x86_mov_eax_edx(text); /* remainder lives in edx */
+            x86_mov_mem_eax(text, slot_disp(i->dst));
+            break;
+        case IR_SHL:
+        case IR_SHR:
+            x86_mov_eax_mem(text, slot_disp(i->a));
+            x86_mov_ecx_mem(text, slot_disp(i->b));
+            if (i->op == IR_SHL)
+                x86_shl_eax_cl(text);
+            else
+                x86_sar_eax_cl(text);
+            x86_mov_mem_eax(text, slot_disp(i->dst));
+            break;
+        case IR_NEG:
+        case IR_BNOT:
+            x86_mov_eax_mem(text, slot_disp(i->a));
+            if (i->op == IR_NEG)
+                x86_neg_eax(text);
+            else
+                x86_not_eax(text);
             x86_mov_mem_eax(text, slot_disp(i->dst));
             break;
         case IR_CMP:
