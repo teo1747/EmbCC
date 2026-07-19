@@ -57,12 +57,30 @@ check pointer \
     "pointers are not supported"
 check undefined-call \
     'int main(void) { return foo(); }' \
-    "not defined in this file"
+    "not declared"
 check forward-call \
     'static int a(void) { return b(); }
 static int b(void) { return 1; }
 int main(void) { return a(); }' \
-    "before its definition"
+    "before its declaration"
+check proto-arity-mismatch \
+    'int f(int, int);
+int f(int a) { return a; }
+int main(void) { return f(1); }' \
+    "declared with 1 parameter but 2 earlier"
+check static-never-defined \
+    'static int ghost(void);
+int main(void) { return ghost(); }' \
+    "called but never defined"
+check nonstatic-then-static \
+    'int f(void);
+static int f(void) { return 1; }
+int main(void) { return f(); }' \
+    "static declaration of 'f' follows non-static"
+check unnamed-param-in-definition \
+    'int f(int) { return 1; }
+int main(void) { return f(1); }' \
+    "needs a name in a definition"
 check fallthrough \
     'int main(void) { int x = 1; }' \
     "must end in a return"

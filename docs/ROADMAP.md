@@ -12,11 +12,12 @@ was loaded by the EmbLinkOS kernel and exited 0x2A
 whole TARGET_ABI end of the system is validated while the compiler is still
 small enough to change cheaply — which was the entire point of doing M1 before
 a real frontend. M2 is in progress, growing the subset in test-covered
-increments — control flow (if/else, while, for, break/continue) and the full
-int operator set (/ % arithmetic, bitwise, shifts, compound assignment,
-++/--) have landed; next are relocations/externals (the first libc calls),
-then types beyond int, and the preprocessor last, judged against newlib's
-headers.
+increments — control flow, the full int operator set, and now prototypes +
+external calls: objects carry R_X86_64_PLT32 relocations against UNDEF
+symbols and an EmbCC program calls putchar through the real linker (output
+diffed against gcc's build). Next: types beyond int (char, pointers,
+arrays — unlocking strings and printf), then globals with .data/.bss, and
+the preprocessor last, judged against newlib's headers.
 
 ---
 

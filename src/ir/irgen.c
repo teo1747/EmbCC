@@ -317,12 +317,16 @@ struct ir_unit *irgen(struct unit *u)
     struct ir_unit *iu = xcalloc(1, sizeof *iu);
     iu->src = u;
 
+    /* Only canonical, defined functions produce code; prototypes of
+     * externals produce symbols and relocations instead (driver). */
     for (struct func *f = u->funcs; f; f = f->next)
-        iu->nfuncs++;
+        if (!f->absorbed && f->has_defn)
+            iu->nfuncs++;
     iu->funcs = xcalloc((size_t)iu->nfuncs, sizeof *iu->funcs);
 
     int n = 0;
     for (struct func *f = u->funcs; f; f = f->next)
-        gen_func(&iu->funcs[n++], f);
+        if (!f->absorbed && f->has_defn)
+            gen_func(&iu->funcs[n++], f);
     return iu;
 }

@@ -21,11 +21,16 @@ for c in tests/exec/*.c; do
         echo "$name: not valid C99 — the M1 subset must stay a strict"
         echo "subset of C, or golden comparisons are impossible"
         exit 1; }
-    "$out_dir/$name.embcc"; a=$?
-    "$out_dir/$name.gcc"; b=$?
+    out_a=$("$out_dir/$name.embcc"); a=$?
+    out_b=$("$out_dir/$name.gcc"); b=$?
     if [ "$a" -ne "$b" ]; then
         echo "$name: embcc exits $a, gcc exits $b"
         exit 1
     fi
-    echo "$name: both exit $a"
+    if [ "$out_a" != "$out_b" ]; then
+        echo "$name: stdout differs between embcc and gcc builds:"
+        printf 'embcc: %s\ngcc:   %s\n' "$out_a" "$out_b"
+        exit 1
+    fi
+    echo "$name: both exit $a, same output"
 done

@@ -29,6 +29,12 @@ int elfw_add_section(struct elfw *w, const char *name, Elf64_Word type,
 int elfw_add_symbol(struct elfw *w, const char *name, Elf64_Addr value,
                     Elf64_Xword size, Elf64_Uchar info, Elf64_Half shndx);
 
+/* Adds a relocation against the section at target_ndx (currently the
+ * writer emits a single .rela.text, so target must be the .text
+ * section). sym is an index from elfw_add_symbol. */
+void elfw_add_rela(struct elfw *w, int target_ndx, Elf64_Addr offset,
+                   int sym, int type, long addend);
+
 /* Writes the ET_REL/EM_X86_64 object. Returns 0, or -1 with a message on
  * stderr. Always emits .symtab/.strtab/.shstrtab after the user sections. */
 int elfw_write(struct elfw *w, const char *path);

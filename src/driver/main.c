@@ -17,7 +17,7 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.2.1-m2.operators"
+#define EMBCC_VERSION "0.2.2-m2.externals"
 
 static void print_version(void)
 {
@@ -26,8 +26,8 @@ static void print_version(void)
            EMBCC_VERSION);
     printf("C subset: int functions, if/else, while, for, break/continue, "
            "comparisons, &&/||/!, full int arithmetic and bitwise ops, "
-           "assignment incl. compound and ++/--, calls within one file; "
-           "compile with -c.\n");
+           "assignment incl. compound and ++/--, prototypes and calls to "
+           "external int functions (PLT32 relocations); compile with -c.\n");
     printf("No preprocessor yet (M2), no linker yet (M3) — "
            "link objects with the existing toolchain.\n");
 }
@@ -96,7 +96,9 @@ static int compile(const char *in, const char *out)
     struct ir_unit *iu = irgen(u);
 
     struct code text = { 0, 0, 0 };
-    codegen_unit(iu, &text);
+    struct extcall *ext;
+    int next;
+    codegen_unit(iu, &text, &ext, &next);
 
     struct elfw *w = elfw_new();
     int text_ndx = elfw_add_section(w, ".text", SHT_PROGBITS,
@@ -107,19 +109,35 @@ static int compile(const char *in, const char *out)
     elfw_add_symbol(w, "", 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_SECTION),
                     (Elf64_Half)text_ndx);
-    /* Locals before globals — the writer enforces the gABI ordering. */
+    /* Locals before globals — the writer enforces the gABI ordering.
+     * Only canonical, defined functions own code. */
     for (struct func *f = u->funcs; f; f = f->next)
-        if (f->is_static)
+        if (!f->absorbed && f->has_defn && f->is_static)
             elfw_add_symbol(w, f->name, (Elf64_Addr)f->code_off,
                             (Elf64_Xword)f->code_len,
                             ELF64_ST_INFO(STB_LOCAL, STT_FUNC),
                             (Elf64_Half)text_ndx);
     for (struct func *f = u->funcs; f; f = f->next)
-        if (!f->is_static)
+        if (!f->absorbed && f->has_defn && !f->is_static)
             elfw_add_symbol(w, f->name, (Elf64_Addr)f->code_off,
                             (Elf64_Xword)f->code_len,
                             ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
                             (Elf64_Half)text_ndx);
+
+    /* Every called external gets one UNDEF symbol, and every call site
+     * a PLT32 relocation against it. addend -4: rel32 is relative to
+     * the END of the call instruction, four bytes past r_offset. */
+    for (int i = 0; i < next; i++) {
+        struct func *callee = ext[i].callee;
+        if (!callee->sym_ndx)
+            callee->sym_ndx =
+                elfw_add_symbol(w, callee->name, 0, 0,
+                                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE),
+                                SHN_UNDEF);
+        elfw_add_rela(w, text_ndx, (Elf64_Addr)ext[i].patch_off,
+                      callee->sym_ndx, R_X86_64_PLT32, -4);
+    }
+    free(ext);
 
     int rc = elfw_write(w, out);
     elfw_free(w);

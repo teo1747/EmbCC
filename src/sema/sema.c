@@ -34,10 +34,12 @@ static int scope_add(struct scope *sc, const char *name)
     return sc->n++;
 }
 
+/* Returns the canonical node for a name: the first declaration, into
+ * which any later definition has been merged. */
 static struct func *find_func(struct unit *u, const char *name)
 {
     for (struct func *f = u->funcs; f; f = f->next)
-        if (strcmp(f->name, name) == 0)
+        if (!f->absorbed && strcmp(f->name, name) == 0)
             return f;
     return NULL;
 }
@@ -93,24 +95,24 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         struct func *callee = find_func(u, e->name);
         if (!callee)
             diag_fatal(u->file, e->line,
-                       "call to '%s', which is not defined in this file — "
-                       "external calls need relocations and arrive later "
-                       "in M2 (see docs/ROADMAP.md)", e->name);
-        /* The subset must stay a strict subset of C99, or programs
-         * EmbCC accepts stop compiling under gcc and every golden
-         * comparison breaks. C99 has no implicit declarations, and
-         * there are no prototypes yet — so definition precedes use. */
+                       "call to '%s', which is not declared — add a "
+                       "prototype ('int %s(...);') or define it first",
+                       e->name, e->name);
+        /* C99 has no implicit declarations; a declaration (prototype
+         * or definition) must precede the call, or the program is not
+         * the strict C99 subset the golden tests hold us to. */
         if (!callee->declared)
             diag_fatal(u->file, e->line,
-                       "call to '%s' before its definition — there are no "
-                       "prototypes yet; define functions before their "
-                       "callers", e->name);
+                       "call to '%s' before its declaration — declare "
+                       "or define functions before their callers",
+                       e->name);
         if (e->nargs != callee->nparams)
             diag_fatal(u->file, e->line,
                        "'%s' takes %d argument%s, called with %d",
                        e->name, callee->nparams,
                        callee->nparams == 1 ? "" : "s", e->nargs);
         e->callee = callee;
+        callee->used = 1;
         for (int i = 0; i < e->nargs; i++)
             check_expr(u, f, sc, e->args[i]);
         break;
@@ -227,17 +229,66 @@ static void check_func(struct unit *u, struct func *f)
     free(sc.names);
 }
 
+/* Merge every later declaration of a name into its first (canonical)
+ * node, so calls resolve to one place whether the definition came
+ * before or after them. C's static rule is kept exactly: static-then-
+ * non-static keeps internal linkage, non-static-then-static is an
+ * error (matching gcc, so the subset stays strict). */
+static void merge_decls(struct unit *u)
+{
+    for (struct func *f = u->funcs; f; f = f->next) {
+        if (f->absorbed)
+            continue;
+        struct func *canon = find_func(u, f->name);
+        if (canon == f) {
+            f->has_defn = f->defined;
+            continue;
+        }
+        if (canon->nparams != f->nparams)
+            diag_fatal(u->file, f->line,
+                       "'%s' declared with %d parameter%s but %d earlier "
+                       "(line %d)", f->name, f->nparams,
+                       f->nparams == 1 ? "" : "s", canon->nparams,
+                       canon->line);
+        if (f->is_static && !canon->is_static)
+            diag_fatal(u->file, f->line,
+                       "static declaration of '%s' follows non-static "
+                       "declaration (line %d)", f->name, canon->line);
+        if (f->defined) {
+            if (canon->has_defn)
+                diag_fatal(u->file, f->line, "redefinition of '%s'",
+                           f->name);
+            canon->has_defn = 1;
+            canon->body = f->body;
+            for (int i = 0; i < f->nparams; i++)
+                canon->params[i] = f->params[i]; /* definition names win */
+        }
+        f->absorbed = 1;
+    }
+}
+
 void sema_check(struct unit *u)
 {
-    for (struct func *f = u->funcs; f; f = f->next)
-        for (struct func *g = f->next; g; g = g->next)
-            if (strcmp(f->name, g->name) == 0)
-                diag_fatal(u->file, g->line, "redefinition of '%s'", f->name);
+    merge_decls(u);
 
+    /* Walk in source order so `declared` mirrors C's rule exactly: a
+     * name is usable from its first declaration on, and a body is
+     * checked at its DEFINITION's position — everything declared above
+     * the definition is in scope inside it, prototype or not. */
     for (struct func *f = u->funcs; f; f = f->next) {
-        /* Declared before its own body is checked: recursion is legal,
-         * exactly as in C, where the declarator precedes the body. */
-        f->declared = 1;
-        check_func(u, f);
+        struct func *canon = find_func(u, f->name);
+        if (canon == f)
+            f->declared = 1;
+        if (f->defined)
+            check_func(u, canon);
     }
+
+    /* An undefined non-static is an external: the linker gets a chance.
+     * An undefined static has no linker to save it — refuse now instead
+     * of emitting an unresolvable object (THE RULE). */
+    for (struct func *f = u->funcs; f; f = f->next)
+        if (!f->absorbed && !f->has_defn && f->is_static && f->used)
+            diag_fatal(u->file, f->line,
+                       "static function '%s' is called but never defined",
+                       f->name);
 }

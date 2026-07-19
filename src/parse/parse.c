@@ -444,16 +444,19 @@ static struct func *parse_func(struct parser *ps)
                            "(int is the only type for now)",
                            tok_describe(cur(ps)));
             advance(ps);
-            if (cur(ps)->kind != TOK_IDENT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "expected a parameter name before %s",
-                           tok_describe(cur(ps)));
             if (f->nparams >= MAX_PARAMS)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "more than %d parameters "
                            "(register args only for now)", MAX_PARAMS);
-            f->params[f->nparams++] = cur(ps)->text;
-            advance(ps);
+            /* The name is optional in a prototype; a definition with a
+             * nameless parameter is rejected below, once we know which
+             * one this is. */
+            if (cur(ps)->kind == TOK_IDENT) {
+                f->params[f->nparams++] = cur(ps)->text;
+                advance(ps);
+            } else {
+                f->params[f->nparams++] = NULL;
+            }
             if (cur(ps)->kind != TOK_COMMA)
                 break;
             advance(ps);
@@ -461,16 +464,21 @@ static struct func *parse_func(struct parser *ps)
     }
     expect(ps, TOK_RPAREN, "')'");
 
-    if (cur(ps)->kind == TOK_SEMI)
-        diag_fatal(ps->lx.file, cur(ps)->line,
-                   "function declarations without a body are not "
-                   "supported yet (every called function is defined "
-                   "in this file, before its callers)");
+    if (cur(ps)->kind == TOK_SEMI) {
+        advance(ps);
+        return f; /* prototype: body stays NULL */
+    }
     if (cur(ps)->kind != TOK_LBRACE)
         diag_fatal(ps->lx.file, cur(ps)->line,
-                   "expected '{' before %s", tok_describe(cur(ps)));
+                   "expected '{' or ';' before %s", tok_describe(cur(ps)));
+    for (int i = 0; i < f->nparams; i++)
+        if (!f->params[i])
+            diag_fatal(ps->lx.file, f->line,
+                       "parameter %d of '%s' needs a name in a "
+                       "definition", i + 1, f->name);
     struct stmt *blk = parse_block(ps);
     f->body = blk->body;
+    f->defined = 1;
     return f;
 }
 

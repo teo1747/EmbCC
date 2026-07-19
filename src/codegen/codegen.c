@@ -41,7 +41,8 @@ static int cc_for(enum binop pred)
 }
 
 static void gen_func(struct ir_func *fn, struct code *text,
-                     struct callsite **sites, int *nsites, int *capsites)
+                     struct callsite **sites, int *nsites, int *capsites,
+                     struct extcall **ext, int *next, int *capext)
 {
     struct func *f = fn->src;
 
@@ -151,14 +152,24 @@ static void gen_func(struct ir_func *fn, struct code *text,
             for (int k = 0; k < i->nargs; k++)
                 x86_load_arg(text, k, slot_disp(i->args[k]));
             int patch = x86_call_rel32(text);
-            if (*nsites == *capsites) {
-                *capsites = *capsites ? *capsites * 2 : 16;
-                *sites = xrealloc(*sites,
-                                  (size_t)*capsites * sizeof **sites);
+            if (i->callee->has_defn) {
+                if (*nsites == *capsites) {
+                    *capsites = *capsites ? *capsites * 2 : 16;
+                    *sites = xrealloc(*sites,
+                                      (size_t)*capsites * sizeof **sites);
+                }
+                (*sites)[*nsites].patch_off = patch;
+                (*sites)[*nsites].target = i->callee;
+                (*nsites)++;
+            } else {
+                if (*next == *capext) {
+                    *capext = *capext ? *capext * 2 : 16;
+                    *ext = xrealloc(*ext, (size_t)*capext * sizeof **ext);
+                }
+                (*ext)[*next].patch_off = patch;
+                (*ext)[*next].callee = i->callee;
+                (*next)++;
             }
-            (*sites)[*nsites].patch_off = patch;
-            (*sites)[*nsites].target = i->callee;
-            (*nsites)++;
             x86_mov_mem_eax(text, slot_disp(i->dst));
             break;
         }
@@ -186,13 +197,18 @@ static void gen_func(struct ir_func *fn, struct code *text,
     f->code_len = text->len - f->code_off;
 }
 
-void codegen_unit(struct ir_unit *iu, struct code *text)
+void codegen_unit(struct ir_unit *iu, struct code *text,
+                  struct extcall **ext, int *next)
 {
     struct callsite *sites = NULL;
     int nsites = 0, capsites = 0;
+    int capext = 0;
 
+    *ext = NULL;
+    *next = 0;
     for (int n = 0; n < iu->nfuncs; n++)
-        gen_func(&iu->funcs[n], text, &sites, &nsites, &capsites);
+        gen_func(&iu->funcs[n], text, &sites, &nsites, &capsites,
+                 ext, next, &capext);
 
     /* All targets are placed now; resolve the intra-unit calls.
      * rel32 is relative to the end of the call instruction. */

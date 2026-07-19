@@ -62,14 +62,22 @@ struct func {
     int line;
     int is_static;
     int nparams;
-    const char *params[MAX_PARAMS];
+    const char *params[MAX_PARAMS]; /* names; NULL in unnamed prototypes */
     struct stmt *body;
+    int defined;          /* parse: THIS node syntactically had a body
+                           * (may be NULL even so: "{ }" — sema rejects
+                           * it for missing return like any other path) */
+    int has_defn;         /* sema, canonical node: a definition exists
+                           * somewhere in the unit */
     struct func *next;    /* unit list, source order */
 
     int nvars;            /* params + locals; set by sema */
-    int declared;         /* sema: definition has been reached */
-    /* codegen bookkeeping: position inside .text */
+    int declared;         /* sema: declaration has been reached */
+    int absorbed;         /* sema: merged into an earlier node — skip */
+    int used;             /* sema: at least one call resolves here */
+    /* codegen bookkeeping: position inside .text (defined funcs only) */
     int code_off, code_len;
+    int sym_ndx;          /* driver: UNDEF symbol index (externals only) */
 };
 
 struct unit {

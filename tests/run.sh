@@ -63,7 +63,7 @@ for c in tests/exec/*.c; do
         bad "$c" "host link failed" "$msg"
         continue
     fi
-    "$exe"
+    "$exe" >/dev/null 2>&1 # golden/agrees-with-gcc.sh diffs the output
     got=$?
     if [ "$got" -eq "$expect" ]; then
         ok "$c (exit $got)"

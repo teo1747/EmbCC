@@ -51,6 +51,9 @@ struct elfw {
     int globals_started; /* set once a non-local is added */
     struct buf strtab;   /* symbol names */
     struct buf shstrtab; /* section names */
+    struct buf rela;     /* array of Elf64_Rela against rela_target */
+    int nrela;
+    int rela_target;     /* section index the relocations apply to */
 };
 
 struct elfw *elfw_new(void)
@@ -81,6 +84,7 @@ void elfw_free(struct elfw *w)
     free(w->symtab.p);
     free(w->strtab.p);
     free(w->shstrtab.p);
+    free(w->rela.p);
     free(w);
 }
 
@@ -140,9 +144,35 @@ static Elf64_Off align_up(Elf64_Off off, Elf64_Xword align)
     return (off + align - 1) & ~(align - 1);
 }
 
+void elfw_add_rela(struct elfw *w, int target_ndx, Elf64_Addr offset,
+                   int sym, int type, long addend)
+{
+    if (w->nrela && w->rela_target != target_ndx) {
+        /* One .rela.text is all the writer speaks today; a second
+         * target section is a writer extension, not a silent merge. */
+        fprintf(stderr, "embcc: elf writer: relocations against two "
+                        "sections are not supported yet\n");
+        exit(1);
+    }
+    w->rela_target = target_ndx;
+    Elf64_Rela r;
+    r.r_offset = offset;
+    r.r_info = ELF64_R_INFO((Elf64_Xword)sym, (Elf64_Xword)type);
+    r.r_addend = addend;
+    buf_append(&w->rela, &r, sizeof r);
+    w->nrela++;
+}
+
 int elfw_write(struct elfw *w, const char *path)
 {
-    /* Materialize the three bookkeeping sections after the user's. */
+    /* Materialize the bookkeeping sections after the user's:
+     * .rela.text first (its sh_link/sh_info are patched below once the
+     * symtab index exists), then .symtab/.strtab/.shstrtab. */
+    int rela_ndx = 0;
+    if (w->nrela)
+        rela_ndx = elfw_add_section(w, ".rela.text", SHT_RELA,
+                                    SHF_INFO_LINK, w->rela.p, w->rela.len,
+                                    8);
     int symtab_ndx = elfw_add_section(w, ".symtab", SHT_SYMTAB, 0,
                                       w->symtab.p, w->symtab.len, 8);
     int strtab_ndx = elfw_add_section(w, ".strtab", SHT_STRTAB, 0,
@@ -162,6 +192,11 @@ int elfw_write(struct elfw *w, const char *path)
     w->sec[symtab_ndx].hdr.sh_link = (Elf64_Word)strtab_ndx;
     w->sec[symtab_ndx].hdr.sh_info = (Elf64_Word)w->nlocal;
     w->sec[symtab_ndx].hdr.sh_entsize = sizeof(Elf64_Sym);
+    if (w->nrela) {
+        w->sec[rela_ndx].hdr.sh_link = (Elf64_Word)symtab_ndx;
+        w->sec[rela_ndx].hdr.sh_info = (Elf64_Word)w->rela_target;
+        w->sec[rela_ndx].hdr.sh_entsize = sizeof(Elf64_Rela);
+    }
 
     /* Lay out: ehdr, section payloads, then the section header table. */
     Elf64_Off off = sizeof(Elf64_Ehdr);

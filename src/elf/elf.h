@@ -60,6 +60,22 @@ typedef struct {
     Elf64_Xword st_size;
 } Elf64_Sym;
 
+typedef struct {
+    Elf64_Addr  r_offset;
+    Elf64_Xword r_info;
+    long long   r_addend;
+} Elf64_Rela;
+
+#define ELF64_R_INFO(sym, type) \
+    (((Elf64_Xword)(sym) << 32) | ((Elf64_Xword)(type) & 0xffffffff))
+
+/* Relocation types EmbCC emits. R_X86_64_PLT32 is what gas/gcc emit
+ * for a call to a global; TARGET_ABI §4a records the expensive fact
+ * that a static link must treat it as a plain PC32 — the EmbLinkOS
+ * linker (TCC patch 0001) and the cross ld both do. */
+#define R_X86_64_PC32  2
+#define R_X86_64_PLT32 4
+
 /* e_ident indices and values */
 #define EI_MAG0       0
 #define EI_MAG1       1
@@ -96,6 +112,7 @@ typedef struct {
 #define SHF_WRITE     0x1
 #define SHF_ALLOC     0x2
 #define SHF_EXECINSTR 0x4
+#define SHF_INFO_LINK 0x40
 
 /* special section indices */
 #define SHN_UNDEF     0
