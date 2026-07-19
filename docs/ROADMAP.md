@@ -5,14 +5,15 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position: M1 built and host-proven; on-OS confirmation pending.**
-`embcc -c` compiles the M1 subset (int functions, + - *, intra-file calls)
-through lex→parse→sema→EmbIR→codegen→ELF in one process. The exit-42 program
-and its siblings compile, link (host cc and cross ld both accept the objects),
-run, and agree with gcc's exit codes; everything outside the subset fails
-loudly with file:line. **What M1's acceptance still requires:** running the
-produced binary on EmbLinkOS itself, linked against the real crt0/newlib —
-the OS is the final judge, not the host (DECISIONS D-005).
+**Current position: M1 COMPLETE — confirmed on the OS 2026-07-20.** The
+exit-42 object compiled by `embcc -c`, linked against the real crt0/newlib,
+was loaded by the EmbLinkOS kernel and exited 0x2A
+(`/data/apps/embcc42/embcc42.elf`, pid 6, `[syscall] exit code=0x2A`). The
+whole TARGET_ABI end of the system is validated while the compiler is still
+small enough to change cheaply — which was the entire point of doing M1 before
+a real frontend. M2 is in progress, growing the subset in test-covered
+increments: control flow first, then operators, relocations/externals, types,
+and the preprocessor last, judged against newlib's headers.
 
 ---
 

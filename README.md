@@ -1,11 +1,10 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
-**Status: M1 — host-proven, awaiting the OS.** The decision record below still
-governs. `embcc -c` compiles a small C subset to genuine x86_64-elf relocatable
-objects — the roadmap's exit-42 program compiles, links, runs, and exits 42 on
-the host, cross-checked against gcc. M1's acceptance closes only when that
-binary runs on EmbLinkOS itself. No preprocessor yet (M2), no linker yet (M3);
-nothing in EmbLinkOS depends on this.
+**Status: M1 complete — EmbLinkOS ran EmbCC's output (exit 42, 2026-07-20).
+M2 in progress.** The decision record below still governs. `embcc -c` compiles
+a growing C subset to genuine x86_64-elf relocatable objects, cross-checked
+against gcc on the host and proven on the OS. No preprocessor yet (M2 brings
+it), no linker yet (M3); nothing in EmbLinkOS depends on this.
 
 EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
 for, and eventually *by*, the OS itself. It is the next ring of ownership after
