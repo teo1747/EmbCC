@@ -160,3 +160,36 @@ prevent.
 
 **Reopens if:** EmbCC ever becomes a serious optimizing compiler with proven
 freestanding support — a decision for a much later year.
+
+---
+
+## D-008 — Target languages: **C, then C++.** No language of our own is planned
+
+**Decided:** 2026-07-20. **Status:** current intent; C++ is unscheduled.
+
+EmbCC's languages are **C** (the M1–M4 path) and, in the long term, **C++**.
+The novel-language direction that VISION.md §4.2 called "the most interesting
+long-term direction" — EmbLink's typed values (records, tables, SQL-nulls) as
+first-class types — is **not planned**. It is demoted from "interesting future"
+to "possible if it ever earns itself"; D-002's ten-lines gate remains the only
+door back in, and nobody is expected to walk through it.
+
+**Why.**
+1. What the OS actually needs is the ability to build the software that exists,
+   and that software is C and C++. The ports story already proved the demand:
+   C++/libstdc++ was ported *before* any native compiler work began, and C++
+   is the wall TCC will never clear — making it the clearest D-006-legitimate
+   capability EmbCC could ever deliver.
+2. A novel language multiplies every cost in this repo — testability against
+   existing compilers disappears, self-hosting gains a second bootstrap
+   problem, and adoption requires rewriting working programs. The payoff was
+   always speculative; stating "not planned" is more honest than leaving it
+   glowing in the vision docs as an implied someday.
+
+**Order still holds:** C++ comes after the C compiler closes the M4 loop, not
+alongside it. It is a frontend-and-sema project of a different size (name
+mangling, overloading, templates, EH/unwinding, a C++ runtime against newlib's
+C-only world) and it gets its own decision record when it becomes concrete.
+
+**Reopens if:** the ten-lines test (D-002) passes convincingly for the typed
+values language — the gate is unchanged, only the expectation is.

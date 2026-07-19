@@ -115,9 +115,10 @@ These are candidates, not commitments, and each needs a stated reason
   `set_fs_base` contract
 - **Dynamic linking output** — would let EmbCC build EmUI/GUI apps
   (TARGET_ABI §4b); TCC reached this only with a patch
-- **C++** — the largest wall TCC will never clear; a different project in size
-- **A language with EmbLink's typed values first-class** — the genuinely
-  differentiated idea, gated on DECISIONS D-002's ten-lines test
+- **C++** — the largest wall TCC will never clear; a different project in
+  size, and now the stated long-term second language (DECISIONS D-008)
+- **A language with EmbLink's typed values first-class** — not planned
+  (DECISIONS D-008); D-002's ten-lines test remains the only gate back in
 - **ELF-superset extensions** — gated on a capability model existing first
   (DECISIONS D-003)
 

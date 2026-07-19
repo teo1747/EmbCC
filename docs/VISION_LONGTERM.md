@@ -18,6 +18,8 @@ and the build system.
 * Support the C language, grown by need (D-002): the subset expands when a real
   program demands it, with "full C" as the limit of that process rather than an
   up-front target.
+* In the long term, **C++** — the second and final planned language (D-008),
+  taken up only after the C compiler closes the M4 loop.
 * Produce well-optimized native executables — *after* correct ones
   (ARCHITECTURE §3: correct-and-slow first; codegen quality is the first honest
   post-M4 reason to prefer EmbCC over TCC).
@@ -57,8 +59,9 @@ Diagnostics comparable to or better than modern compilers:
 * Notes showing where an error originated — including through macro expansion,
   which the newlib headers will exercise hard.
 
-Rich diagnostics for C++ templates belong to a possible C++ frontend — which
-the roadmap honestly calls "a different project in size," not a milestone.
+Rich diagnostics for C++ templates belong to the intended C++ frontend
+(D-008) — which the roadmap honestly calls "a different project in size": a
+goal after the C compiler closes the M4 loop, not a milestone beside it.
 
 ## Optimization framework
 
@@ -161,9 +164,11 @@ Designed so future capabilities land without architectural upheaval:
 
 * Custom optimization passes.
 * Plugin support.
-* Additional language frontends targeting EmbIR — including the genuinely
-  differentiated one: a language with EmbLink's typed values (records, tables,
-  SQL-nulls) as first-class types, still gated on D-002's ten-lines test.
+* Additional language frontends targeting EmbIR — concretely **C++**, the one
+  additional language actually intended (D-008): it is the wall TCC will never
+  clear, and the OS already ports C++ software. A novel language of our own is
+  not planned (D-008 demoted it; D-002's ten-lines test remains the only way
+  back).
 * Whole-program analysis.
 * Incremental compilation.
 * Distributed compilation (note: on-OS this must respect the one-process
