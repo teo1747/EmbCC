@@ -13,6 +13,13 @@ BUILD   := build
 
 SRCS := \
 	src/driver/main.c \
+	src/driver/util.c \
+	src/lex/lex.c \
+	src/parse/parse.c \
+	src/sema/sema.c \
+	src/ir/irgen.c \
+	src/codegen/codegen.c \
+	src/asm/emit.c \
 	src/cpp/predef.c \
 	src/elf/write.c
 
@@ -27,10 +34,9 @@ $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Header dependencies, kept explicit while the tree is this small.
-$(BUILD)/driver/main.o: src/cpp/predef.h src/elf/write.h src/elf/elf.h
-$(BUILD)/cpp/predef.o: src/cpp/predef.h
-$(BUILD)/elf/write.o: src/elf/write.h src/elf/elf.h
+# The tree is small; every object depending on every header is honest
+# enough and cannot go stale (CONTRIBUTING lie #1).
+$(OBJS): $(wildcard src/*/*.h)
 
 test: embcc
 	tests/run.sh

@@ -2,5 +2,6 @@
 
 argv, flags, orchestration — ../../docs/ARCHITECTURE.md §2.
 
-M0 state: `--version`, `--dump-predef`, `--emit-empty-object`, and a loud
-refusal to compile `.c` files (THE RULE). Real orchestration arrives at M1.
+M1 state: `-c FILE.c [-o FILE.o]` runs lex→parse→sema→IR→codegen→ELF
+in-process; `--version`, `--dump-predef`, `--emit-empty-object` remain.
+No linking (M3): invoking without -c is a loud error.

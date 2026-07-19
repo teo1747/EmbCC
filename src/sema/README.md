@@ -1,4 +1,8 @@
 # src/sema
 
-See ../../docs/ARCHITECTURE.md §2 for this phase's responsibility.
-Empty until ROADMAP M0/M1.
+Types, declarations, diagnostics — ../../docs/ARCHITECTURE.md §2.
+
+M1 state: name resolution and the checks that keep the subset a strict
+subset of C99 — definition-before-use (no prototypes yet), arity,
+duplicate names, and control reaching the end of a function (refused,
+never miscompiled).
