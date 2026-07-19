@@ -58,6 +58,7 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 | Doc | What it is |
 |---|---|
 | [docs/VISION.md](docs/VISION.md) | Why a native compiler; the ownership thesis; the own-the-stack vs host-the-world tension |
+| [docs/VISION_LONGTERM.md](docs/VISION_LONGTERM.md) | The post-M4 horizon: compiler infrastructure, tooling, optimization, analysis — each gated by D-006, none scheduled |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions already made, each with its rationale (ADR-style) |
 | [docs/TARGET_ABI.md](docs/TARGET_ABI.md) | **The grounding doc.** The exact EmbLinkOS contract EmbCC must emit — syscalls, crt0, and the precise ELF the in-kernel loader accepts |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
