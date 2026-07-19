@@ -1,0 +1,19 @@
+# build output
+/build/
+*.o
+*.a
+*.elf
+embcc
+embcc-stage1
+embcc-stage2
+
+# test scratch
+/tests/**/out/
+*.log
+*.tmp
+
+# editor / tooling
+compile_commands.json
+.cache/
+*.swp
+.DS_Store
