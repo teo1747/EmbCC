@@ -1,8 +1,9 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
-**Status: DESIGN. No code yet.** This repository currently holds the decision
-record for a project we will build later. Nothing here is running, and nothing
-in EmbLinkOS depends on it.
+**Status: M0 — scaffolding.** The decision record below still governs; code now
+exists up to ROADMAP M0: a Makefile, a test runner, the ELF writer skeleton and
+the predefined-macro table, with `make && make test` green on the host. Nothing
+compiles C yet, and nothing in EmbLinkOS depends on this.
 
 EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
 for, and eventually *by*, the OS itself. It is the next ring of ownership after

@@ -1,0 +1,41 @@
+# EmbCC — host build (ROADMAP M0: EmbCC is a host program at this stage).
+#
+# Plain make on purpose: the eventual on-OS build goes through EmbBuild
+# (ROADMAP M4), so nothing here may grow host-only cleverness the manifest
+# could not express.
+#
+# -std=c99: self-hosting constrains the source to the subset EmbCC will
+# implement (ARCHITECTURE.md §7). Keep it buildable by a strict C99 compiler.
+
+CC      ?= cc
+CFLAGS  ?= -std=c99 -Wall -Wextra -Werror -g
+BUILD   := build
+
+SRCS := \
+	src/driver/main.c \
+	src/cpp/predef.c \
+	src/elf/write.c
+
+OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
+
+all: embcc
+
+embcc: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS)
+
+$(BUILD)/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Header dependencies, kept explicit while the tree is this small.
+$(BUILD)/driver/main.o: src/cpp/predef.h src/elf/write.h src/elf/elf.h
+$(BUILD)/cpp/predef.o: src/cpp/predef.h
+$(BUILD)/elf/write.o: src/elf/write.h src/elf/elf.h
+
+test: embcc
+	tests/run.sh
+
+clean:
+	rm -rf $(BUILD) embcc
+
+.PHONY: all test clean
