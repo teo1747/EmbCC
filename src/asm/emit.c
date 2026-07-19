@@ -137,3 +137,42 @@ int x86_call_rel32(struct code *c)
     code_u32(c, 0);
     return off;
 }
+
+void x86_cmp_eax_mem(struct code *c, int disp)
+{
+    code_byte(c, 0x3b); /* cmp r32, r/m32 */
+    modrm_rbp(c, 0, disp);
+}
+
+void x86_setcc_eax(struct code *c, int cc)
+{
+    code_byte(c, 0x0f); /* setcc al */
+    code_byte(c, cc);
+    code_byte(c, 0xc0);
+    code_byte(c, 0x0f); /* movzx eax, al */
+    code_byte(c, 0xb6);
+    code_byte(c, 0xc0);
+}
+
+void x86_test_eax(struct code *c)
+{
+    code_byte(c, 0x85); /* test r/m32, r32 */
+    code_byte(c, 0xc0);
+}
+
+int x86_jz_rel32(struct code *c)
+{
+    code_byte(c, 0x0f); /* jz rel32 */
+    code_byte(c, 0x84);
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
+int x86_jmp_rel32(struct code *c)
+{
+    code_byte(c, 0xe9); /* jmp rel32 */
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}

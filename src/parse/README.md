@@ -2,6 +2,8 @@
 
 C subset → AST — ../../docs/ARCHITECTURE.md §2.
 
-M1 state: functions of int with int params (≤6), local declarations,
-return, + - * with precedence and parens, calls. Recursive descent;
-first error is fatal with file:line.
+State: functions of int with int params (≤6), declarations, return,
+if/else, while, for, blocks, assignment, full binary precedence chain
+(|| && == rel + *) with parens and !. Recursive descent; first error
+is fatal with file:line; reserved C words it cannot handle are named
+in the diagnostic.

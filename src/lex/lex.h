@@ -17,6 +17,10 @@ enum tok_kind {
     TOK_KW_VOID,
     TOK_KW_RETURN,
     TOK_KW_STATIC,
+    TOK_KW_IF,
+    TOK_KW_ELSE,
+    TOK_KW_WHILE,
+    TOK_KW_FOR,
     TOK_LPAREN,
     TOK_RPAREN,
     TOK_LBRACE,
@@ -26,7 +30,16 @@ enum tok_kind {
     TOK_PLUS,
     TOK_MINUS,
     TOK_STAR,
-    TOK_ASSIGN
+    TOK_ASSIGN,
+    TOK_EQEQ,
+    TOK_NEQ,
+    TOK_LT,
+    TOK_GT,
+    TOK_LE,
+    TOK_GE,
+    TOK_ANDAND,
+    TOK_OROR,
+    TOK_BANG
 };
 
 struct token {

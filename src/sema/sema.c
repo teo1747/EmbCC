@@ -1,8 +1,8 @@
-/* Name resolution and the checks the M1 subset needs. Everything is
- * int, so there is no type inference to do — what remains is exactly
- * the set of ways a program could silently lie: unknown names, arity
- * mismatches, calls that would need a relocation (externals), and
- * control flow falling off the end of a function.
+/* Name resolution and the checks the subset needs. Everything is int,
+ * so there is no type inference to do — what remains is exactly the set
+ * of ways a program could silently lie: unknown names, arity mismatches,
+ * calls that would need a relocation (externals), and control flow
+ * falling off the end of a function.
  */
 #include "sema.h"
 
@@ -54,13 +54,26 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             if (find_func(u, e->name))
                 diag_fatal(u->file, e->line,
                            "'%s' is a function; taking its address is "
-                           "not supported (M1 subset)", e->name);
+                           "not supported yet", e->name);
             diag_fatal(u->file, e->line,
                        "'%s' is not declared in '%s'", e->name, f->name);
         }
         e->var_index = i;
         break;
     }
+    case EXPR_ASSIGN: {
+        int i = scope_find(sc, e->name);
+        if (i < 0)
+            diag_fatal(u->file, e->line,
+                       "assignment to '%s', which is not declared in '%s'",
+                       e->name, f->name);
+        e->var_index = i;
+        check_expr(u, f, sc, e->rhs);
+        break;
+    }
+    case EXPR_NOT:
+        check_expr(u, f, sc, e->rhs);
+        break;
     case EXPR_BINOP:
         check_expr(u, f, sc, e->lhs);
         check_expr(u, f, sc, e->rhs);
@@ -70,17 +83,17 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (!callee)
             diag_fatal(u->file, e->line,
                        "call to '%s', which is not defined in this file — "
-                       "external calls need relocations and arrive after "
-                       "M1 (see docs/ROADMAP.md)", e->name);
-        /* The M1 subset must stay a strict subset of C99, or programs
+                       "external calls need relocations and arrive later "
+                       "in M2 (see docs/ROADMAP.md)", e->name);
+        /* The subset must stay a strict subset of C99, or programs
          * EmbCC accepts stop compiling under gcc and every golden
-         * comparison breaks. C99 has no implicit declarations, and M1
-         * has no prototypes — so definition must precede use. */
+         * comparison breaks. C99 has no implicit declarations, and
+         * there are no prototypes yet — so definition precedes use. */
         if (!callee->declared)
             diag_fatal(u->file, e->line,
-                       "call to '%s' before its definition — M1 has no "
-                       "prototypes; define functions before their callers",
-                       e->name);
+                       "call to '%s' before its definition — there are no "
+                       "prototypes yet; define functions before their "
+                       "callers", e->name);
         if (e->nargs != callee->nparams)
             diag_fatal(u->file, e->line,
                        "'%s' takes %d argument%s, called with %d",
@@ -92,6 +105,84 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     }
     }
+}
+
+/* Declarations anywhere in the function share one flat scope, and
+ * shadowing is rejected outright. C gives inner blocks their own scope;
+ * refusing shadowed names accepts strictly fewer programs than C does,
+ * so the subset stays a subset. Real block scoping arrives with sema's
+ * M2 growth. */
+static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
+                       struct stmt *s)
+{
+    for (; s; s = s->next) {
+        switch (s->kind) {
+        case STMT_DECL:
+            if (s->expr)
+                check_expr(u, f, sc, s->expr);
+            if (scope_find(sc, s->name) >= 0)
+                diag_fatal(u->file, s->line,
+                           "'%s' is already declared in '%s' (one flat "
+                           "scope per function for now — rename it)",
+                           s->name, f->name);
+            s->var_index = scope_add(sc, s->name);
+            break;
+        case STMT_RETURN:
+        case STMT_EXPR:
+            check_expr(u, f, sc, s->expr);
+            break;
+        case STMT_IF:
+            check_expr(u, f, sc, s->cond);
+            check_stmt(u, f, sc, s->thn);
+            if (s->els)
+                check_stmt(u, f, sc, s->els);
+            break;
+        case STMT_WHILE:
+            check_expr(u, f, sc, s->cond);
+            check_stmt(u, f, sc, s->body);
+            break;
+        case STMT_FOR:
+            if (s->init)
+                check_expr(u, f, sc, s->init);
+            check_expr(u, f, sc, s->cond);
+            if (s->step)
+                check_expr(u, f, sc, s->step);
+            check_stmt(u, f, sc, s->body);
+            break;
+        case STMT_BLOCK:
+            check_stmt(u, f, sc, s->body);
+            break;
+        }
+    }
+}
+
+/* Conservative all-paths-return: a list returns if any statement in it
+ * guarantees a return (whatever follows is unreachable); if/else
+ * guarantees one only when both arms do; loops never do (the condition
+ * may be false on entry). Refusing a maybe-missing return is honest —
+ * miscompiling one is not (THE RULE). */
+static int list_returns(struct stmt *s);
+
+static int stmt_returns(struct stmt *s)
+{
+    switch (s->kind) {
+    case STMT_RETURN:
+        return 1;
+    case STMT_BLOCK:
+        return list_returns(s->body);
+    case STMT_IF:
+        return s->els && stmt_returns(s->thn) && stmt_returns(s->els);
+    default:
+        return 0;
+    }
+}
+
+static int list_returns(struct stmt *s)
+{
+    for (; s; s = s->next)
+        if (stmt_returns(s))
+            return 1;
+    return 0;
 }
 
 static void check_func(struct unit *u, struct func *f)
@@ -106,31 +197,12 @@ static void check_func(struct unit *u, struct func *f)
         scope_add(&sc, f->params[i]);
     }
 
-    struct stmt *last = NULL;
-    for (struct stmt *s = f->body; s; s = s->next) {
-        last = s;
-        switch (s->kind) {
-        case STMT_DECL:
-            if (s->expr)
-                check_expr(u, f, &sc, s->expr);
-            if (scope_find(&sc, s->name) >= 0)
-                diag_fatal(u->file, s->line,
-                           "'%s' is already declared in '%s'",
-                           s->name, f->name);
-            s->var_index = scope_add(&sc, s->name);
-            break;
-        case STMT_RETURN:
-            check_expr(u, f, &sc, s->expr);
-            break;
-        }
-    }
+    check_stmt(u, f, &sc, f->body);
 
-    /* All functions return int; falling off the end would return
-     * whatever is in eax. Refuse rather than miscompile (THE RULE). */
-    if (!last || last->kind != STMT_RETURN)
+    if (!list_returns(f->body))
         diag_fatal(u->file, f->line,
-                   "control reaches the end of '%s' — every function "
-                   "must end in a return statement (M1 subset)", f->name);
+                   "control may reach the end of '%s' — every path must "
+                   "end in a return statement", f->name);
 
     f->nvars = sc.n;
     free(sc.names);

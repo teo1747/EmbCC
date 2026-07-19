@@ -12,29 +12,44 @@
 
 #define MAX_PARAMS 6
 
-enum expr_kind { EXPR_NUM, EXPR_VAR, EXPR_BINOP, EXPR_CALL };
+enum expr_kind { EXPR_NUM, EXPR_VAR, EXPR_BINOP, EXPR_CALL, EXPR_ASSIGN,
+                 EXPR_NOT };
+
+/* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
+ * never reach codegen as plain binops. Comparisons yield 0/1 ints. */
+enum binop {
+    B_ADD, B_SUB, B_MUL,
+    B_EQ, B_NE, B_LT, B_LE, B_GT, B_GE,
+    B_LAND, B_LOR
+};
 
 struct expr {
     enum expr_kind kind;
     int line;
     long num;             /* EXPR_NUM */
-    const char *name;     /* EXPR_VAR, EXPR_CALL */
-    int var_index;        /* EXPR_VAR: slot in the function; set by sema */
-    int op;               /* EXPR_BINOP: '+', '-', '*' */
-    struct expr *lhs, *rhs;
+    const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_ASSIGN target */
+    int var_index;        /* EXPR_VAR/EXPR_ASSIGN: slot; set by sema */
+    enum binop op;        /* EXPR_BINOP */
+    struct expr *lhs, *rhs; /* BINOP; NOT and ASSIGN use rhs only */
     struct expr *args[MAX_PARAMS]; /* EXPR_CALL */
     int nargs;
     struct func *callee;  /* EXPR_CALL: resolved by sema */
 };
 
-enum stmt_kind { STMT_RETURN, STMT_DECL };
+enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
+                 STMT_FOR, STMT_BLOCK };
 
 struct stmt {
     enum stmt_kind kind;
     int line;
     const char *name;     /* STMT_DECL */
     int var_index;        /* STMT_DECL: set by sema */
-    struct expr *expr;    /* return value / initializer (DECL: may be NULL) */
+    struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
+    struct expr *cond;    /* IF/WHILE/FOR */
+    struct expr *init, *step; /* FOR: either may be NULL */
+    struct stmt *thn, *els;   /* IF: els may be NULL */
+    struct stmt *body;    /* WHILE/FOR: the controlled statement;
+                           * BLOCK: the child list */
     struct stmt *next;
 };
 

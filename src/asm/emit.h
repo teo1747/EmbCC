@@ -38,4 +38,16 @@ void x86_alu_eax_mem(struct code *c, int op, int disp);   /* op: '+','-','*' */
  * field so the caller can patch it once the target's address is known. */
 int x86_call_rel32(struct code *c);
 
+/* Comparisons: cmp eax with a slot, then set al by condition and
+ * zero-extend, leaving 0/1 in eax. cc is the x86 condition nibble
+ * carrier (0x94 sete .. 0x9f setg), chosen by codegen. */
+void x86_cmp_eax_mem(struct code *c, int disp);
+void x86_setcc_eax(struct code *c, int cc);
+
+/* Branches: test eax,eax; jz/jmp with a zero rel32 placeholder —
+ * both return the patch offset, resolved per-function by codegen. */
+void x86_test_eax(struct code *c);
+int x86_jz_rel32(struct code *c);
+int x86_jmp_rel32(struct code *c);
+
 #endif

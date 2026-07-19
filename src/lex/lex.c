@@ -56,6 +56,10 @@ static const struct {
     { "void", TOK_KW_VOID },
     { "return", TOK_KW_RETURN },
     { "static", TOK_KW_STATIC },
+    { "if", TOK_KW_IF },
+    { "else", TOK_KW_ELSE },
+    { "while", TOK_KW_WHILE },
+    { "for", TOK_KW_FOR },
 };
 
 void lex_next(struct lexer *lx)
@@ -77,8 +81,7 @@ void lex_next(struct lexer *lx)
         long v = strtol(lx->p, &end, 0);
         if (isalpha((unsigned char)*end) || *end == '_' || *end == '.')
             diag_fatal(lx->file, lx->line,
-                       "only plain integer constants are supported "
-                       "(M1 subset)");
+                       "only plain integer constants are supported yet");
         if (v < INT_MIN || v > INT_MAX)
             diag_fatal(lx->file, lx->line,
                        "integer constant out of range for int");
@@ -116,10 +119,60 @@ void lex_next(struct lexer *lx)
     case '-': t->kind = TOK_MINUS; break;
     case '*': t->kind = TOK_STAR; break;
     case '=':
-        if (lx->p[1] == '=')
+        if (lx->p[1] == '=') {
+            t->kind = TOK_EQEQ;
+            lx->p++;
+        } else {
+            t->kind = TOK_ASSIGN;
+        }
+        break;
+    case '!':
+        if (lx->p[1] == '=') {
+            t->kind = TOK_NEQ;
+            lx->p++;
+        } else {
+            t->kind = TOK_BANG;
+        }
+        break;
+    case '<':
+        if (lx->p[1] == '<')
             diag_fatal(lx->file, lx->line,
-                       "'==' is not supported (M1 subset has no comparisons)");
-        t->kind = TOK_ASSIGN;
+                       "'<<' is not supported yet (bitwise ops come "
+                       "later in M2)");
+        if (lx->p[1] == '=') {
+            t->kind = TOK_LE;
+            lx->p++;
+        } else {
+            t->kind = TOK_LT;
+        }
+        break;
+    case '>':
+        if (lx->p[1] == '>')
+            diag_fatal(lx->file, lx->line,
+                       "'>>' is not supported yet (bitwise ops come "
+                       "later in M2)");
+        if (lx->p[1] == '=') {
+            t->kind = TOK_GE;
+            lx->p++;
+        } else {
+            t->kind = TOK_GT;
+        }
+        break;
+    case '&':
+        if (lx->p[1] != '&')
+            diag_fatal(lx->file, lx->line,
+                       "'&' is not supported yet (bitwise ops and "
+                       "address-of come later in M2)");
+        t->kind = TOK_ANDAND;
+        lx->p++;
+        break;
+    case '|':
+        if (lx->p[1] != '|')
+            diag_fatal(lx->file, lx->line,
+                       "'|' is not supported yet (bitwise ops come "
+                       "later in M2)");
+        t->kind = TOK_OROR;
+        lx->p++;
         break;
     case '#':
         diag_fatal(lx->file, lx->line,
@@ -129,12 +182,11 @@ void lex_next(struct lexer *lx)
     case '"':
     case '\'':
         diag_fatal(lx->file, lx->line,
-                   "string and character literals are not supported "
-                   "(M1 subset)");
+                   "string and character literals are not supported yet");
         break;
     default:
         diag_fatal(lx->file, lx->line,
-                   "character '%c' is not part of the M1 subset", *lx->p);
+                   "character '%c' is not supported yet", *lx->p);
     }
     lx->p++;
 }
@@ -154,6 +206,10 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_VOID: return "'void'";
     case TOK_KW_RETURN: return "'return'";
     case TOK_KW_STATIC: return "'static'";
+    case TOK_KW_IF: return "'if'";
+    case TOK_KW_ELSE: return "'else'";
+    case TOK_KW_WHILE: return "'while'";
+    case TOK_KW_FOR: return "'for'";
     case TOK_LPAREN: return "'('";
     case TOK_RPAREN: return "')'";
     case TOK_LBRACE: return "'{'";
@@ -164,6 +220,15 @@ const char *tok_describe(const struct token *t)
     case TOK_MINUS: return "'-'";
     case TOK_STAR: return "'*'";
     case TOK_ASSIGN: return "'='";
+    case TOK_EQEQ: return "'=='";
+    case TOK_NEQ: return "'!='";
+    case TOK_LT: return "'<'";
+    case TOK_GT: return "'>'";
+    case TOK_LE: return "'<='";
+    case TOK_GE: return "'>='";
+    case TOK_ANDAND: return "'&&'";
+    case TOK_OROR: return "'||'";
+    case TOK_BANG: return "'!'";
     }
     return "?";
 }

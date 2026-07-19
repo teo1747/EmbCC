@@ -1,6 +1,7 @@
 #include "parse.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "../driver/util.h"
 #include "../lex/lex.h"
@@ -18,6 +19,27 @@ static void expect(struct parser *ps, enum tok_kind kind, const char *what)
         diag_fatal(ps->lx.file, cur(ps)->line, "expected %s before %s",
                    what, tok_describe(cur(ps)));
     advance(ps);
+}
+
+/* C keywords the subset does not implement lex as identifiers; naming
+ * them here turns "'break' is not declared" into an honest "not
+ * supported yet". Grows emptier as M2 proceeds. */
+static const char *const reserved_unsupported[] = {
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "enum", "extern", "float", "goto", "long", "register",
+    "short", "signed", "sizeof", "struct", "switch", "typedef", "union",
+    "unsigned", "volatile",
+};
+
+static void reject_reserved(struct parser *ps, const char *name, int line)
+{
+    for (size_t i = 0;
+         i < sizeof reserved_unsupported / sizeof reserved_unsupported[0];
+         i++)
+        if (strcmp(reserved_unsupported[i], name) == 0)
+            diag_fatal(ps->lx.file, line,
+                       "'%s' is not supported yet (see docs/ROADMAP.md M2)",
+                       name);
 }
 
 static struct expr *new_expr(enum expr_kind kind, int line)
@@ -49,6 +71,7 @@ static struct expr *parse_primary(struct parser *ps)
     case TOK_IDENT: {
         const char *name = t->text;
         int line = t->line;
+        reject_reserved(ps, name, line);
         advance(ps);
         if (cur(ps)->kind != TOK_LPAREN) {
             e = new_expr(EXPR_VAR, line);
@@ -63,8 +86,7 @@ static struct expr *parse_primary(struct parser *ps)
                 if (e->nargs >= MAX_PARAMS)
                     diag_fatal(ps->lx.file, cur(ps)->line,
                                "more than %d call arguments "
-                               "(M1 subset: register args only)",
-                               MAX_PARAMS);
+                               "(register args only for now)", MAX_PARAMS);
                 e->args[e->nargs++] = parse_expr(ps);
                 if (cur(ps)->kind != TOK_COMMA)
                     break;
@@ -76,8 +98,7 @@ static struct expr *parse_primary(struct parser *ps)
     }
     case TOK_MINUS:
         diag_fatal(ps->lx.file, t->line,
-                   "unary minus is not supported (M1 subset); "
-                   "write '0 - x'");
+                   "unary minus is not supported yet; write '0 - x'");
         return NULL;
     default:
         diag_fatal(ps->lx.file, t->line, "expected an expression, got %s",
@@ -86,57 +107,188 @@ static struct expr *parse_primary(struct parser *ps)
     }
 }
 
-static struct expr *parse_mul(struct parser *ps)
+static struct expr *parse_unary(struct parser *ps)
 {
-    struct expr *e = parse_primary(ps);
-    while (cur(ps)->kind == TOK_STAR) {
-        struct expr *b = new_expr(EXPR_BINOP, cur(ps)->line);
+    if (cur(ps)->kind == TOK_BANG) {
+        struct expr *e = new_expr(EXPR_NOT, cur(ps)->line);
         advance(ps);
-        b->op = '*';
-        b->lhs = e;
-        b->rhs = parse_primary(ps);
-        e = b;
+        e->rhs = parse_unary(ps);
+        return e;
     }
+    return parse_primary(ps);
+}
+
+static struct expr *binop(enum binop op, struct expr *lhs, struct expr *rhs)
+{
+    struct expr *e = new_expr(EXPR_BINOP, lhs->line);
+    e->op = op;
+    e->lhs = lhs;
+    e->rhs = rhs;
     return e;
 }
 
+/* One binary precedence level: while the current token maps to an op in
+ * the table, consume it and parse the next-tighter level. */
+struct oplevel {
+    enum tok_kind tok;
+    enum binop op;
+};
+
+static struct expr *parse_level(struct parser *ps,
+                                const struct oplevel *ops, int nops,
+                                struct expr *(*tighter)(struct parser *))
+{
+    struct expr *e = tighter(ps);
+    for (;;) {
+        int i;
+        for (i = 0; i < nops; i++)
+            if (cur(ps)->kind == ops[i].tok)
+                break;
+        if (i == nops)
+            return e;
+        advance(ps);
+        e = binop(ops[i].op, e, tighter(ps));
+    }
+}
+
+#define LEVEL(name, tighter, ...)                                        \
+    static struct expr *name(struct parser *ps)                          \
+    {                                                                    \
+        static const struct oplevel ops[] = { __VA_ARGS__ };             \
+        return parse_level(ps, ops,                                      \
+                           (int)(sizeof ops / sizeof ops[0]), tighter);  \
+    }
+
+LEVEL(parse_mul, parse_unary, { TOK_STAR, B_MUL })
+LEVEL(parse_add, parse_mul, { TOK_PLUS, B_ADD }, { TOK_MINUS, B_SUB })
+LEVEL(parse_rel, parse_add, { TOK_LT, B_LT }, { TOK_LE, B_LE },
+      { TOK_GT, B_GT }, { TOK_GE, B_GE })
+LEVEL(parse_eq, parse_rel, { TOK_EQEQ, B_EQ }, { TOK_NEQ, B_NE })
+LEVEL(parse_land, parse_eq, { TOK_ANDAND, B_LAND })
+LEVEL(parse_lor, parse_land, { TOK_OROR, B_LOR })
+
+/* assignment is right-associative and its target must be a variable */
 static struct expr *parse_expr(struct parser *ps)
 {
-    struct expr *e = parse_mul(ps);
-    while (cur(ps)->kind == TOK_PLUS || cur(ps)->kind == TOK_MINUS) {
-        struct expr *b = new_expr(EXPR_BINOP, cur(ps)->line);
-        b->op = cur(ps)->kind == TOK_PLUS ? '+' : '-';
+    struct expr *e = parse_lor(ps);
+    if (cur(ps)->kind == TOK_ASSIGN) {
+        int line = cur(ps)->line;
+        if (e->kind != EXPR_VAR)
+            diag_fatal(ps->lx.file, line,
+                       "assignment target must be a variable "
+                       "(no pointers or array elements yet)");
         advance(ps);
-        b->lhs = e;
-        b->rhs = parse_mul(ps);
-        e = b;
+        struct expr *a = new_expr(EXPR_ASSIGN, line);
+        a->name = e->name;
+        a->rhs = parse_expr(ps);
+        return a;
     }
     return e;
 }
 
-static struct stmt *parse_stmt(struct parser *ps)
+static struct stmt *new_stmt(enum stmt_kind kind, int line)
+{
+    struct stmt *s = xcalloc(1, sizeof *s);
+    s->kind = kind;
+    s->line = line;
+    return s;
+}
+
+static struct stmt *parse_stmt(struct parser *ps, int allow_decl);
+
+/* The statement controlled by if/while/for: C99 does not allow a bare
+ * declaration there, and neither do we — that keeps the subset strict. */
+static struct stmt *parse_controlled(struct parser *ps)
+{
+    return parse_stmt(ps, 0);
+}
+
+static struct stmt *parse_block(struct parser *ps)
+{
+    struct stmt *s = new_stmt(STMT_BLOCK, cur(ps)->line);
+    expect(ps, TOK_LBRACE, "'{'");
+    struct stmt **tail = &s->body;
+    while (cur(ps)->kind != TOK_RBRACE) {
+        if (cur(ps)->kind == TOK_EOF)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "unexpected end of file inside a block");
+        *tail = parse_stmt(ps, 1);
+        tail = &(*tail)->next;
+    }
+    advance(ps); /* '}' */
+    return s;
+}
+
+static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
 {
     struct token *t = cur(ps);
-    struct stmt *s = xcalloc(1, sizeof *s);
-    s->line = t->line;
+    struct stmt *s;
 
     switch (t->kind) {
+    case TOK_LBRACE:
+        return parse_block(ps);
     case TOK_KW_RETURN:
+        s = new_stmt(STMT_RETURN, t->line);
         advance(ps);
-        s->kind = STMT_RETURN;
         s->expr = parse_expr(ps);
         expect(ps, TOK_SEMI, "';'");
         return s;
+    case TOK_KW_IF:
+        s = new_stmt(STMT_IF, t->line);
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'('");
+        s->cond = parse_expr(ps);
+        expect(ps, TOK_RPAREN, "')'");
+        s->thn = parse_controlled(ps);
+        if (cur(ps)->kind == TOK_KW_ELSE) {
+            advance(ps);
+            s->els = parse_controlled(ps);
+        }
+        return s;
+    case TOK_KW_WHILE:
+        s = new_stmt(STMT_WHILE, t->line);
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'('");
+        s->cond = parse_expr(ps);
+        expect(ps, TOK_RPAREN, "')'");
+        s->body = parse_controlled(ps);
+        return s;
+    case TOK_KW_FOR:
+        s = new_stmt(STMT_FOR, t->line);
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'('");
+        if (cur(ps)->kind == TOK_KW_INT)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "declarations in for-init are not supported yet; "
+                       "declare the variable before the loop");
+        if (cur(ps)->kind != TOK_SEMI)
+            s->init = parse_expr(ps);
+        expect(ps, TOK_SEMI, "';'");
+        if (cur(ps)->kind == TOK_SEMI)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "for-loops need a condition ('for (;;)' has no "
+                       "'break' to leave it yet)");
+        s->cond = parse_expr(ps);
+        expect(ps, TOK_SEMI, "';'");
+        if (cur(ps)->kind != TOK_RPAREN)
+            s->step = parse_expr(ps);
+        expect(ps, TOK_RPAREN, "')'");
+        s->body = parse_controlled(ps);
+        return s;
     case TOK_KW_INT:
+        if (!allow_decl)
+            diag_fatal(ps->lx.file, t->line,
+                       "a declaration cannot be the body of if/while/for "
+                       "(C99 forbids it too); wrap it in braces");
+        s = new_stmt(STMT_DECL, t->line);
         advance(ps);
         if (cur(ps)->kind == TOK_STAR)
             diag_fatal(ps->lx.file, cur(ps)->line,
-                       "pointers are not supported (M1 subset)");
+                       "pointers are not supported yet");
         if (cur(ps)->kind != TOK_IDENT)
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "expected a variable name before %s",
                        tok_describe(cur(ps)));
-        s->kind = STMT_DECL;
         s->name = cur(ps)->text;
         advance(ps);
         if (cur(ps)->kind == TOK_ASSIGN) {
@@ -146,14 +298,16 @@ static struct stmt *parse_stmt(struct parser *ps)
         expect(ps, TOK_SEMI, "';'");
         return s;
     case TOK_IDENT:
-        /* Covers both keywords outside the subset (if, while, for, ...)
-         * and assignments — neither exists in M1, and both must be
-         * refused, not guessed at. */
-        diag_fatal(ps->lx.file, t->line,
-                   "statement starting with '%s' is not supported "
-                   "(M1 subset: 'int' declarations and 'return' only)",
-                   t->text);
-        return NULL;
+    case TOK_NUM:
+    case TOK_LPAREN:
+    case TOK_BANG:
+        /* expression statement: assignment or call */
+        if (t->kind == TOK_IDENT)
+            reject_reserved(ps, t->text, t->line);
+        s = new_stmt(STMT_EXPR, t->line);
+        s->expr = parse_expr(ps);
+        expect(ps, TOK_SEMI, "';'");
+        return s;
     default:
         diag_fatal(ps->lx.file, t->line,
                    "expected a statement, got %s", tok_describe(t));
@@ -169,15 +323,17 @@ static struct func *parse_func(struct parser *ps)
         f->is_static = 1;
         advance(ps);
     }
+    if (cur(ps)->kind == TOK_IDENT)
+        reject_reserved(ps, cur(ps)->text, cur(ps)->line);
     if (cur(ps)->kind != TOK_KW_INT)
         diag_fatal(ps->lx.file, cur(ps)->line,
                    "expected 'int' before %s "
-                   "(M1 subset: int is the only type)",
+                   "(int is the only type for now)",
                    tok_describe(cur(ps)));
     advance(ps);
     if (cur(ps)->kind == TOK_STAR)
         diag_fatal(ps->lx.file, cur(ps)->line,
-                   "pointers are not supported (M1 subset)");
+                   "pointers are not supported yet");
     if (cur(ps)->kind != TOK_IDENT)
         diag_fatal(ps->lx.file, cur(ps)->line,
                    "expected a function name before %s",
@@ -191,10 +347,12 @@ static struct func *parse_func(struct parser *ps)
         advance(ps);
     } else if (cur(ps)->kind != TOK_RPAREN) {
         for (;;) {
+            if (cur(ps)->kind == TOK_IDENT)
+                reject_reserved(ps, cur(ps)->text, cur(ps)->line);
             if (cur(ps)->kind != TOK_KW_INT)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected 'int' parameter before %s "
-                           "(M1 subset: int is the only type)",
+                           "(int is the only type for now)",
                            tok_describe(cur(ps)));
             advance(ps);
             if (cur(ps)->kind != TOK_IDENT)
@@ -204,7 +362,7 @@ static struct func *parse_func(struct parser *ps)
             if (f->nparams >= MAX_PARAMS)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "more than %d parameters "
-                           "(M1 subset: register args only)", MAX_PARAMS);
+                           "(register args only for now)", MAX_PARAMS);
             f->params[f->nparams++] = cur(ps)->text;
             advance(ps);
             if (cur(ps)->kind != TOK_COMMA)
@@ -217,19 +375,13 @@ static struct func *parse_func(struct parser *ps)
     if (cur(ps)->kind == TOK_SEMI)
         diag_fatal(ps->lx.file, cur(ps)->line,
                    "function declarations without a body are not "
-                   "supported (M1: every called function is defined "
-                   "in this file)");
-    expect(ps, TOK_LBRACE, "'{'");
-
-    struct stmt **tail = &f->body;
-    while (cur(ps)->kind != TOK_RBRACE) {
-        if (cur(ps)->kind == TOK_EOF)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "unexpected end of file inside '%s'", f->name);
-        *tail = parse_stmt(ps);
-        tail = &(*tail)->next;
-    }
-    advance(ps); /* '}' */
+                   "supported yet (every called function is defined "
+                   "in this file, before its callers)");
+    if (cur(ps)->kind != TOK_LBRACE)
+        diag_fatal(ps->lx.file, cur(ps)->line,
+                   "expected '{' before %s", tok_describe(cur(ps)));
+    struct stmt *blk = parse_block(ps);
+    f->body = blk->body;
     return f;
 }
 

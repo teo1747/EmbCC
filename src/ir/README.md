@@ -2,5 +2,7 @@
 
 EmbIR, the intermediate form — ../../docs/ARCHITECTURE.md §3.
 
-M1 state: linear three-address code over int-typed virtual registers.
-No SSA, no passes, no blocks — the subset has no control flow yet.
+State: linear three-address code over int-typed vregs, now with
+labels, conditional branches (BRZ), and 0/1 comparisons; && and ||
+are lowered to short-circuit branches here. Still no SSA and no
+passes — that revision belongs to the optimizer era (VISION_LONGTERM).

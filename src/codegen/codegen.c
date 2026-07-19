@@ -24,10 +24,38 @@ struct callsite {
     struct func *target;
 };
 
+/* setcc condition byte for each comparison predicate (signed int). */
+static int cc_for(enum binop pred)
+{
+    switch (pred) {
+    case B_EQ: return 0x94; /* sete  */
+    case B_NE: return 0x95; /* setne */
+    case B_LT: return 0x9c; /* setl  */
+    case B_LE: return 0x9e; /* setle */
+    case B_GT: return 0x9f; /* setg  */
+    case B_GE: return 0x9d; /* setge */
+    default:
+        fprintf(stderr, "embcc: internal: bad cmp predicate %d\n", pred);
+        exit(1);
+    }
+}
+
 static void gen_func(struct ir_func *fn, struct code *text,
                      struct callsite **sites, int *nsites, int *capsites)
 {
     struct func *f = fn->src;
+
+    /* Branch targets and sites are function-local; both arrays are
+     * resolved before this function returns. */
+    int *label_off = xmalloc((size_t)(fn->nlabels ? fn->nlabels : 1)
+                             * sizeof *label_off);
+    for (int i = 0; i < fn->nlabels; i++)
+        label_off[i] = -1;
+    struct brsite {
+        int patch_off;
+        int label;
+    } *brs = NULL;
+    int nbrs = 0, capbrs = 0;
 
     code_align(text, 16, 0x90);
     f->code_off = text->len;
@@ -57,6 +85,34 @@ static void gen_func(struct ir_func *fn, struct code *text,
                             slot_disp(i->b));
             x86_mov_mem_eax(text, slot_disp(i->dst));
             break;
+        case IR_CMP:
+            x86_mov_eax_mem(text, slot_disp(i->a));
+            x86_cmp_eax_mem(text, slot_disp(i->b));
+            x86_setcc_eax(text, cc_for(i->pred));
+            x86_mov_mem_eax(text, slot_disp(i->dst));
+            break;
+        case IR_LABEL:
+            label_off[i->label] = text->len;
+            break;
+        case IR_JMP:
+        case IR_BRZ: {
+            int patch;
+            if (i->op == IR_BRZ) {
+                x86_mov_eax_mem(text, slot_disp(i->a));
+                x86_test_eax(text);
+                patch = x86_jz_rel32(text);
+            } else {
+                patch = x86_jmp_rel32(text);
+            }
+            if (nbrs == capbrs) {
+                capbrs = capbrs ? capbrs * 2 : 16;
+                brs = xrealloc(brs, (size_t)capbrs * sizeof *brs);
+            }
+            brs[nbrs].patch_off = patch;
+            brs[nbrs].label = i->label;
+            nbrs++;
+            break;
+        }
         case IR_CALL: {
             for (int k = 0; k < i->nargs; k++)
                 x86_load_arg(text, k, slot_disp(i->args[k]));
@@ -78,6 +134,20 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
     }
+
+    for (int n = 0; n < nbrs; n++) {
+        int target = label_off[brs[n].label];
+        if (target < 0) {
+            fprintf(stderr, "embcc: internal: label %d in '%s' was never "
+                            "placed\n", brs[n].label, f->name);
+            exit(1);
+        }
+        int from = brs[n].patch_off + 4;
+        code_patch32(text, brs[n].patch_off,
+                     (unsigned long)(unsigned int)(target - from));
+    }
+    free(brs);
+    free(label_off);
 
     f->code_len = text->len - f->code_off;
 }
