@@ -5,13 +5,13 @@
 
 #include "../driver/util.h"
 
-/* [kind][is_unsigned] — TY_PTR handled separately */
+/* [kind][is_unsigned] — TY_PTR/TY_ARRAY handled separately */
 static struct type bases[5][2] = {
-    { { TY_VOID, 0, 0 }, { TY_VOID, 0, 0 } },
-    { { TY_CHAR, 0, 0 }, { TY_CHAR, 1, 0 } },
-    { { TY_SHORT, 0, 0 }, { TY_SHORT, 1, 0 } },
-    { { TY_INT, 0, 0 }, { TY_INT, 1, 0 } },
-    { { TY_LONG, 0, 0 }, { TY_LONG, 1, 0 } },
+    { { TY_VOID, 0, 0, 0 }, { TY_VOID, 0, 0, 0 } },
+    { { TY_CHAR, 0, 0, 0 }, { TY_CHAR, 1, 0, 0 } },
+    { { TY_SHORT, 0, 0, 0 }, { TY_SHORT, 1, 0, 0 } },
+    { { TY_INT, 0, 0, 0 }, { TY_INT, 1, 0, 0 } },
+    { { TY_LONG, 0, 0, 0 }, { TY_LONG, 1, 0, 0 } },
 };
 
 struct type *ty_base(enum ty_kind kind, int is_unsigned)
@@ -27,6 +27,15 @@ struct type *ty_ptr(struct type *pointee)
     return t;
 }
 
+struct type *ty_array(struct type *elem, int count)
+{
+    struct type *t = xcalloc(1, sizeof *t);
+    t->kind = TY_ARRAY;
+    t->pointee = elem;
+    t->count = count;
+    return t;
+}
+
 int ty_size(const struct type *t)
 {
     switch (t->kind) {
@@ -35,6 +44,7 @@ int ty_size(const struct type *t)
     case TY_INT: return 4;
     case TY_LONG: return 8;
     case TY_PTR: return 8;
+    case TY_ARRAY: return t->count * ty_size(t->pointee);
     case TY_VOID: break;
     }
     return 0;
@@ -46,6 +56,8 @@ int ty_equal(const struct type *a, const struct type *b)
         return 0;
     if (a->kind == TY_PTR)
         return ty_equal(a->pointee, b->pointee);
+    if (a->kind == TY_ARRAY)
+        return a->count == b->count && ty_equal(a->pointee, b->pointee);
     return 1;
 }
 
@@ -72,12 +84,27 @@ int ty_signed_int(const struct type *t)
 
 const char *ty_name(const struct type *t)
 {
-    static char buf[64];
+    /* Rotating buffers so one diagnostic can name two types — with a
+     * single buffer "cannot convert char* to int" printed the SAME
+     * spelling twice (found by a refusal test, of course). */
+    static char bufs[4][64];
+    static int which;
+    char *buf = bufs[which];
+    size_t bufsz = sizeof bufs[0];
+    which = (which + 1) & 3;
     const char *base;
     int stars = 0;
+    int dims[4];
+    int ndims = 0;
 
-    while (t->kind == TY_PTR) {
-        stars++;
+    while (t->kind == TY_PTR || t->kind == TY_ARRAY) {
+        if (t->kind == TY_PTR) {
+            stars++;
+        } else {
+            if (ndims < 4)
+                dims[ndims] = t->count;
+            ndims++;
+        }
         t = t->pointee;
     }
     switch (t->kind) {
@@ -88,12 +115,14 @@ const char *ty_name(const struct type *t)
     case TY_LONG: base = t->is_unsigned ? "unsigned long" : "long"; break;
     default: base = "?"; break;
     }
-    int n = snprintf(buf, sizeof buf, "%s ", base);
-    for (int i = 0; i < stars && n < (int)sizeof buf - 1; i++)
-        buf[n++] = '*';
-    if (!stars)
-        buf[n - 1] = 0; /* drop the trailing space */
-    else
-        buf[n] = 0;
+    int n = snprintf(buf, bufsz, "%s", base);
+    if (stars) {
+        buf[n++] = ' ';
+        for (int i = 0; i < stars && n < (int)bufsz - 8; i++)
+            buf[n++] = '*';
+    }
+    for (int i = 0; i < ndims && i < 4 && n < (int)bufsz - 16; i++)
+        n += snprintf(buf + n, bufsz - (size_t)n, "[%d]", dims[i]);
+    buf[n] = 0;
     return buf;
 }

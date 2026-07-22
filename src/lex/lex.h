@@ -12,7 +12,9 @@
 enum tok_kind {
     TOK_EOF,
     TOK_NUM,
+    TOK_STR,
     TOK_IDENT,
+    TOK_ELLIPSIS,
     TOK_KW_INT,
     TOK_KW_CHAR,
     TOK_KW_SHORT,
@@ -76,10 +78,10 @@ enum tok_kind {
 struct token {
     enum tok_kind kind;
     int line;
-    long num;      /* TOK_NUM */
+    long num;      /* TOK_NUM; TOK_STR: byte length INCLUDING the NUL */
     int num_long;  /* TOK_NUM: type is long (L suffix or magnitude) */
     int num_uns;   /* TOK_NUM: type is unsigned (U suffix or hex range) */
-    char *text;    /* TOK_IDENT */
+    char *text;    /* TOK_IDENT; TOK_STR: the bytes (may contain NULs) */
 };
 
 struct lexer {

@@ -154,6 +154,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_NUM:
         /* type assigned by the parser from the literal's shape */
         break;
+    case EXPR_STR:
+        /* char[N], decaying to char* like any array (sizeof sees the
+         * array through `undecayed`) */
+        e->undecayed = ty_array(ty_base(TY_CHAR, 0), (int)e->num);
+        e->ty = ty_ptr(ty_base(TY_CHAR, 0));
+        break;
     case EXPR_VAR: {
         int i = scope_find(sc, e->name);
         if (i < 0) {
@@ -166,6 +172,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         }
         e->var_index = i;
         e->ty = sc->vars[i].ty;
+        if (e->ty->kind == TY_ARRAY) {
+            e->undecayed = e->ty;
+            e->ty = ty_ptr(e->ty->pointee);
+        }
         break;
     }
     case EXPR_ASSIGN:
@@ -173,6 +183,8 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (!is_lvalue(e->lhs))
             diag_fatal(u->file, e->line, "assignment target is not an "
                                          "lvalue");
+        if (e->lhs->undecayed)
+            diag_fatal(u->file, e->line, "cannot assign to an array");
         check_expr(u, f, sc, e->rhs);
         need_scalar(u, e->rhs, "assignment");
         e->rhs = convert_assign(u, e->rhs, e->lhs->ty, "assignment");
@@ -217,12 +229,22 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (e->rhs->ty->pointee->kind == TY_VOID)
             diag_fatal(u->file, e->line, "cannot dereference void *");
         e->ty = e->rhs->ty->pointee;
+        if (e->ty->kind == TY_ARRAY) {
+            /* m[i] of a 2-D array is itself an array: it decays, and
+             * irgen "loads" it as its address, not its bytes. */
+            e->undecayed = e->ty;
+            e->ty = ty_ptr(e->ty->pointee);
+        }
         break;
     case EXPR_ADDR:
         check_expr(u, f, sc, e->rhs);
         if (!is_lvalue(e->rhs))
             diag_fatal(u->file, e->line,
                        "'&' needs a variable or *pointer");
+        if (e->rhs->undecayed)
+            diag_fatal(u->file, e->line,
+                       "'&' on an array is not supported yet (its name "
+                       "is already the address of the first element)");
         e->ty = ty_ptr(e->rhs->ty);
         break;
     case EXPR_CAST:
@@ -243,7 +265,9 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             check_expr(u, f, sc, e->rhs);
             if (e->rhs->ty->kind == TY_VOID)
                 diag_fatal(u->file, e->line, "sizeof a void expression");
-            size = ty_size(e->rhs->ty);
+            /* sizeof is the one context where an array does NOT decay */
+            size = ty_size(e->rhs->undecayed ? e->rhs->undecayed
+                                             : e->rhs->ty);
         }
         /* Folded to a constant here; the operand is never evaluated,
          * exactly as C specifies. size_t is unsigned long in LP64. */
@@ -365,19 +389,25 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        "call to '%s' before its declaration — declare "
                        "or define functions before their callers",
                        e->name);
-        if (e->nargs != callee->nparams)
+        if (callee->is_varargs ? e->nargs < callee->nparams
+                               : e->nargs != callee->nparams)
             diag_fatal(u->file, e->line,
-                       "'%s' takes %d argument%s, called with %d",
-                       e->name, callee->nparams,
+                       "'%s' takes %s%d argument%s, called with %d",
+                       e->name, callee->is_varargs ? "at least " : "",
+                       callee->nparams,
                        callee->nparams == 1 ? "" : "s", e->nargs);
         e->callee = callee;
         callee->used = 1;
         for (int i = 0; i < e->nargs; i++) {
             check_expr(u, f, sc, e->args[i]);
             need_scalar(u, e->args[i], "an argument");
-            e->args[i] = convert_assign(u, e->args[i],
-                                        callee->param_tys[i],
-                                        "argument");
+            if (i < callee->nparams)
+                e->args[i] = convert_assign(u, e->args[i],
+                                            callee->param_tys[i],
+                                            "argument");
+            else /* variadic tail: default argument promotions */
+                e->args[i] = mk_cast(e->args[i],
+                                     promote(e->args[i]->ty));
         }
         e->ty = callee->ret_ty;
         break;
@@ -532,6 +562,7 @@ static void merge_decls(struct unit *u)
             continue;
         }
         int match = canon->nparams == f->nparams &&
+                    canon->is_varargs == f->is_varargs &&
                     ty_equal(canon->ret_ty, f->ret_ty);
         for (int i = 0; match && i < f->nparams; i++)
             if (!ty_equal(canon->param_tys[i], f->param_tys[i]))

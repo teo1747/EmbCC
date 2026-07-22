@@ -38,6 +38,7 @@ enum ir_op {
     IR_LDVAR, /* dst = var a          (size, sign, w: extend) */
     IR_STVAR, /* var dst = a          (size: truncating store) */
     IR_ADDR,  /* dst = &var a         (always w=8) */
+    IR_STRADDR, /* dst = &.rodata string (label = string index) */
     IR_LOAD,  /* dst = *(temp a)      (size, sign, w: extend) */
     IR_STORE, /* *(temp a) = b        (size) */
     IR_EXT,   /* dst = a re-extended  (size, sign: from; w: to) */
@@ -70,10 +71,21 @@ struct ir_func {
     int nins, cap;
 };
 
+/* One .rodata string; offsets are assigned sequentially at collection
+ * time and become section offsets verbatim in the driver. */
+struct ir_str {
+    const char *bytes;
+    int len;                 /* including the terminating NUL */
+    int off;                 /* offset inside .rodata */
+};
+
 struct ir_unit {
     struct unit *src;
     struct ir_func *funcs;   /* array, same order as src->funcs */
     int nfuncs;
+    struct ir_str *strs;
+    int nstrs, capstrs;
+    int rodata_len;
 };
 
 struct ir_unit *irgen(struct unit *u);

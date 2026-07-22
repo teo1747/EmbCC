@@ -17,17 +17,17 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.3.0-m2.types1"
+#define EMBCC_VERSION "0.4.0-m2.types2"
 
 static void print_version(void)
 {
     /* Honest: names what exists and what does not. */
     printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
            EMBCC_VERSION);
-    printf("C subset: char/short/int/long with unsigned, pointers, void "
-           "returns, sizeof, casts, full control flow and operators, "
-           "prototypes and external calls (PLT32 relocations); "
-           "compile with -c.\n");
+    printf("C subset: char/short/int/long with unsigned, pointers, "
+           "arrays, string literals (.rodata), sizeof, casts, full "
+           "control flow and operators, prototypes incl. variadic "
+           "externals — printf works; compile with -c.\n");
     printf("No preprocessor yet (M2), no linker yet (M3) — "
            "link objects with the existing toolchain.\n");
 }
@@ -97,18 +97,39 @@ static int compile(const char *in, const char *out)
 
     struct code text = { 0, 0, 0 };
     struct extcall *ext;
-    int next;
-    codegen_unit(iu, &text, &ext, &next);
+    struct strsite *strs;
+    int next, nstrs;
+    codegen_unit(iu, &text, &ext, &next, &strs, &nstrs);
+
+    /* .rodata: the string literals, at the offsets irgen assigned. */
+    char *rodata = NULL;
+    if (iu->rodata_len) {
+        rodata = xmalloc((size_t)iu->rodata_len);
+        for (int i = 0; i < iu->nstrs; i++)
+            memcpy(rodata + iu->strs[i].off, iu->strs[i].bytes,
+                   (size_t)iu->strs[i].len);
+    }
 
     struct elfw *w = elfw_new();
     int text_ndx = elfw_add_section(w, ".text", SHT_PROGBITS,
                                     SHF_ALLOC | SHF_EXECINSTR,
                                     text.p, (Elf64_Xword)text.len, 16);
+    int rodata_ndx = 0;
+    if (rodata)
+        rodata_ndx = elfw_add_section(w, ".rodata", SHT_PROGBITS,
+                                      SHF_ALLOC, rodata,
+                                      (Elf64_Xword)iu->rodata_len, 1);
     elfw_add_symbol(w, in, 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_FILE), SHN_ABS);
     elfw_add_symbol(w, "", 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_SECTION),
                     (Elf64_Half)text_ndx);
+    int rodata_sym = 0;
+    if (rodata)
+        rodata_sym = elfw_add_symbol(w, "", 0, 0,
+                                     ELF64_ST_INFO(STB_LOCAL,
+                                                   STT_SECTION),
+                                     (Elf64_Half)rodata_ndx);
     /* Locals before globals — the writer enforces the gABI ordering.
      * Only canonical, defined functions own code. */
     for (struct func *f = u->funcs; f; f = f->next)
@@ -138,6 +159,14 @@ static int compile(const char *in, const char *out)
                       callee->sym_ndx, R_X86_64_PLT32, -4);
     }
     free(ext);
+
+    /* String addresses: PC32 against the .rodata section symbol.
+     * addend = target offset - 4, because rel32 is measured from the
+     * end of the instruction, four bytes past r_offset. */
+    for (int i = 0; i < nstrs; i++)
+        elfw_add_rela(w, text_ndx, (Elf64_Addr)strs[i].patch_off,
+                      rodata_sym, R_X86_64_PC32, strs[i].str_off - 4);
+    free(strs);
 
     int rc = elfw_write(w, out);
     elfw_free(w);

@@ -48,6 +48,9 @@ void x86_load_mem_rax(struct code *c, int size, int sign, int w);
 void x86_store_mem_rcx(struct code *c, int size);
 void x86_mov_rcx_slot(struct code *c, int disp);  /* mov rcx,[rbp+disp] */
 void x86_lea_rax_slot(struct code *c, int disp);  /* lea rax,[rbp+disp] */
+/* lea rax,[rip+0]; returns the rel32 patch offset (for a relocation). */
+int x86_lea_rax_rip(struct code *c);
+void x86_zero_eax(struct code *c); /* xor eax,eax — al=0 for varargs calls */
 
 void x86_alu_eax_mem(struct code *c, int op, int disp, int w); /* + - * & | ^ */
 void x86_cdq(struct code *c, int w);              /* cdq / cqo */

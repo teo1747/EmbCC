@@ -18,9 +18,11 @@ variants, pointers (arithmetic, comparison, deref/address-of, p[i]),
 void returns, sizeof, casts, and C's exact conversion rules (promotions,
 usual arithmetic conversions, signed narrowing, unsigned div/shift/compare)
 — every implicit conversion materialized in the tree and cross-checked
-against gcc. Next: arrays + string literals in .rodata (unlocking printf),
-then globals with .data/.bss, structs, and the preprocessor last, judged
-against newlib's headers.
+against gcc. Arrays (incl. 2-D, decay, sizeof) and string literals in
+.rodata landed next, with variadic external calls (al=0 per SysV):
+**an EmbCC-compiled hello world runs — puts and printf work.** Next:
+globals with .data/.bss, structs/unions/enums, and the preprocessor last,
+judged against newlib's headers.
 
 ---
 

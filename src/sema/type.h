@@ -15,18 +15,21 @@
 #ifndef EMBCC_SEMA_TYPE_H
 #define EMBCC_SEMA_TYPE_H
 
-enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_PTR };
+enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_PTR,
+               TY_ARRAY };
 
 struct type {
     enum ty_kind kind;
     int is_unsigned;        /* integers only */
-    struct type *pointee;   /* TY_PTR only */
+    struct type *pointee;   /* TY_PTR: target; TY_ARRAY: element */
+    int count;              /* TY_ARRAY: element count */
 };
 
 /* Base types are interned singletons — pointer equality works for
  * them; ty_equal() works for everything. */
 struct type *ty_base(enum ty_kind kind, int is_unsigned);
 struct type *ty_ptr(struct type *pointee);
+struct type *ty_array(struct type *elem, int count);
 
 int ty_size(const struct type *t);          /* bytes; void has none */
 int ty_equal(const struct type *a, const struct type *b);

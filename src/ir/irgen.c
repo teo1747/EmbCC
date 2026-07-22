@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../driver/util.h"
 #include "../sema/type.h"
@@ -115,6 +116,30 @@ static int log2_size(int size)
 
 static int gen_expr(struct ir_func *fn, struct expr *e);
 
+/* The unit being generated — for the string table. One compilation per
+ * process, so a file-scope current-unit pointer is honest. */
+static struct ir_unit *cur_unit;
+
+static int intern_str(const char *bytes, int len)
+{
+    struct ir_unit *iu = cur_unit;
+    for (int i = 0; i < iu->nstrs; i++)
+        if (iu->strs[i].len == len &&
+            memcmp(iu->strs[i].bytes, bytes, (size_t)len) == 0)
+            return i;
+    if (iu->nstrs == iu->capstrs) {
+        iu->capstrs = iu->capstrs ? iu->capstrs * 2 : 8;
+        iu->strs = xrealloc(iu->strs,
+                            (size_t)iu->capstrs * sizeof *iu->strs);
+    }
+    struct ir_str *s = &iu->strs[iu->nstrs];
+    s->bytes = bytes;
+    s->len = len;
+    s->off = iu->rodata_len;
+    iu->rodata_len += len;
+    return iu->nstrs++;
+}
+
 /* !x and conditions want "is zero" — comparison against a zero of the
  * operand's width. */
 static int emit_isz(struct ir_func *fn, int v, int w)
@@ -172,7 +197,23 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     switch (e->kind) {
     case EXPR_NUM:
         return emit_const(fn, e->num, ty_w(e->ty));
+    case EXPR_STR: {
+        e->str_index = intern_str(e->name, (int)e->num);
+        struct ir_ins *i = emit(fn);
+        i->op = IR_STRADDR;
+        i->label = e->str_index;
+        i->dst = new_temp(fn);
+        return i->dst;
+    }
     case EXPR_VAR:
+        if (e->undecayed) {
+            /* an array's name IS the address of its first element */
+            struct ir_ins *i = emit(fn);
+            i->op = IR_ADDR;
+            i->a = e->var_index;
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
         return emit_ldvar(fn, e->var_index, e->ty);
     case EXPR_ASSIGN: {
         if (e->lhs->kind == EXPR_VAR) {
@@ -234,6 +275,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     }
     case EXPR_DEREF: {
         int addr = gen_expr(fn, e->rhs);
+        if (e->undecayed)
+            return addr; /* m[i] of a 2-D array: the row's address */
         struct ir_ins *i = emit(fn);
         i->op = IR_LOAD;
         i->a = addr;
@@ -497,6 +540,7 @@ struct ir_unit *irgen(struct unit *u)
 {
     struct ir_unit *iu = xcalloc(1, sizeof *iu);
     iu->src = u;
+    cur_unit = iu;
 
     /* Only canonical, defined functions produce code; prototypes of
      * externals produce symbols and relocations instead (driver). */

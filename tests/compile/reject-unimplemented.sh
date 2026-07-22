@@ -73,6 +73,30 @@ int main(void) { return !&f; }' \
 check void-variable \
     'int main(void) { void v; return 0; }' \
     "cannot have type void"
+check array-assign \
+    'int main(void) { int a[3]; int b[3]; a = b; return 0; }' \
+    "cannot assign to an array"
+check addr-of-array \
+    'int main(void) { int a[3]; return !&a; }' \
+    "already the address"
+check array-initializer \
+    'int main(void) { int a[3] = 0; return 0; }' \
+    "array initializers are not supported"
+check adjacent-strings \
+    'int puts(char *);
+int main(void) { puts("a" "b"); return 0; }' \
+    "concatenation is not supported"
+check varargs-definition \
+    'int f(int a, ...) { return a; }
+int main(void) { return f(1); }' \
+    "variadic function is not supported"
+check member-dot \
+    'int main(void) { int x = 1; return x.y; }' \
+    "member access is not supported"
+check varargs-too-few \
+    'int printf(char *fmt, ...);
+int main(void) { printf(); return 0; }' \
+    "takes at least 1 argument"
 check preprocessor \
     '#include <stdio.h>
 int main(void) { return 0; }' \
@@ -121,9 +145,9 @@ check arity \
     'static int f(int a, int b) { return a + b; }
 int main(void) { return f(1); }' \
     "takes 2 arguments, called with 1"
-check string-literal \
+check string-as-int \
     'int main(void) { return "x"; }' \
-    "not supported"
+    "converting char \* to int"
 check decl-as-if-body \
     'int main(void) { if (1) int x = 1; return 0; }' \
     "wrap it in braces"

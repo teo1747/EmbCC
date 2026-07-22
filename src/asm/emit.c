@@ -251,6 +251,22 @@ void x86_lea_rax_slot(struct code *c, int disp)
     modrm_rbp(c, 0, disp);
 }
 
+int x86_lea_rax_rip(struct code *c)
+{
+    code_byte(c, 0x48);
+    code_byte(c, 0x8d); /* lea rax, [rip+rel32] */
+    code_byte(c, 0x05); /* ModRM: mod=00 rm=101 = RIP-relative */
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
+void x86_zero_eax(struct code *c)
+{
+    code_byte(c, 0x31); /* xor eax, eax */
+    code_byte(c, 0xc0);
+}
+
 void x86_alu_eax_mem(struct code *c, int op, int disp, int w)
 {
     rexw(c, w);

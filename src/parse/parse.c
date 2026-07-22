@@ -139,6 +139,16 @@ static struct expr *parse_primary(struct parser *ps)
         e->ty = ty_base(t->num_long ? TY_LONG : TY_INT, t->num_uns);
         advance(ps);
         return e;
+    case TOK_STR:
+        e = new_expr(EXPR_STR, t->line);
+        e->name = t->text;
+        e->num = t->num;
+        advance(ps);
+        if (cur(ps)->kind == TOK_STR)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "adjacent string literal concatenation is not "
+                       "supported yet");
+        return e;
     case TOK_LPAREN:
         advance(ps);
         e = parse_expr(ps);
@@ -457,6 +467,30 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                        tok_describe(cur(ps)));
         s->name = cur(ps)->text;
         advance(ps);
+        /* array declarator(s): int a[10], char m[3][4] — sizes must be
+         * integer literals until there is constant folding */
+        if (cur(ps)->kind == TOK_LBRACKET) {
+            int dims[4];
+            int ndims = 0;
+            while (cur(ps)->kind == TOK_LBRACKET) {
+                advance(ps);
+                if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "array size must be a positive integer "
+                               "literal");
+                if (ndims >= 4)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "more than 4 array dimensions");
+                dims[ndims++] = (int)cur(ps)->num;
+                advance(ps);
+                expect(ps, TOK_RBRACKET, "']'");
+            }
+            for (int i = ndims - 1; i >= 0; i--)
+                s->dty = ty_array(s->dty, dims[i]);
+            if (cur(ps)->kind == TOK_ASSIGN)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "array initializers are not supported yet");
+        }
         if (cur(ps)->kind == TOK_ASSIGN) {
             advance(ps);
             s->expr = parse_expr(ps);
@@ -587,6 +621,15 @@ static struct func *parse_func(struct parser *ps)
     }
     if (cur(ps)->kind != TOK_RPAREN) {
         for (;;) {
+            if (cur(ps)->kind == TOK_ELLIPSIS) {
+                if (f->nparams == 0)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "'...' needs at least one named "
+                               "parameter before it");
+                f->is_varargs = 1;
+                advance(ps);
+                break;
+            }
             if (cur(ps)->kind == TOK_IDENT)
                 reject_reserved(ps, cur(ps)->text, cur(ps)->line);
             struct type *pt = parse_type_spec(ps);
@@ -606,11 +649,22 @@ static struct func *parse_func(struct parser *ps)
             /* The name is optional in a prototype; a definition with a
              * nameless parameter is rejected below. */
             if (cur(ps)->kind == TOK_IDENT) {
-                f->params[f->nparams++] = cur(ps)->text;
+                f->params[f->nparams] = cur(ps)->text;
                 advance(ps);
             } else {
-                f->params[f->nparams++] = NULL;
+                f->params[f->nparams] = NULL;
             }
+            /* C adjusts an array parameter to a pointer to its element;
+             * the size, if given, is documentation. */
+            if (cur(ps)->kind == TOK_LBRACKET) {
+                advance(ps);
+                if (cur(ps)->kind == TOK_NUM)
+                    advance(ps);
+                expect(ps, TOK_RBRACKET, "']'");
+                f->param_tys[f->nparams] =
+                    ty_ptr(f->param_tys[f->nparams]);
+            }
+            f->nparams++;
             if (cur(ps)->kind != TOK_COMMA)
                 break;
             advance(ps);
@@ -625,6 +679,11 @@ static struct func *parse_func(struct parser *ps)
     if (cur(ps)->kind != TOK_LBRACE)
         diag_fatal(ps->lx.file, cur(ps)->line,
                    "expected '{' or ';' before %s", tok_describe(cur(ps)));
+    if (f->is_varargs)
+        diag_fatal(ps->lx.file, f->line,
+                   "defining a variadic function is not supported yet "
+                   "(no va_list); only calls to external variadic "
+                   "functions work");
     for (int i = 0; i < f->nparams; i++)
         if (!f->params[i])
             diag_fatal(ps->lx.file, f->line,

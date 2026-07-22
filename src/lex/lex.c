@@ -263,10 +263,60 @@ void lex_next(struct lexer *lx)
         t->num_uns = 0;
         break;
     }
-    case '"':
+    case '"': {
+        lx->p++;
+        /* Worst case the literal shrinks (escapes), never grows. */
+        size_t cap = 0;
+        const char *scan = lx->p;
+        while (*scan && *scan != '"') {
+            if (*scan == '\\' && scan[1])
+                scan++;
+            scan++;
+            cap++;
+        }
+        char *bytes = xmalloc(cap + 1);
+        size_t n = 0;
+        while (*lx->p && *lx->p != '"' && *lx->p != '\n') {
+            char ch;
+            if (*lx->p == '\\') {
+                lx->p++;
+                switch (*lx->p) {
+                case 'n': ch = '\n'; break;
+                case 't': ch = '\t'; break;
+                case 'r': ch = '\r'; break;
+                case '0': ch = 0; break;
+                case '\\': ch = '\\'; break;
+                case '\'': ch = '\''; break;
+                case '"': ch = '"'; break;
+                default:
+                    diag_fatal(lx->file, lx->line,
+                               "unknown escape '\\%c' in string literal",
+                               *lx->p);
+                    return;
+                }
+                lx->p++;
+            } else {
+                ch = *lx->p++;
+            }
+            bytes[n++] = ch;
+        }
+        if (*lx->p != '"')
+            diag_fatal(lx->file, lx->line, "unterminated string literal");
+        bytes[n] = 0;
+        t->kind = TOK_STR;
+        t->text = bytes;
+        t->num = (long)n + 1; /* the NUL is part of the object */
+        break;
+    }
+    case '.':
+        if (lx->p[1] == '.' && lx->p[2] == '.') {
+            t->kind = TOK_ELLIPSIS;
+            lx->p += 2;
+            break;
+        }
         diag_fatal(lx->file, lx->line,
-                   "string literals are not supported yet (they need "
-                   "arrays and .rodata — the next increment)");
+                   "'.' member access is not supported yet (structs come "
+                   "later in M2)");
         break;
     default:
         diag_fatal(lx->file, lx->line,
@@ -283,6 +333,8 @@ const char *tok_describe(const struct token *t)
     case TOK_NUM:
         snprintf(buf, sizeof buf, "number %ld", t->num);
         return buf;
+    case TOK_STR: return "a string literal";
+    case TOK_ELLIPSIS: return "'...'";
     case TOK_IDENT:
         snprintf(buf, sizeof buf, "'%s'", t->text);
         return buf;

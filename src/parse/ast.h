@@ -14,8 +14,8 @@
 
 #define MAX_PARAMS 6
 
-enum expr_kind { EXPR_NUM, EXPR_VAR, EXPR_BINOP, EXPR_CALL, EXPR_ASSIGN,
-                 EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
+enum expr_kind { EXPR_NUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
+                 EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
@@ -33,9 +33,13 @@ struct expr {
     enum expr_kind kind;
     int line;
     struct type *ty;      /* set by sema on every node */
-    long num;             /* EXPR_NUM */
-    const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_INCDEC target */
+    struct type *undecayed; /* sema: original array type when ty is the
+                             * decayed pointer (sizeof needs it) */
+    long num;             /* EXPR_NUM; EXPR_STR: byte length incl NUL */
+    const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_INCDEC target;
+                           * EXPR_STR: the bytes */
     int var_index;        /* EXPR_VAR/EXPR_INCDEC: slot; set by sema */
+    int str_index;        /* EXPR_STR: unit string table slot (irgen) */
     enum binop op;        /* EXPR_BINOP */
     struct expr *lhs, *rhs; /* BINOP + ASSIGN(lhs=target);
                              * NOT/NEG/BNOT/DEREF/ADDR/CAST use rhs only */
@@ -68,6 +72,7 @@ struct func {
     const char *name;
     int line;
     int is_static;
+    int is_varargs;       /* declared with a trailing ", ..." */
     struct type *ret_ty;
     int nparams;
     const char *params[MAX_PARAMS]; /* names; NULL in unnamed prototypes */
