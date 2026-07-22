@@ -134,6 +134,40 @@ static void emit_store(struct ir_func *fn, int addr, int val,
     i->size = ty_size(t);
 }
 
+static int gen_expr(struct ir_func *fn, struct expr *e);
+
+/* The address of an lvalue (or of a struct-typed expression — struct
+ * "values" are represented by their address, since sema bars them from
+ * every value context). */
+static int gen_addr(struct ir_func *fn, struct expr *e)
+{
+    switch (e->kind) {
+    case EXPR_VAR:
+        if (e->gref)
+            return emit_gaddr(fn, e->gref);
+        {
+            struct ir_ins *i = emit(fn);
+            i->op = IR_ADDR;
+            i->a = e->var_index;
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
+    case EXPR_DEREF:
+        return gen_expr(fn, e->rhs);
+    case EXPR_MEMBER: {
+        int base = e->is_arrow ? gen_expr(fn, e->lhs)
+                               : gen_addr(fn, e->lhs);
+        if (e->memb->off == 0)
+            return base;
+        int off = emit_const(fn, e->memb->off, 8);
+        return emit_bin(fn, IR_ADD, base, off, 8, 1);
+    }
+    default:
+        fprintf(stderr, "embcc: internal: address of a non-lvalue\n");
+        exit(1);
+    }
+}
+
 static int log2_size(int size)
 {
     switch (size) {
@@ -238,31 +272,26 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return i->dst;
     }
     case EXPR_VAR:
-        if (e->gref) {
-            int addr = emit_gaddr(fn, e->gref);
-            if (e->undecayed)
-                return addr; /* a global array's name is its address */
-            return emit_load(fn, addr, e->ty);
-        }
-        if (e->undecayed) {
-            /* an array's name IS the address of its first element */
-            struct ir_ins *i = emit(fn);
-            i->op = IR_ADDR;
-            i->a = e->var_index;
-            i->dst = new_temp(fn);
-            return i->dst;
-        }
+        /* arrays and structs are represented by their address */
+        if (e->undecayed || e->ty->kind == TY_STRUCT)
+            return gen_addr(fn, e);
+        if (e->gref)
+            return emit_load(fn, emit_gaddr(fn, e->gref), e->ty);
         return emit_ldvar(fn, e->var_index, e->ty);
+    case EXPR_MEMBER: {
+        int addr = gen_addr(fn, e);
+        if (e->undecayed || e->ty->kind == TY_STRUCT)
+            return addr; /* array member decays; nested struct is addr */
+        return emit_load(fn, addr, e->ty);
+    }
     case EXPR_ASSIGN: {
         if (e->lhs->kind == EXPR_VAR && !e->lhs->gref) {
             int v = gen_expr(fn, e->rhs);
             emit_stvar(fn, e->lhs->var_index, v, e->ty);
             return v;
         }
-        /* global or *p: both are a store through an address */
-        int addr = e->lhs->kind == EXPR_VAR
-                       ? emit_gaddr(fn, e->lhs->gref)
-                       : gen_expr(fn, e->lhs->rhs);
+        /* global, *p, or member: a store through an address */
+        int addr = gen_addr(fn, e->lhs);
         int v = gen_expr(fn, e->rhs);
         emit_store(fn, addr, v, e->ty);
         return v;
@@ -316,8 +345,9 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     }
     case EXPR_DEREF: {
         int addr = gen_expr(fn, e->rhs);
-        if (e->undecayed)
-            return addr; /* m[i] of a 2-D array: the row's address */
+        /* row of a 2-D array, or a struct: the address is the value */
+        if (e->undecayed || e->ty->kind == TY_STRUCT)
+            return addr;
         struct ir_ins *i = emit(fn);
         i->op = IR_LOAD;
         i->a = addr;
@@ -328,17 +358,7 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return i->dst;
     }
     case EXPR_ADDR:
-        if (e->rhs->kind == EXPR_VAR) {
-            if (e->rhs->gref)
-                return emit_gaddr(fn, e->rhs->gref);
-            struct ir_ins *i = emit(fn);
-            i->op = IR_ADDR;
-            i->a = e->rhs->var_index;
-            i->dst = new_temp(fn);
-            return i->dst;
-        }
-        /* &*p is just p */
-        return gen_expr(fn, e->rhs->rhs);
+        return gen_addr(fn, e->rhs);
     case EXPR_CAST: {
         int v = gen_expr(fn, e->rhs);
         return gen_convert(fn, v, e->rhs->ty, e->ty);

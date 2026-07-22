@@ -90,9 +90,9 @@ check varargs-definition \
     'int f(int a, ...) { return a; }
 int main(void) { return f(1); }' \
     "variadic function is not supported"
-check member-dot \
+check member-dot-on-int \
     'int main(void) { int x = 1; return x.y; }' \
-    "member access is not supported"
+    "needs a struct/union, got int"
 check varargs-too-few \
     'int printf(char *fmt, ...);
 int main(void) { printf(); return 0; }' \
@@ -133,6 +133,57 @@ check multi-declarator \
     'int a, b;
 int main(void) { return 0; }' \
     "one declarator per declaration"
+check struct-assign \
+    'struct P { int x; };
+int main(void) { struct P a; struct P b; a.x = 1; b = a; return b.x; }' \
+    "struct assignment is not supported"
+check struct-param \
+    'struct P { int x; };
+static int f(struct P p) { return p.x; }
+int main(void) { return 0; }' \
+    "pass a pointer"
+check struct-return \
+    'struct P { int x; };
+static struct P f(void) { struct P p; p.x = 1; return p; }
+int main(void) { return 0; }' \
+    "return a pointer"
+check incomplete-var \
+    'struct Later;
+int main(void) { struct Later v; return 0; }' \
+    "incomplete type"
+check unknown-member \
+    'struct P { int x; };
+int main(void) { struct P p; p.x = 1; return p.z; }' \
+    "no member 'z'"
+check dot-on-pointer \
+    'struct P { int x; };
+int main(void) { struct P p; struct P *q = &p; return q.x; }' \
+    "use '->' through a pointer"
+check arrow-on-struct \
+    'struct P { int x; };
+int main(void) { struct P p; return p->x; }' \
+    "needs a pointer"
+check tag-redefinition \
+    'struct P { int x; };
+struct P { int y; };
+int main(void) { return 0; }' \
+    "redefinition of 'P'"
+check block-scope-struct \
+    'int main(void) { struct L { int x; }; return 0; }' \
+    "file scope"
+check bitfield \
+    'struct B { int f : 3; };
+int main(void) { return 0; }' \
+    "not supported"
+check empty-struct \
+    'struct E { };
+int main(void) { return 0; }' \
+    "at least one member"
+check typedef-redef \
+    'typedef int T;
+typedef long T;
+int main(void) { T v = 1; return (int)v; }' \
+    "redefinition of typedef"
 check preprocessor \
     '#include <stdio.h>
 int main(void) { return 0; }' \

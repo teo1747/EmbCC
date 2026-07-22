@@ -17,18 +17,17 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.5.0-m2.globals"
+#define EMBCC_VERSION "0.6.0-m2.structs"
 
 static void print_version(void)
 {
     /* Honest: names what exists and what does not. */
     printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
            EMBCC_VERSION);
-    printf("C subset: char/short/int/long with unsigned, pointers, "
-           "arrays, string literals (.rodata), globals (.data/.bss, "
-           "static/extern), sizeof, casts, full control flow and "
-           "operators, prototypes incl. variadic externals — printf "
-           "works; compile with -c.\n");
+    printf("C subset: the integer types, pointers, arrays, "
+           "structs/unions/enums, typedef, string literals, globals, "
+           "sizeof, casts, full control flow and operators, prototypes "
+           "incl. variadic externals; compile with -c.\n");
     printf("No preprocessor yet (M2), no linker yet (M3) — "
            "link objects with the existing toolchain.\n");
 }
@@ -109,10 +108,7 @@ static int compile(const char *in, const char *out)
     for (struct global *g = u->globals; g; g = g->next) {
         if (g->absorbed || !g->defined)
             continue;
-        struct type *base = g->ty;
-        while (base->kind == TY_ARRAY)
-            base = base->pointee;
-        int align = ty_size(base);
+        int align = ty_align(g->ty);
         g->in_bss = !g->has_init;
         int *len = g->in_bss ? &bss_len : &data_len;
         *len = (*len + align - 1) & ~(align - 1);

@@ -7,12 +7,51 @@
 #include "../lex/lex.h"
 #include "../sema/type.h"
 
+/* Tags (struct/union/enum) live in their own namespace; typedef names
+ * live in the ordinary one and must be known DURING parsing (the
+ * classic C ambiguity), so both tables belong to the parser. */
+enum tag_kind { TAG_STRUCT, TAG_UNION, TAG_ENUM };
+
+struct tagdef {
+    const char *tag;
+    enum tag_kind kind;
+    struct type *ty;      /* struct/union node; NULL for enums */
+    struct tagdef *next;
+};
+
+struct typedefent {
+    const char *name;
+    struct type *ty;
+    struct typedefent *next;
+};
+
 struct parser {
     struct lexer lx;
+    struct unit *unit;
+    struct tagdef *tags;
+    struct typedefent *typedefs;
+    struct econst **econst_tail;
+    int seq;              /* current top-level item, for econst seq */
 };
 
 static struct token *cur(struct parser *ps) { return &ps->lx.tok; }
 static void advance(struct parser *ps) { lex_next(&ps->lx); }
+
+static struct tagdef *find_tag(struct parser *ps, const char *tag)
+{
+    for (struct tagdef *t = ps->tags; t; t = t->next)
+        if (strcmp(t->tag, tag) == 0)
+            return t;
+    return NULL;
+}
+
+static struct type *find_typedef(struct parser *ps, const char *name)
+{
+    for (struct typedefent *t = ps->typedefs; t; t = t->next)
+        if (strcmp(t->name, name) == 0)
+            return t->ty;
+    return NULL;
+}
 
 static void expect(struct parser *ps, enum tok_kind kind, const char *what)
 {
@@ -26,9 +65,8 @@ static void expect(struct parser *ps, enum tok_kind kind, const char *what)
  * them here turns "'struct' is not declared" into an honest "not
  * supported yet". Grows emptier as M2 proceeds. */
 static const char *const reserved_unsupported[] = {
-    "auto", "case", "const", "default", "do", "double", "enum",
-    "float", "goto", "register", "struct", "switch", "typedef", "union",
-    "volatile",
+    "auto", "case", "const", "default", "do", "double",
+    "float", "goto", "register", "switch", "volatile",
 };
 
 static void reject_reserved(struct parser *ps, const char *name, int line)
@@ -48,12 +86,97 @@ static int tok_is_type_start(enum tok_kind k)
 {
     return k == TOK_KW_INT || k == TOK_KW_CHAR || k == TOK_KW_SHORT ||
            k == TOK_KW_LONG || k == TOK_KW_UNSIGNED ||
-           k == TOK_KW_SIGNED || k == TOK_KW_VOID;
+           k == TOK_KW_SIGNED || k == TOK_KW_VOID ||
+           k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM;
+}
+
+/* Does a type begin at the current token — including typedef names,
+ * which only the parser's table can decide. */
+static int at_type_start(struct parser *ps)
+{
+    if (tok_is_type_start(cur(ps)->kind))
+        return 1;
+    return cur(ps)->kind == TOK_IDENT &&
+           find_typedef(ps, cur(ps)->text) != NULL;
+}
+
+static struct type *parse_struct_body(struct parser *ps, struct type *t);
+static void parse_enum_body(struct parser *ps);
+
+/* struct/union/enum specifier, after the keyword was consumed. */
+static struct type *parse_tagged(struct parser *ps, enum tag_kind kind,
+                                 int allow_body, int line)
+{
+    const char *tag = NULL;
+    if (cur(ps)->kind == TOK_IDENT) {
+        tag = cur(ps)->text;
+        advance(ps);
+    }
+
+    if (cur(ps)->kind == TOK_LBRACE) {
+        if (!allow_body)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "define %s at file scope (block-scope type "
+                       "definitions are not supported)",
+                       kind == TAG_ENUM ? "enums" : "structs/unions");
+        struct type *t = NULL;
+        if (tag) {
+            struct tagdef *td = find_tag(ps, tag);
+            if (td) {
+                if (td->kind != kind)
+                    diag_fatal(ps->lx.file, line,
+                               "'%s' is a different kind of tag", tag);
+                if (kind != TAG_ENUM && td->ty->complete)
+                    diag_fatal(ps->lx.file, line,
+                               "redefinition of '%s'", tag);
+                t = td->ty;
+            } else {
+                td = xcalloc(1, sizeof *td);
+                td->tag = tag;
+                td->kind = kind;
+                if (kind != TAG_ENUM)
+                    td->ty = ty_struct(tag, kind == TAG_UNION);
+                td->next = ps->tags;
+                ps->tags = td;
+                t = td->ty;
+            }
+        } else if (kind != TAG_ENUM) {
+            t = ty_struct(NULL, kind == TAG_UNION);
+        }
+        if (kind == TAG_ENUM) {
+            parse_enum_body(ps);
+            return ty_base(TY_INT, 0);
+        }
+        return parse_struct_body(ps, t);
+    }
+
+    if (!tag)
+        diag_fatal(ps->lx.file, line, "%s needs a tag or a body",
+                   kind == TAG_ENUM ? "enum" :
+                   kind == TAG_UNION ? "union" : "struct");
+    struct tagdef *td = find_tag(ps, tag);
+    if (td) {
+        if (td->kind != kind)
+            diag_fatal(ps->lx.file, line,
+                       "'%s' is a different kind of tag", tag);
+        return kind == TAG_ENUM ? ty_base(TY_INT, 0) : td->ty;
+    }
+    if (kind == TAG_ENUM)
+        diag_fatal(ps->lx.file, line, "unknown enum '%s'", tag);
+    /* Forward reference: an incomplete struct, fine behind a pointer */
+    td = xcalloc(1, sizeof *td);
+    td->tag = tag;
+    td->kind = kind;
+    td->ty = ty_struct(tag, kind == TAG_UNION);
+    td->next = ps->tags;
+    ps->tags = td;
+    return td->ty;
 }
 
 /* Consumes a type specifier if one starts here, else returns NULL with
- * nothing consumed. "unsigned"/"signed" alone mean int, as in C. */
-static struct type *parse_type_spec(struct parser *ps)
+ * nothing consumed. "unsigned"/"signed" alone mean int, as in C.
+ * allow_body: may a struct/union/enum BODY appear here (file scope). */
+static struct type *parse_type_spec(struct parser *ps, int allow_body)
 {
     int uns = -1;
     enum ty_kind kind = TY_INT;
@@ -64,6 +187,25 @@ static struct type *parse_type_spec(struct parser *ps)
     } else if (cur(ps)->kind == TOK_KW_SIGNED) {
         uns = 0;
         advance(ps);
+    }
+    if (cur(ps)->kind == TOK_KW_STRUCT || cur(ps)->kind == TOK_KW_UNION ||
+        cur(ps)->kind == TOK_KW_ENUM) {
+        if (uns != -1)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "tagged types cannot be signed or unsigned");
+        enum tag_kind k = cur(ps)->kind == TOK_KW_STRUCT ? TAG_STRUCT :
+                          cur(ps)->kind == TOK_KW_UNION ? TAG_UNION :
+                          TAG_ENUM;
+        int line = cur(ps)->line;
+        advance(ps);
+        return parse_tagged(ps, k, allow_body, line);
+    }
+    if (uns == -1 && cur(ps)->kind == TOK_IDENT) {
+        struct type *td = find_typedef(ps, cur(ps)->text);
+        if (!td)
+            return NULL;
+        advance(ps);
+        return td;
     }
     switch (cur(ps)->kind) {
     case TOK_KW_CHAR:
@@ -110,6 +252,123 @@ static struct type *parse_stars(struct parser *ps, struct type *t)
         advance(ps);
     }
     return t;
+}
+
+/* Shared by locals, globals, and members: trailing [N]([M]...) turns t
+ * into (nested) array types. Sizes are positive integer literals. */
+static struct type *parse_array_dims(struct parser *ps, struct type *t)
+{
+    int dims[4];
+    int ndims = 0;
+    while (cur(ps)->kind == TOK_LBRACKET) {
+        advance(ps);
+        if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "array size must be a positive integer literal");
+        if (ndims >= 4)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "more than 4 array dimensions");
+        dims[ndims++] = (int)cur(ps)->num;
+        advance(ps);
+        expect(ps, TOK_RBRACKET, "']'");
+    }
+    for (int i = ndims - 1; i >= 0; i--)
+        t = ty_array(t, dims[i]);
+    return t;
+}
+
+static struct type *parse_struct_body(struct parser *ps, struct type *t)
+{
+    expect(ps, TOK_LBRACE, "'{'");
+    struct member *ms = NULL;
+    int n = 0, cap = 0;
+
+    while (cur(ps)->kind != TOK_RBRACE) {
+        struct type *spec = parse_type_spec(ps, 0);
+        if (!spec)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a member type before %s",
+                       tok_describe(cur(ps)));
+        struct type *mty = parse_stars(ps, spec);
+        if (mty->kind == TY_VOID)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "a member cannot have type void");
+        if (cur(ps)->kind != TOK_IDENT)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a member name before %s",
+                       tok_describe(cur(ps)));
+        const char *mname = cur(ps)->text;
+        int mline = cur(ps)->line;
+        advance(ps);
+        mty = parse_array_dims(ps, mty);
+        if (ty_size(mty) == 0)
+            diag_fatal(ps->lx.file, mline,
+                       "member '%s' has incomplete type %s",
+                       mname, ty_name(mty));
+        for (int i = 0; i < n; i++)
+            if (strcmp(ms[i].name, mname) == 0)
+                diag_fatal(ps->lx.file, mline,
+                           "duplicate member '%s'", mname);
+        expect(ps, TOK_SEMI, "';'");
+        if (n == cap) {
+            cap = cap ? cap * 2 : 8;
+            ms = xrealloc(ms, (size_t)cap * sizeof *ms);
+        }
+        ms[n].name = mname;
+        ms[n].ty = mty;
+        ms[n].off = 0;
+        n++;
+    }
+    advance(ps); /* '}' */
+    if (n == 0)
+        diag_fatal(ps->lx.file, cur(ps)->line,
+                   "a struct/union needs at least one member");
+    ty_struct_layout(t, ms, n);
+    return t;
+}
+
+static void parse_enum_body(struct parser *ps)
+{
+    expect(ps, TOK_LBRACE, "'{'");
+    long val = 0;
+
+    while (cur(ps)->kind != TOK_RBRACE) {
+        if (cur(ps)->kind != TOK_IDENT)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected an enumerator name before %s",
+                       tok_describe(cur(ps)));
+        const char *name = cur(ps)->text;
+        int line = cur(ps)->line;
+        advance(ps);
+        if (cur(ps)->kind == TOK_ASSIGN) {
+            advance(ps);
+            int neg = 0;
+            if (cur(ps)->kind == TOK_MINUS) {
+                neg = 1;
+                advance(ps);
+            }
+            if (cur(ps)->kind != TOK_NUM)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "an enumerator value must be an integer "
+                           "literal for now");
+            val = neg ? -cur(ps)->num : cur(ps)->num;
+            advance(ps);
+        }
+        for (struct econst *ec = ps->unit->econsts; ec; ec = ec->next)
+            if (strcmp(ec->name, name) == 0)
+                diag_fatal(ps->lx.file, line,
+                           "duplicate enumerator '%s'", name);
+        struct econst *ec = xcalloc(1, sizeof *ec);
+        ec->name = name;
+        ec->val = val++;
+        ec->seq = ps->seq;
+        *ps->econst_tail = ec;
+        ps->econst_tail = &ec->next;
+        if (cur(ps)->kind != TOK_COMMA)
+            break;
+        advance(ps); /* trailing comma before '}' is fine, as in C99 */
+    }
+    expect(ps, TOK_RBRACE, "'}'");
 }
 
 /* ---- expressions ---- */
@@ -218,6 +477,21 @@ static struct expr *parse_postfix(struct parser *ps)
             struct expr *d = new_expr(EXPR_DEREF, line);
             d->rhs = binop(B_ADD, e, idx);
             e = d;
+        } else if (cur(ps)->kind == TOK_DOT ||
+                   cur(ps)->kind == TOK_ARROW) {
+            int is_arrow = cur(ps)->kind == TOK_ARROW;
+            int line = cur(ps)->line;
+            advance(ps);
+            if (cur(ps)->kind != TOK_IDENT)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a member name before %s",
+                           tok_describe(cur(ps)));
+            struct expr *m = new_expr(EXPR_MEMBER, line);
+            m->lhs = e;
+            m->name = cur(ps)->text;
+            m->is_arrow = is_arrow;
+            advance(ps);
+            e = m;
         } else if (cur(ps)->kind == TOK_PLUSPLUS ||
                    cur(ps)->kind == TOK_MINUSMINUS) {
             int delta = cur(ps)->kind == TOK_PLUSPLUS ? 1 : -1;
@@ -275,8 +549,8 @@ static struct expr *parse_unary(struct parser *ps)
         if (cur(ps)->kind == TOK_LPAREN) {
             struct lexer save = ps->lx;
             advance(ps);
-            if (tok_is_type_start(cur(ps)->kind)) {
-                e->cast_ty = parse_stars(ps, parse_type_spec(ps));
+            if (at_type_start(ps)) {
+                e->cast_ty = parse_stars(ps, parse_type_spec(ps, 0));
                 expect(ps, TOK_RPAREN, "')'");
                 return e;
             }
@@ -289,8 +563,8 @@ static struct expr *parse_unary(struct parser *ps)
         /* a cast, or a parenthesized expression — peek one token */
         struct lexer save = ps->lx;
         advance(ps);
-        if (tok_is_type_start(cur(ps)->kind)) {
-            struct type *ct = parse_stars(ps, parse_type_spec(ps));
+        if (at_type_start(ps)) {
+            struct type *ct = parse_stars(ps, parse_type_spec(ps, 0));
             expect(ps, TOK_RPAREN, "')'");
             e = new_expr(EXPR_CAST, t->line);
             e->cast_ty = ct;
@@ -389,9 +663,11 @@ static struct expr *parse_expr(struct parser *ps)
 
     if (k != TOK_ASSIGN && comp < 0)
         return e;
-    if (e->kind != EXPR_VAR && e->kind != EXPR_DEREF)
+    if (e->kind != EXPR_VAR && e->kind != EXPR_DEREF &&
+        e->kind != EXPR_MEMBER)
         diag_fatal(ps->lx.file, line,
-                   "assignment target must be a variable or *pointer");
+                   "assignment target must be a variable, *pointer, or "
+                   "member");
     if (comp >= 0 && e->kind != EXPR_VAR)
         diag_fatal(ps->lx.file, line,
                    "compound assignment through a pointer is not "
@@ -450,13 +726,13 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     struct token *t = cur(ps);
     struct stmt *s;
 
-    if (tok_is_type_start(t->kind)) {
+    if (at_type_start(ps)) {
         if (!allow_decl)
             diag_fatal(ps->lx.file, t->line,
                        "a declaration cannot be the body of if/while/for "
                        "(C99 forbids it too); wrap it in braces");
         s = new_stmt(STMT_DECL, t->line);
-        struct type *base = parse_type_spec(ps);
+        struct type *base = parse_type_spec(ps, 0);
         s->dty = parse_stars(ps, base);
         if (s->dty->kind == TY_VOID)
             diag_fatal(ps->lx.file, t->line,
@@ -467,30 +743,15 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                        tok_describe(cur(ps)));
         s->name = cur(ps)->text;
         advance(ps);
-        /* array declarator(s): int a[10], char m[3][4] — sizes must be
-         * integer literals until there is constant folding */
-        if (cur(ps)->kind == TOK_LBRACKET) {
-            int dims[4];
-            int ndims = 0;
-            while (cur(ps)->kind == TOK_LBRACKET) {
-                advance(ps);
-                if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
-                               "array size must be a positive integer "
-                               "literal");
-                if (ndims >= 4)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
-                               "more than 4 array dimensions");
-                dims[ndims++] = (int)cur(ps)->num;
-                advance(ps);
-                expect(ps, TOK_RBRACKET, "']'");
-            }
-            for (int i = ndims - 1; i >= 0; i--)
-                s->dty = ty_array(s->dty, dims[i]);
-            if (cur(ps)->kind == TOK_ASSIGN)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "array initializers are not supported yet");
-        }
+        int was_array = cur(ps)->kind == TOK_LBRACKET;
+        s->dty = parse_array_dims(ps, s->dty);
+        if (ty_size(s->dty) == 0)
+            diag_fatal(ps->lx.file, s->line,
+                       "'%s' has incomplete type %s", s->name,
+                       ty_name(s->dty));
+        if (was_array && cur(ps)->kind == TOK_ASSIGN)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "array initializers are not supported yet");
         if (cur(ps)->kind == TOK_ASSIGN) {
             advance(ps);
             s->expr = parse_expr(ps);
@@ -533,7 +794,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         s = new_stmt(STMT_FOR, t->line);
         advance(ps);
         expect(ps, TOK_LPAREN, "'('");
-        if (tok_is_type_start(cur(ps)->kind))
+        if (at_type_start(ps))
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "declarations in for-init are not supported yet; "
                        "declare the variable before the loop");
@@ -598,25 +859,10 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
 
     if (g->ty->kind == TY_VOID)
         diag_fatal(ps->lx.file, line, "a variable cannot have type void");
-    if (cur(ps)->kind == TOK_LBRACKET) {
-        int dims[4];
-        int ndims = 0;
-        while (cur(ps)->kind == TOK_LBRACKET) {
-            advance(ps);
-            if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "array size must be a positive integer "
-                           "literal");
-            if (ndims >= 4)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "more than 4 array dimensions");
-            dims[ndims++] = (int)cur(ps)->num;
-            advance(ps);
-            expect(ps, TOK_RBRACKET, "']'");
-        }
-        for (int i = ndims - 1; i >= 0; i--)
-            g->ty = ty_array(g->ty, dims[i]);
-    }
+    g->ty = parse_array_dims(ps, g->ty);
+    if (ty_size(g->ty) == 0)
+        diag_fatal(ps->lx.file, line,
+                   "'%s' has incomplete type %s", name, ty_name(g->ty));
     if (cur(ps)->kind == TOK_ASSIGN) {
         advance(ps);
         if (is_extern)
@@ -654,6 +900,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                       int seq)
 {
     int is_static = 0, is_extern = 0;
+    ps->seq = seq;
 
     if (cur(ps)->kind == TOK_KW_STATIC) {
         is_static = 1;
@@ -662,12 +909,44 @@ static void parse_top(struct parser *ps, struct unit *u,
         is_extern = 1;
         advance(ps);
     }
+    if (cur(ps)->kind == TOK_KW_TYPEDEF) {
+        if (is_static || is_extern)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "typedef cannot be static or extern");
+        advance(ps);
+        struct type *tbase = parse_type_spec(ps, 1);
+        if (!tbase)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a type after 'typedef'");
+        struct type *tt = parse_stars(ps, tbase);
+        if (cur(ps)->kind != TOK_IDENT)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "typedef needs a name, got %s",
+                       tok_describe(cur(ps)));
+        const char *tname = cur(ps)->text;
+        if (find_typedef(ps, tname))
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "redefinition of typedef '%s'", tname);
+        advance(ps);
+        expect(ps, TOK_SEMI, "';'");
+        struct typedefent *te = xcalloc(1, sizeof *te);
+        te->name = tname;
+        te->ty = tt;
+        te->next = ps->typedefs;
+        ps->typedefs = te;
+        return;
+    }
     if (cur(ps)->kind == TOK_IDENT)
         reject_reserved(ps, cur(ps)->text, cur(ps)->line);
-    struct type *base = parse_type_spec(ps);
+    struct type *base = parse_type_spec(ps, 1);
     if (!base)
         diag_fatal(ps->lx.file, cur(ps)->line,
                    "expected a type before %s", tok_describe(cur(ps)));
+    if (cur(ps)->kind == TOK_SEMI) {
+        /* bare declaration: 'struct X { ... };', 'enum { ... };' */
+        advance(ps);
+        return;
+    }
     struct type *ty = parse_stars(ps, base);
     if (cur(ps)->kind != TOK_IDENT)
         diag_fatal(ps->lx.file, cur(ps)->line,
@@ -689,6 +968,10 @@ static void parse_top(struct parser *ps, struct unit *u,
     struct func *f = xcalloc(1, sizeof *f);
     /* 'extern' on a function is the default linkage — accept, ignore */
     f->is_static = is_static;
+    if (ty->kind == TY_STRUCT)
+        diag_fatal(ps->lx.file, line,
+                   "returning a struct/union by value is not supported "
+                   "yet (SysV classification) — return a pointer");
     f->ret_ty = ty;
     f->name = name;
     f->line = line;
@@ -718,7 +1001,7 @@ static void parse_top(struct parser *ps, struct unit *u,
             }
             if (cur(ps)->kind == TOK_IDENT)
                 reject_reserved(ps, cur(ps)->text, cur(ps)->line);
-            struct type *pt = parse_type_spec(ps);
+            struct type *pt = parse_type_spec(ps, 0);
             if (!pt)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a parameter type before %s",
@@ -727,6 +1010,11 @@ static void parse_top(struct parser *ps, struct unit *u,
             if (pt->kind == TY_VOID)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "a parameter cannot have type void");
+            if (pt->kind == TY_STRUCT)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "struct/union parameters by value are not "
+                           "supported yet (SysV classification) — "
+                           "pass a pointer");
             if (f->nparams >= MAX_PARAMS)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "more than %d parameters "
@@ -789,6 +1077,11 @@ struct unit *parse_unit(const char *file, const char *src)
     struct unit *u = xcalloc(1, sizeof *u);
     u->file = file;
 
+    ps.unit = u;
+    ps.tags = NULL;
+    ps.typedefs = NULL;
+    ps.econst_tail = &u->econsts;
+    ps.seq = 0;
     lex_init(&ps.lx, file, src);
     struct func **ftail = &u->funcs;
     struct global **gtail = &u->globals;

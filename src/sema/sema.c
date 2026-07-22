@@ -154,7 +154,8 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
 
 static int is_lvalue(const struct expr *e)
 {
-    return e->kind == EXPR_VAR || e->kind == EXPR_DEREF;
+    return e->kind == EXPR_VAR || e->kind == EXPR_DEREF ||
+           e->kind == EXPR_MEMBER;
 }
 
 /* ---- expression checking ---- */
@@ -178,6 +179,21 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->var_index = i;
             e->ty = sc->vars[i].ty;
         } else {
+            /* enumerators fold to their constant right here */
+            struct econst *ec = u->econsts;
+            for (; ec; ec = ec->next)
+                if (strcmp(ec->name, e->name) == 0)
+                    break;
+            if (ec && ec->seq < cur_body_seq) {
+                e->kind = EXPR_NUM;
+                e->num = ec->val;
+                e->ty = ty_base(TY_INT, 0);
+                break;
+            }
+            if (ec)
+                diag_fatal(u->file, e->line,
+                           "enumerator '%s' is used before its "
+                           "declaration", e->name);
             struct global *g = find_global(u, e->name);
             if (g && g->seq < cur_body_seq) {
                 e->gref = g;
@@ -210,6 +226,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                                          "lvalue");
         if (e->lhs->undecayed)
             diag_fatal(u->file, e->line, "cannot assign to an array");
+        if (e->lhs->ty->kind == TY_STRUCT)
+            diag_fatal(u->file, e->line,
+                       "struct assignment is not supported yet — copy "
+                       "the members, or memcpy through pointers");
         check_expr(u, f, sc, e->rhs);
         need_scalar(u, e->rhs, "assignment");
         e->rhs = convert_assign(u, e->rhs, e->lhs->ty, "assignment");
@@ -287,11 +307,43 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        ty_name(e->cast_ty));
         e->ty = e->cast_ty;
         break;
+    case EXPR_MEMBER: {
+        check_expr(u, f, sc, e->lhs);
+        struct type *base = e->lhs->ty;
+        if (e->is_arrow) {
+            if (base->kind != TY_PTR || base->pointee->kind != TY_STRUCT)
+                diag_fatal(u->file, e->line,
+                           "'->' needs a pointer to a struct/union, "
+                           "got %s", ty_name(base));
+            base = base->pointee;
+        } else if (base->kind != TY_STRUCT) {
+            diag_fatal(u->file, e->line,
+                       "'.' needs a struct/union, got %s (use '->' "
+                       "through a pointer)", ty_name(base));
+        }
+        if (!base->complete)
+            diag_fatal(u->file, e->line,
+                       "%s is incomplete here (its body comes later "
+                       "or never)", ty_name(base));
+        e->memb = ty_find_member(base, e->name);
+        if (!e->memb)
+            diag_fatal(u->file, e->line, "%s has no member '%s'",
+                       ty_name(base), e->name);
+        e->ty = e->memb->ty;
+        if (e->ty->kind == TY_ARRAY) {
+            e->undecayed = e->ty;
+            e->ty = ty_ptr(e->ty->pointee);
+        }
+        break;
+    }
     case EXPR_SIZEOF: {
         long size;
         if (e->cast_ty) {
             if (e->cast_ty->kind == TY_VOID)
                 diag_fatal(u->file, e->line, "sizeof(void)");
+            if (ty_size(e->cast_ty) == 0)
+                diag_fatal(u->file, e->line, "sizeof of incomplete %s",
+                           ty_name(e->cast_ty));
             size = ty_size(e->cast_ty);
         } else {
             check_expr(u, f, sc, e->rhs);

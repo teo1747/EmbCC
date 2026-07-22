@@ -21,10 +21,12 @@ usual arithmetic conversions, signed narrowing, unsigned div/shift/compare)
 against gcc. Arrays (incl. 2-D, decay, sizeof) and string literals in
 .rodata landed next, with variadic external calls (al=0 per SysV):
 **an EmbCC-compiled hello world runs — puts and printf work.** Globals
-followed: .data/.bss with static/extern linkage, OBJECT symbols carrying
-real sizes, PC32 relocations against each global's own symbol. Next:
-structs/unions/enums, then the preprocessor last, judged against newlib's
-headers.
+followed (.data/.bss, static/extern, OBJECT symbols), then the last big
+language surface: structs/unions/enums with SysV layout and padding,
+member access, typedef (incl. anonymous-struct form), enums as folded
+int constants — struct assignment/params/returns refused pending SysV
+classification. What remains of M2: the preprocessor, judged against
+newlib's headers, then the tally.c acceptance on the OS.
 
 ---
 

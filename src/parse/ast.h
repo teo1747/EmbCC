@@ -16,7 +16,8 @@
 
 enum expr_kind { EXPR_NUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
-                 EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF };
+                 EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
+                 EXPR_MEMBER };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -47,6 +48,10 @@ struct expr {
                              * NOT/NEG/BNOT/DEREF/ADDR/CAST use rhs only */
     struct type *cast_ty; /* EXPR_CAST target; EXPR_SIZEOF(type) */
     int is_post, delta;   /* EXPR_INCDEC: x++/x-- vs ++x/--x, +1/-1 */
+    /* EXPR_MEMBER: lhs is the base, name the member; is_arrow for ->.
+     * memb is resolved by sema (offset + type). */
+    int is_arrow;
+    struct member *memb;
     struct expr *args[MAX_PARAMS]; /* EXPR_CALL */
     int nargs;
     struct func *callee;  /* EXPR_CALL: resolved by sema */
@@ -122,10 +127,19 @@ struct func {
     int sym_ndx;          /* driver: UNDEF symbol index (externals only) */
 };
 
+/* An enumerator: a named int constant at file scope. */
+struct econst {
+    const char *name;
+    long val;
+    int seq;
+    struct econst *next;
+};
+
 struct unit {
     const char *file;
     struct func *funcs;
     struct global *globals;
+    struct econst *econsts;
 };
 
 #endif

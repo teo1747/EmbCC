@@ -63,6 +63,10 @@ static const struct {
     { "return", TOK_KW_RETURN },
     { "static", TOK_KW_STATIC },
     { "extern", TOK_KW_EXTERN },
+    { "struct", TOK_KW_STRUCT },
+    { "union", TOK_KW_UNION },
+    { "enum", TOK_KW_ENUM },
+    { "typedef", TOK_KW_TYPEDEF },
     { "if", TOK_KW_IF },
     { "else", TOK_KW_ELSE },
     { "while", TOK_KW_WHILE },
@@ -159,6 +163,7 @@ void lex_next(struct lexer *lx)
     case '-':
         if (lx->p[1] == '-') { t->kind = TOK_MINUSMINUS; lx->p++; }
         else if (lx->p[1] == '=') { t->kind = TOK_MINUSEQ; lx->p++; }
+        else if (lx->p[1] == '>') { t->kind = TOK_ARROW; lx->p++; }
         else t->kind = TOK_MINUS;
         break;
     case '*':
@@ -313,11 +318,9 @@ void lex_next(struct lexer *lx)
         if (lx->p[1] == '.' && lx->p[2] == '.') {
             t->kind = TOK_ELLIPSIS;
             lx->p += 2;
-            break;
+        } else {
+            t->kind = TOK_DOT;
         }
-        diag_fatal(lx->file, lx->line,
-                   "'.' member access is not supported yet (structs come "
-                   "later in M2)");
         break;
     default:
         diag_fatal(lx->file, lx->line,
@@ -350,6 +353,12 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_RETURN: return "'return'";
     case TOK_KW_STATIC: return "'static'";
     case TOK_KW_EXTERN: return "'extern'";
+    case TOK_KW_STRUCT: return "'struct'";
+    case TOK_KW_UNION: return "'union'";
+    case TOK_KW_ENUM: return "'enum'";
+    case TOK_KW_TYPEDEF: return "'typedef'";
+    case TOK_DOT: return "'.'";
+    case TOK_ARROW: return "'->'";
     case TOK_KW_IF: return "'if'";
     case TOK_KW_ELSE: return "'else'";
     case TOK_KW_WHILE: return "'while'";

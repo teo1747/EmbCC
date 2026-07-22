@@ -16,13 +16,26 @@
 #define EMBCC_SEMA_TYPE_H
 
 enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_PTR,
-               TY_ARRAY };
+               TY_ARRAY, TY_STRUCT };
+
+struct member {
+    const char *name;
+    struct type *ty;
+    int off;
+};
 
 struct type {
     enum ty_kind kind;
     int is_unsigned;        /* integers only */
     struct type *pointee;   /* TY_PTR: target; TY_ARRAY: element */
     int count;              /* TY_ARRAY: element count */
+    /* TY_STRUCT (unions too — one type kind, is_union flag): */
+    const char *tag;        /* NULL for anonymous */
+    int is_union;
+    int complete;           /* body seen; size/align/members valid */
+    struct member *members;
+    int nmembers;
+    int size, align;        /* SysV layout, computed when completed */
 };
 
 /* Base types are interned singletons — pointer equality works for
@@ -31,7 +44,16 @@ struct type *ty_base(enum ty_kind kind, int is_unsigned);
 struct type *ty_ptr(struct type *pointee);
 struct type *ty_array(struct type *elem, int count);
 
+/* A new, incomplete struct/union type (one node per tag — completed in
+ * place by ty_struct_layout once its body is parsed). */
+struct type *ty_struct(const char *tag, int is_union);
+/* Assigns member offsets and the struct's size/align per SysV, and
+ * marks the type complete. Members must already have complete types. */
+void ty_struct_layout(struct type *t, struct member *members, int n);
+struct member *ty_find_member(struct type *t, const char *name);
+
 int ty_size(const struct type *t);          /* bytes; void has none */
+int ty_align(const struct type *t);
 int ty_equal(const struct type *a, const struct type *b);
 int ty_is_integer(const struct type *t);
 int ty_is_scalar(const struct type *t);     /* integer or pointer */
