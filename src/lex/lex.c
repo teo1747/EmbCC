@@ -53,7 +53,13 @@ static const struct {
     enum tok_kind kind;
 } keywords[] = {
     { "int", TOK_KW_INT },
+    { "char", TOK_KW_CHAR },
+    { "short", TOK_KW_SHORT },
+    { "long", TOK_KW_LONG },
+    { "unsigned", TOK_KW_UNSIGNED },
+    { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
+    { "sizeof", TOK_KW_SIZEOF },
     { "return", TOK_KW_RETURN },
     { "static", TOK_KW_STATIC },
     { "if", TOK_KW_IF },
@@ -80,15 +86,37 @@ void lex_next(struct lexer *lx)
 
     if (isdigit((unsigned char)*lx->p)) {
         char *end;
-        long v = strtol(lx->p, &end, 0);
-        if (isalpha((unsigned char)*end) || *end == '_' || *end == '.')
+        int hex = lx->p[0] == '0' &&
+                  (lx->p[1] == 'x' || lx->p[1] == 'X');
+        unsigned long v = strtoul(lx->p, &end, 0);
+        int has_u = 0, has_l = 0;
+        while (*end == 'u' || *end == 'U' || *end == 'l' || *end == 'L') {
+            if (*end == 'u' || *end == 'U')
+                has_u = 1;
+            else
+                has_l = 1;
+            end++;
+        }
+        if (isalnum((unsigned char)*end) || *end == '_' || *end == '.')
             diag_fatal(lx->file, lx->line,
-                       "only plain integer constants are supported yet");
-        if (v < INT_MIN || v > INT_MAX)
-            diag_fatal(lx->file, lx->line,
-                       "integer constant out of range for int");
+                       "malformed integer constant");
         t->kind = TOK_NUM;
-        t->num = v;
+        t->num = (long)v;
+        /* C99 typing: decimal grows int -> long; hex additionally
+         * passes through the unsigned types. Suffixes force it. */
+        t->num_long = has_l || v > (unsigned long)INT_MAX;
+        t->num_uns = has_u;
+        if (hex && !has_u) {
+            if (v > (unsigned long)INT_MAX && v <= 0xffffffffUL) {
+                t->num_uns = 1;
+                t->num_long = has_l;
+            } else if (v > (unsigned long)LONG_MAX) {
+                t->num_uns = 1;
+            }
+        }
+        if (!hex && !has_u && !has_l && v > (unsigned long)LONG_MAX)
+            diag_fatal(lx->file, lx->line,
+                       "integer constant out of range for long");
         lx->p = end;
         return;
     }
@@ -117,6 +145,8 @@ void lex_next(struct lexer *lx)
     case ')': t->kind = TOK_RPAREN; break;
     case '{': t->kind = TOK_LBRACE; break;
     case '}': t->kind = TOK_RBRACE; break;
+    case '[': t->kind = TOK_LBRACKET; break;
+    case ']': t->kind = TOK_RBRACKET; break;
     case ',': t->kind = TOK_COMMA; break;
     case ';': t->kind = TOK_SEMI; break;
     case '~': t->kind = TOK_TILDE; break;
@@ -197,10 +227,46 @@ void lex_next(struct lexer *lx)
                    "preprocessor directives are not supported yet "
                    "(the preprocessor is M2 — see docs/ROADMAP.md)");
         break;
+    case '\'': {
+        lx->p++;
+        long v;
+        if (*lx->p == '\\') {
+            lx->p++;
+            switch (*lx->p) {
+            case 'n': v = '\n'; break;
+            case 't': v = '\t'; break;
+            case 'r': v = '\r'; break;
+            case '0': v = 0; break;
+            case '\\': v = '\\'; break;
+            case '\'': v = '\''; break;
+            case '"': v = '"'; break;
+            default:
+                diag_fatal(lx->file, lx->line,
+                           "unknown escape '\\%c' in character constant",
+                           *lx->p);
+                return;
+            }
+            lx->p++;
+        } else if (*lx->p && *lx->p != '\'' && *lx->p != '\n') {
+            v = (unsigned char)*lx->p;
+            lx->p++;
+        } else {
+            diag_fatal(lx->file, lx->line, "empty character constant");
+            return;
+        }
+        if (*lx->p != '\'')
+            diag_fatal(lx->file, lx->line,
+                       "unterminated character constant");
+        t->kind = TOK_NUM; /* a char constant has type int in C */
+        t->num = v;
+        t->num_long = 0;
+        t->num_uns = 0;
+        break;
+    }
     case '"':
-    case '\'':
         diag_fatal(lx->file, lx->line,
-                   "string and character literals are not supported yet");
+                   "string literals are not supported yet (they need "
+                   "arrays and .rodata — the next increment)");
         break;
     default:
         diag_fatal(lx->file, lx->line,
@@ -221,6 +287,12 @@ const char *tok_describe(const struct token *t)
         snprintf(buf, sizeof buf, "'%s'", t->text);
         return buf;
     case TOK_KW_INT: return "'int'";
+    case TOK_KW_CHAR: return "'char'";
+    case TOK_KW_SHORT: return "'short'";
+    case TOK_KW_LONG: return "'long'";
+    case TOK_KW_UNSIGNED: return "'unsigned'";
+    case TOK_KW_SIGNED: return "'signed'";
+    case TOK_KW_SIZEOF: return "'sizeof'";
     case TOK_KW_VOID: return "'void'";
     case TOK_KW_RETURN: return "'return'";
     case TOK_KW_STATIC: return "'static'";
@@ -234,6 +306,8 @@ const char *tok_describe(const struct token *t)
     case TOK_RPAREN: return "')'";
     case TOK_LBRACE: return "'{'";
     case TOK_RBRACE: return "'}'";
+    case TOK_LBRACKET: return "'['";
+    case TOK_RBRACKET: return "']'";
     case TOK_COMMA: return "','";
     case TOK_SEMI: return "';'";
     case TOK_PLUS: return "'+'";

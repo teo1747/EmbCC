@@ -2,8 +2,10 @@
 
 Types, declarations, diagnostics — ../../docs/ARCHITECTURE.md §2.
 
-State: name resolution (one flat scope per function, shadowing rejected
-so the subset stays strictly inside C99), prototype/definition merging
-with C linkage rules (static-then-non-static keeps internal; the reverse
-is an error, as in gcc), declaration-before-use, arity, all-paths-return
-analysis, and undefined-static-but-called refused at compile time.
+State: the type system lives here (type.h/type.c — void, the integer
+types with unsigned variants, pointers; LP64). Sema annotates every
+expression with a type and materializes every implicit C conversion as
+an explicit cast node, so irgen never guesses widths. Also: prototype/
+definition merging with C linkage rules, lvalue checking, one flat
+scope per function (shadowing rejected — strictly fewer programs than
+C99), all-paths-return, undefined-static-but-called refused.

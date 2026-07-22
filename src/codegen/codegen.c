@@ -1,7 +1,12 @@
 /* IR → x86-64, System V AMD64 (ARCHITECTURE §4). Deliberately naive:
  * every vreg lives in a stack slot, every operation goes through eax.
  * Correct-and-slow first — register allocation is a post-M4 reason to
- * exist, not an M1 one (ARCHITECTURE §3).
+ * exist, not an M2 one (ARCHITECTURE §3).
+ *
+ * Slot discipline: temporaries are stored as full 8 bytes (32-bit
+ * results arrive zero-extended, so the slot is always well-defined);
+ * variables are stored at their true width so their address points at
+ * exactly sizeof(type) meaningful bytes.
  */
 #include "codegen.h"
 
@@ -24,16 +29,17 @@ struct callsite {
     struct func *target;
 };
 
-/* setcc condition byte for each comparison predicate (signed int). */
-static int cc_for(enum binop pred)
+/* setcc opcode byte per predicate; pointers and unsigned integers use
+ * the unsigned condition set (b/be/a/ae). */
+static int cc_for(enum binop pred, int sign)
 {
     switch (pred) {
-    case B_EQ: return 0x94; /* sete  */
-    case B_NE: return 0x95; /* setne */
-    case B_LT: return 0x9c; /* setl  */
-    case B_LE: return 0x9e; /* setle */
-    case B_GT: return 0x9f; /* setg  */
-    case B_GE: return 0x9d; /* setge */
+    case B_EQ: return 0x94;              /* sete */
+    case B_NE: return 0x95;              /* setne */
+    case B_LT: return sign ? 0x9c : 0x92; /* setl / setb */
+    case B_LE: return sign ? 0x9e : 0x96; /* setle / setbe */
+    case B_GT: return sign ? 0x9f : 0x97; /* setg / seta */
+    case B_GE: return sign ? 0x9d : 0x93; /* setge / setae */
     default:
         fprintf(stderr, "embcc: internal: bad cmp predicate %d\n", pred);
         exit(1);
@@ -69,12 +75,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
         struct ir_ins *i = &fn->ins[n];
         switch (i->op) {
         case IR_CONST:
-            x86_mov_eax_imm32(text, i->imm);
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+            x86_mov_eax_imm(text, i->imm, i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_MOV:
-            x86_mov_eax_mem(text, slot_disp(i->a));
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+            x86_load_slot(text, slot_disp(i->a), 8, 0, 8);
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_ADD:
         case IR_SUB:
@@ -82,49 +88,78 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_AND:
         case IR_OR:
         case IR_XOR:
-            x86_mov_eax_mem(text, slot_disp(i->a));
+            x86_load_slot(text, slot_disp(i->a), i->w, 0, i->w);
             x86_alu_eax_mem(text,
                             i->op == IR_ADD ? '+' :
                             i->op == IR_SUB ? '-' :
                             i->op == IR_MUL ? '*' :
                             i->op == IR_AND ? '&' :
                             i->op == IR_OR ? '|' : '^',
-                            slot_disp(i->b));
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+                            slot_disp(i->b), i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_DIV:
         case IR_MOD:
-            x86_mov_eax_mem(text, slot_disp(i->a));
-            x86_cdq(text);
-            x86_idiv_mem(text, slot_disp(i->b));
+            x86_load_slot(text, slot_disp(i->a), i->w, 0, i->w);
+            if (i->sign)
+                x86_cdq(text, i->w);
+            else
+                x86_zero_edx(text);
+            x86_div_mem(text, slot_disp(i->b), i->sign, i->w);
             if (i->op == IR_MOD)
-                x86_mov_eax_edx(text); /* remainder lives in edx */
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+                x86_mov_eax_edx(text, i->w); /* remainder lives in edx */
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_SHL:
         case IR_SHR:
-            x86_mov_eax_mem(text, slot_disp(i->a));
-            x86_mov_ecx_mem(text, slot_disp(i->b));
-            if (i->op == IR_SHL)
-                x86_shl_eax_cl(text);
-            else
-                x86_sar_eax_cl(text);
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+            x86_load_slot(text, slot_disp(i->a), i->w, 0, i->w);
+            x86_mov_ecx_mem(text, slot_disp(i->b), 4);
+            x86_shift_eax_cl(text,
+                             i->op == IR_SHL ? '<' :
+                             i->sign ? '>' : 'u', i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_NEG:
         case IR_BNOT:
-            x86_mov_eax_mem(text, slot_disp(i->a));
+            x86_load_slot(text, slot_disp(i->a), i->w, 0, i->w);
             if (i->op == IR_NEG)
-                x86_neg_eax(text);
+                x86_neg_eax(text, i->w);
             else
-                x86_not_eax(text);
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+                x86_not_eax(text, i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_CMP:
-            x86_mov_eax_mem(text, slot_disp(i->a));
-            x86_cmp_eax_mem(text, slot_disp(i->b));
-            x86_setcc_eax(text, cc_for(i->pred));
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+            x86_load_slot(text, slot_disp(i->a), i->w, 0, i->w);
+            x86_cmp_eax_mem(text, slot_disp(i->b), i->w);
+            x86_setcc_eax(text, cc_for(i->pred, i->sign));
+            x86_store_slot(text, slot_disp(i->dst), 8);
+            break;
+        case IR_LDVAR:
+            x86_load_slot(text, slot_disp(i->a), i->size, i->sign, i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
+            break;
+        case IR_STVAR:
+            x86_load_slot(text, slot_disp(i->a), 8, 0, 8);
+            x86_store_slot(text, slot_disp(i->dst), i->size);
+            break;
+        case IR_ADDR:
+            x86_lea_rax_slot(text, slot_disp(i->a));
+            x86_store_slot(text, slot_disp(i->dst), 8);
+            break;
+        case IR_LOAD:
+            x86_load_slot(text, slot_disp(i->a), 8, 0, 8); /* the address */
+            x86_load_mem_rax(text, i->size, i->sign, i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
+            break;
+        case IR_STORE:
+            x86_mov_rcx_slot(text, slot_disp(i->a));       /* the address */
+            x86_load_slot(text, slot_disp(i->b), 8, 0, 8); /* the value */
+            x86_store_mem_rcx(text, i->size);
+            break;
+        case IR_EXT:
+            /* re-extend from the low `size` bytes of the temp's slot */
+            x86_load_slot(text, slot_disp(i->a), i->size, i->sign, i->w);
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         case IR_LABEL:
             label_off[i->label] = text->len;
@@ -133,8 +168,8 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_BRZ: {
             int patch;
             if (i->op == IR_BRZ) {
-                x86_mov_eax_mem(text, slot_disp(i->a));
-                x86_test_eax(text);
+                x86_load_slot(text, slot_disp(i->a), i->w, 0, i->w);
+                x86_test_eax(text, i->w);
                 patch = x86_jz_rel32(text);
             } else {
                 patch = x86_jmp_rel32(text);
@@ -170,11 +205,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 (*ext)[*next].callee = i->callee;
                 (*next)++;
             }
-            x86_mov_mem_eax(text, slot_disp(i->dst));
+            x86_store_slot(text, slot_disp(i->dst), 8);
             break;
         }
         case IR_RET:
-            x86_mov_eax_mem(text, slot_disp(i->a));
+            if (i->a >= 0)
+                x86_load_slot(text, slot_disp(i->a), 8, 0, 8);
             x86_epilogue(text);
             break;
         }

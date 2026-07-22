@@ -17,17 +17,17 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.2.2-m2.externals"
+#define EMBCC_VERSION "0.3.0-m2.types1"
 
 static void print_version(void)
 {
     /* Honest: names what exists and what does not. */
     printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
            EMBCC_VERSION);
-    printf("C subset: int functions, if/else, while, for, break/continue, "
-           "comparisons, &&/||/!, full int arithmetic and bitwise ops, "
-           "assignment incl. compound and ++/--, prototypes and calls to "
-           "external int functions (PLT32 relocations); compile with -c.\n");
+    printf("C subset: char/short/int/long with unsigned, pointers, void "
+           "returns, sizeof, casts, full control flow and operators, "
+           "prototypes and external calls (PLT32 relocations); "
+           "compile with -c.\n");
     printf("No preprocessor yet (M2), no linker yet (M3) — "
            "link objects with the existing toolchain.\n");
 }

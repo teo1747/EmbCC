@@ -14,7 +14,13 @@ enum tok_kind {
     TOK_NUM,
     TOK_IDENT,
     TOK_KW_INT,
+    TOK_KW_CHAR,
+    TOK_KW_SHORT,
+    TOK_KW_LONG,
+    TOK_KW_UNSIGNED,
+    TOK_KW_SIGNED,
     TOK_KW_VOID,
+    TOK_KW_SIZEOF,
     TOK_KW_RETURN,
     TOK_KW_STATIC,
     TOK_KW_IF,
@@ -27,6 +33,8 @@ enum tok_kind {
     TOK_RPAREN,
     TOK_LBRACE,
     TOK_RBRACE,
+    TOK_LBRACKET,
+    TOK_RBRACKET,
     TOK_COMMA,
     TOK_SEMI,
     TOK_PLUS,
@@ -68,8 +76,10 @@ enum tok_kind {
 struct token {
     enum tok_kind kind;
     int line;
-    long num;   /* TOK_NUM */
-    char *text; /* TOK_IDENT */
+    long num;      /* TOK_NUM */
+    int num_long;  /* TOK_NUM: type is long (L suffix or magnitude) */
+    int num_uns;   /* TOK_NUM: type is unsigned (U suffix or hex range) */
+    char *text;    /* TOK_IDENT */
 };
 
 struct lexer {

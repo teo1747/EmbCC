@@ -17,6 +17,7 @@ SRCS := \
 	src/lex/lex.c \
 	src/parse/parse.c \
 	src/sema/sema.c \
+	src/sema/type.c \
 	src/ir/irgen.c \
 	src/codegen/codegen.c \
 	src/asm/emit.c \

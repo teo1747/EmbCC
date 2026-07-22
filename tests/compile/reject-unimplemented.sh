@@ -39,12 +39,40 @@ check do-while \
 check ternary \
     'int main(void) { return 1 ? 42 : 0; }' \
     "not supported"
-check address-of \
-    'int main(void) { int x = 1; return !&x; }' \
-    "address-of is not supported"
 check break-outside-loop \
     'int main(void) { break; return 0; }' \
     "outside of a loop"
+check deref-non-pointer \
+    'int main(void) { int x = 1; return *x; }' \
+    "cannot dereference int"
+check deref-void-ptr \
+    'int main(void) { void *p = 0; return *p; }' \
+    "cannot dereference void"
+check ptr-plus-ptr \
+    'int main(void) { int x; int *a = &x; int *b = &x; return !(a + b); }' \
+    "cannot add two pointers"
+check int-to-ptr-implicit \
+    'int main(void) { int *p = 42; return !p; }' \
+    "without a cast"
+check ptr-int-compare \
+    'int main(void) { int x; int *p = &x; return p == 42; }' \
+    "needs a cast"
+check incompatible-ptr-assign \
+    'int main(void) { int x; char *p = &x; return !p; }' \
+    "without a cast"
+check compound-through-pointer \
+    'int main(void) { int x = 1; int *p = &x; *p += 1; return x; }' \
+    "compound assignment through a pointer"
+check addr-of-rvalue \
+    'int main(void) { int x = 1; return !&(x + 1); }' \
+    "needs a variable"
+check function-pointer \
+    'static int f(void) { return 1; }
+int main(void) { return !&f; }' \
+    "function pointers are not supported"
+check void-variable \
+    'int main(void) { void v; return 0; }' \
+    "cannot have type void"
 check preprocessor \
     '#include <stdio.h>
 int main(void) { return 0; }' \
@@ -52,9 +80,6 @@ int main(void) { return 0; }' \
 check float-type \
     'float main(void) { return 0; }' \
     "not supported"
-check pointer \
-    'int main(void) { int *p; return 0; }' \
-    "pointers are not supported"
 check undefined-call \
     'int main(void) { return foo(); }' \
     "not declared"
@@ -67,7 +92,12 @@ check proto-arity-mismatch \
     'int f(int, int);
 int f(int a) { return a; }
 int main(void) { return f(1); }' \
-    "declared with 1 parameter but 2 earlier"
+    "conflicting declaration"
+check proto-type-mismatch \
+    'int f(int x);
+char *f(int x) { return 0; }
+int main(void) { return !f(1); }' \
+    "conflicting declaration"
 check static-never-defined \
     'static int ghost(void);
 int main(void) { return ghost(); }' \

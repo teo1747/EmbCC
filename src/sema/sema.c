@@ -1,8 +1,7 @@
-/* Name resolution and the checks the subset needs. Everything is int,
- * so there is no type inference to do — what remains is exactly the set
- * of ways a program could silently lie: unknown names, arity mismatches,
- * calls that would need a relocation (externals), and control flow
- * falling off the end of a function.
+/* Name resolution and type checking. Sema's output contract: every
+ * expression node carries a type, and every implicit conversion C
+ * would perform is materialized as an explicit EXPR_CAST node — irgen
+ * never guesses about widths or signedness, it just reads the tree.
  */
 #include "sema.h"
 
@@ -10,27 +9,34 @@
 #include <string.h>
 
 #include "../driver/util.h"
+#include "type.h"
+
+struct vardef {
+    const char *name;
+    struct type *ty;
+};
 
 struct scope {
-    const char **names;
+    struct vardef *vars;
     int n, cap;
 };
 
 static int scope_find(struct scope *sc, const char *name)
 {
     for (int i = 0; i < sc->n; i++)
-        if (strcmp(sc->names[i], name) == 0)
+        if (strcmp(sc->vars[i].name, name) == 0)
             return i;
     return -1;
 }
 
-static int scope_add(struct scope *sc, const char *name)
+static int scope_add(struct scope *sc, const char *name, struct type *ty)
 {
     if (sc->n == sc->cap) {
         sc->cap = sc->cap ? sc->cap * 2 : 8;
-        sc->names = xrealloc(sc->names, (size_t)sc->cap * sizeof *sc->names);
+        sc->vars = xrealloc(sc->vars, (size_t)sc->cap * sizeof *sc->vars);
     }
-    sc->names[sc->n] = name;
+    sc->vars[sc->n].name = name;
+    sc->vars[sc->n].ty = ty;
     return sc->n++;
 }
 
@@ -44,39 +50,133 @@ static struct func *find_func(struct unit *u, const char *name)
     return NULL;
 }
 
+/* ---- conversions ---- */
+
+static int is_null_const(const struct expr *e)
+{
+    return e->kind == EXPR_NUM && e->num == 0;
+}
+
+/* Wrap in an implicit cast node unless already exactly that type. */
+static struct expr *mk_cast(struct expr *inner, struct type *to)
+{
+    if (ty_equal(inner->ty, to))
+        return inner;
+    struct expr *c = xcalloc(1, sizeof *c);
+    c->kind = EXPR_CAST;
+    c->line = inner->line;
+    c->cast_ty = to;
+    c->rhs = inner;
+    c->ty = to;
+    return c;
+}
+
+/* C's integer promotions: everything narrower than int becomes int
+ * (all narrow values fit, so the promoted type is always signed). */
+static struct type *promote(struct type *t)
+{
+    if (t->kind == TY_CHAR || t->kind == TY_SHORT)
+        return ty_base(TY_INT, 0);
+    return t;
+}
+
+/* Usual arithmetic conversions, LP64: ranks are int(32) and long(64);
+ * long can represent every unsigned int, so mixed int/long keeps the
+ * long's signedness. */
+static struct type *arith_common(struct type *a, struct type *b)
+{
+    a = promote(a);
+    b = promote(b);
+    int wa = ty_wide(a), wb = ty_wide(b);
+    if (wa || wb) {
+        int uns;
+        if (wa && wb)
+            uns = a->is_unsigned || b->is_unsigned;
+        else
+            uns = (wa ? a : b)->is_unsigned;
+        return ty_base(TY_LONG, uns);
+    }
+    return ty_base(TY_INT, a->is_unsigned || b->is_unsigned);
+}
+
+static void need_scalar(struct unit *u, struct expr *e, const char *what)
+{
+    if (!ty_is_scalar(e->ty))
+        diag_fatal(u->file, e->line, "%s needs a scalar value, got %s",
+                   what, ty_name(e->ty));
+}
+
+static void need_integer(struct unit *u, struct expr *e, const char *what)
+{
+    if (!ty_is_integer(e->ty))
+        diag_fatal(u->file, e->line, "%s needs an integer, got %s",
+                   what, ty_name(e->ty));
+}
+
+/* The conversions assignment performs (also used for arguments and
+ * return values). Explicit casts are looser; this is the implicit set. */
+static struct expr *convert_assign(struct unit *u, struct expr *rhs,
+                                   struct type *to, const char *ctx)
+{
+    if (ty_is_integer(to) && ty_is_integer(rhs->ty))
+        return mk_cast(rhs, to);
+    if (to->kind == TY_PTR) {
+        if (rhs->ty->kind == TY_PTR &&
+            (ty_equal(rhs->ty, to) || to->pointee->kind == TY_VOID ||
+             rhs->ty->pointee->kind == TY_VOID))
+            return mk_cast(rhs, to);
+        if (is_null_const(rhs))
+            return mk_cast(rhs, to);
+        diag_fatal(u->file, rhs->line,
+                   "%s: cannot convert %s to %s without a cast",
+                   ctx, ty_name(rhs->ty), ty_name(to));
+    }
+    if (ty_is_integer(to) && rhs->ty->kind == TY_PTR)
+        diag_fatal(u->file, rhs->line,
+                   "%s: converting %s to %s needs an explicit cast",
+                   ctx, ty_name(rhs->ty), ty_name(to));
+    diag_fatal(u->file, rhs->line, "%s: cannot convert %s to %s",
+               ctx, ty_name(rhs->ty), ty_name(to));
+    return NULL;
+}
+
+static int is_lvalue(const struct expr *e)
+{
+    return e->kind == EXPR_VAR || e->kind == EXPR_DEREF;
+}
+
+/* ---- expression checking ---- */
+
 static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        struct expr *e)
 {
     switch (e->kind) {
     case EXPR_NUM:
+        /* type assigned by the parser from the literal's shape */
         break;
     case EXPR_VAR: {
         int i = scope_find(sc, e->name);
         if (i < 0) {
             if (find_func(u, e->name))
                 diag_fatal(u->file, e->line,
-                           "'%s' is a function; taking its address is "
+                           "'%s' is a function; function pointers are "
                            "not supported yet", e->name);
             diag_fatal(u->file, e->line,
                        "'%s' is not declared in '%s'", e->name, f->name);
         }
         e->var_index = i;
+        e->ty = sc->vars[i].ty;
         break;
     }
-    case EXPR_ASSIGN: {
-        int i = scope_find(sc, e->name);
-        if (i < 0)
-            diag_fatal(u->file, e->line,
-                       "assignment to '%s', which is not declared in '%s'",
-                       e->name, f->name);
-        e->var_index = i;
+    case EXPR_ASSIGN:
+        check_expr(u, f, sc, e->lhs);
+        if (!is_lvalue(e->lhs))
+            diag_fatal(u->file, e->line, "assignment target is not an "
+                                         "lvalue");
         check_expr(u, f, sc, e->rhs);
-        break;
-    }
-    case EXPR_NOT:
-    case EXPR_NEG:
-    case EXPR_BNOT:
-        check_expr(u, f, sc, e->rhs);
+        need_scalar(u, e->rhs, "assignment");
+        e->rhs = convert_assign(u, e->rhs, e->lhs->ty, "assignment");
+        e->ty = e->lhs->ty;
         break;
     case EXPR_INCDEC: {
         int i = scope_find(sc, e->name);
@@ -85,12 +185,174 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        "++/-- on '%s', which is not declared in '%s'",
                        e->name, f->name);
         e->var_index = i;
+        e->ty = sc->vars[i].ty;
+        if (e->ty->kind == TY_PTR) {
+            if (e->ty->pointee->kind == TY_VOID)
+                diag_fatal(u->file, e->line,
+                           "++/-- on a void pointer");
+        } else if (!ty_is_integer(e->ty)) {
+            diag_fatal(u->file, e->line, "++/-- needs an integer or "
+                                         "pointer, got %s",
+                       ty_name(e->ty));
+        }
         break;
     }
-    case EXPR_BINOP:
+    case EXPR_NOT:
+        check_expr(u, f, sc, e->rhs);
+        need_scalar(u, e->rhs, "'!'");
+        e->ty = ty_base(TY_INT, 0);
+        break;
+    case EXPR_NEG:
+    case EXPR_BNOT:
+        check_expr(u, f, sc, e->rhs);
+        need_integer(u, e->rhs, e->kind == EXPR_NEG ? "unary '-'" : "'~'");
+        e->ty = promote(e->rhs->ty);
+        e->rhs = mk_cast(e->rhs, e->ty);
+        break;
+    case EXPR_DEREF:
+        check_expr(u, f, sc, e->rhs);
+        if (e->rhs->ty->kind != TY_PTR)
+            diag_fatal(u->file, e->line, "cannot dereference %s",
+                       ty_name(e->rhs->ty));
+        if (e->rhs->ty->pointee->kind == TY_VOID)
+            diag_fatal(u->file, e->line, "cannot dereference void *");
+        e->ty = e->rhs->ty->pointee;
+        break;
+    case EXPR_ADDR:
+        check_expr(u, f, sc, e->rhs);
+        if (!is_lvalue(e->rhs))
+            diag_fatal(u->file, e->line,
+                       "'&' needs a variable or *pointer");
+        e->ty = ty_ptr(e->rhs->ty);
+        break;
+    case EXPR_CAST:
+        check_expr(u, f, sc, e->rhs);
+        need_scalar(u, e->rhs, "a cast");
+        if (!ty_is_scalar(e->cast_ty))
+            diag_fatal(u->file, e->line, "cannot cast to %s",
+                       ty_name(e->cast_ty));
+        e->ty = e->cast_ty;
+        break;
+    case EXPR_SIZEOF: {
+        long size;
+        if (e->cast_ty) {
+            if (e->cast_ty->kind == TY_VOID)
+                diag_fatal(u->file, e->line, "sizeof(void)");
+            size = ty_size(e->cast_ty);
+        } else {
+            check_expr(u, f, sc, e->rhs);
+            if (e->rhs->ty->kind == TY_VOID)
+                diag_fatal(u->file, e->line, "sizeof a void expression");
+            size = ty_size(e->rhs->ty);
+        }
+        /* Folded to a constant here; the operand is never evaluated,
+         * exactly as C specifies. size_t is unsigned long in LP64. */
+        e->kind = EXPR_NUM;
+        e->num = size;
+        e->rhs = NULL;
+        e->ty = ty_base(TY_LONG, 1);
+        break;
+    }
+    case EXPR_BINOP: {
         check_expr(u, f, sc, e->lhs);
         check_expr(u, f, sc, e->rhs);
+        struct type *lt = e->lhs->ty, *rt = e->rhs->ty;
+
+        switch (e->op) {
+        case B_LAND:
+        case B_LOR:
+            need_scalar(u, e->lhs, "'&&'/'||'");
+            need_scalar(u, e->rhs, "'&&'/'||'");
+            e->ty = ty_base(TY_INT, 0);
+            break;
+        case B_ADD:
+        case B_SUB: {
+            int lp = lt->kind == TY_PTR, rp = rt->kind == TY_PTR;
+            if (lp && rp) {
+                if (e->op == B_ADD)
+                    diag_fatal(u->file, e->line,
+                               "cannot add two pointers");
+                if (!ty_equal(lt, rt))
+                    diag_fatal(u->file, e->line,
+                               "subtracting incompatible pointers "
+                               "(%s vs %s)", ty_name(lt), ty_name(rt));
+                if (lt->pointee->kind == TY_VOID)
+                    diag_fatal(u->file, e->line,
+                               "arithmetic on void *");
+                e->ty = ty_base(TY_LONG, 0); /* ptrdiff_t */
+            } else if (lp || rp) {
+                if (rp && e->op == B_SUB)
+                    diag_fatal(u->file, e->line,
+                               "cannot subtract a pointer from an "
+                               "integer");
+                struct expr **ip = lp ? &e->rhs : &e->lhs;
+                struct type *pt = lp ? lt : rt;
+                if (pt->pointee->kind == TY_VOID)
+                    diag_fatal(u->file, e->line, "arithmetic on void *");
+                need_integer(u, *ip, "pointer arithmetic");
+                *ip = mk_cast(*ip, ty_base(TY_LONG, 0));
+                e->ty = pt;
+            } else {
+                need_integer(u, e->lhs, "arithmetic");
+                need_integer(u, e->rhs, "arithmetic");
+                e->ty = arith_common(lt, rt);
+                e->lhs = mk_cast(e->lhs, e->ty);
+                e->rhs = mk_cast(e->rhs, e->ty);
+            }
+            break;
+        }
+        case B_EQ:
+        case B_NE:
+        case B_LT:
+        case B_LE:
+        case B_GT:
+        case B_GE: {
+            int lp = lt->kind == TY_PTR, rp = rt->kind == TY_PTR;
+            if (lp || rp) {
+                if (lp && rp) {
+                    if (!ty_equal(lt, rt) &&
+                        lt->pointee->kind != TY_VOID &&
+                        rt->pointee->kind != TY_VOID)
+                        diag_fatal(u->file, e->line,
+                                   "comparing incompatible pointers "
+                                   "(%s vs %s)", ty_name(lt),
+                                   ty_name(rt));
+                } else {
+                    struct expr **ip = lp ? &e->rhs : &e->lhs;
+                    if (!is_null_const(*ip))
+                        diag_fatal(u->file, e->line,
+                                   "comparing a pointer with an "
+                                   "integer needs a cast");
+                    *ip = mk_cast(*ip, lp ? lt : rt);
+                }
+            } else {
+                need_integer(u, e->lhs, "comparison");
+                need_integer(u, e->rhs, "comparison");
+                struct type *ct = arith_common(lt, rt);
+                e->lhs = mk_cast(e->lhs, ct);
+                e->rhs = mk_cast(e->rhs, ct);
+            }
+            e->ty = ty_base(TY_INT, 0);
+            break;
+        }
+        case B_SHL:
+        case B_SHR:
+            need_integer(u, e->lhs, "shift");
+            need_integer(u, e->rhs, "shift");
+            e->ty = promote(lt);
+            e->lhs = mk_cast(e->lhs, e->ty);
+            e->rhs = mk_cast(e->rhs, ty_base(TY_INT, 0));
+            break;
+        default: /* MUL DIV MOD AND OR XOR */
+            need_integer(u, e->lhs, "arithmetic");
+            need_integer(u, e->rhs, "arithmetic");
+            e->ty = arith_common(lt, rt);
+            e->lhs = mk_cast(e->lhs, e->ty);
+            e->rhs = mk_cast(e->rhs, e->ty);
+            break;
+        }
         break;
+    }
     case EXPR_CALL: {
         struct func *callee = find_func(u, e->name);
         if (!callee)
@@ -98,9 +360,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        "call to '%s', which is not declared — add a "
                        "prototype ('int %s(...);') or define it first",
                        e->name, e->name);
-        /* C99 has no implicit declarations; a declaration (prototype
-         * or definition) must precede the call, or the program is not
-         * the strict C99 subset the golden tests hold us to. */
         if (!callee->declared)
             diag_fatal(u->file, e->line,
                        "call to '%s' before its declaration — declare "
@@ -113,8 +372,14 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        callee->nparams == 1 ? "" : "s", e->nargs);
         e->callee = callee;
         callee->used = 1;
-        for (int i = 0; i < e->nargs; i++)
+        for (int i = 0; i < e->nargs; i++) {
             check_expr(u, f, sc, e->args[i]);
+            need_scalar(u, e->args[i], "an argument");
+            e->args[i] = convert_assign(u, e->args[i],
+                                        callee->param_tys[i],
+                                        "argument");
+        }
+        e->ty = callee->ret_ty;
         break;
     }
     }
@@ -123,8 +388,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
 /* Declarations anywhere in the function share one flat scope, and
  * shadowing is rejected outright. C gives inner blocks their own scope;
  * refusing shadowed names accepts strictly fewer programs than C does,
- * so the subset stays a subset. Real block scoping arrives with sema's
- * M2 growth. */
+ * so the subset stays a subset. */
 static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                        struct stmt *s, int in_loop)
 {
@@ -138,34 +402,57 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                            s->kind == STMT_BREAK ? "break" : "continue");
             break;
         case STMT_DECL:
-            if (s->expr)
+            if (s->expr) {
                 check_expr(u, f, sc, s->expr);
+                need_scalar(u, s->expr, "an initializer");
+                s->expr = convert_assign(u, s->expr, s->dty,
+                                         "initialization");
+            }
             if (scope_find(sc, s->name) >= 0)
                 diag_fatal(u->file, s->line,
                            "'%s' is already declared in '%s' (one flat "
                            "scope per function for now — rename it)",
                            s->name, f->name);
-            s->var_index = scope_add(sc, s->name);
+            s->var_index = scope_add(sc, s->name, s->dty);
             break;
         case STMT_RETURN:
+            if (f->ret_ty->kind == TY_VOID) {
+                if (s->expr)
+                    diag_fatal(u->file, s->line,
+                               "returning a value from void '%s'",
+                               f->name);
+            } else {
+                if (!s->expr)
+                    diag_fatal(u->file, s->line,
+                               "'%s' returns %s; 'return' needs a value",
+                               f->name, ty_name(f->ret_ty));
+                check_expr(u, f, sc, s->expr);
+                need_scalar(u, s->expr, "'return'");
+                s->expr = convert_assign(u, s->expr, f->ret_ty, "return");
+            }
+            break;
         case STMT_EXPR:
             check_expr(u, f, sc, s->expr);
             break;
         case STMT_IF:
             check_expr(u, f, sc, s->cond);
+            need_scalar(u, s->cond, "'if'");
             check_stmt(u, f, sc, s->thn, in_loop);
             if (s->els)
                 check_stmt(u, f, sc, s->els, in_loop);
             break;
         case STMT_WHILE:
             check_expr(u, f, sc, s->cond);
+            need_scalar(u, s->cond, "'while'");
             check_stmt(u, f, sc, s->body, 1);
             break;
         case STMT_FOR:
             if (s->init)
                 check_expr(u, f, sc, s->init);
-            if (s->cond) /* NULL = forever, left by 'break' */
+            if (s->cond) { /* NULL = forever, left by 'break' */
                 check_expr(u, f, sc, s->cond);
+                need_scalar(u, s->cond, "'for'");
+            }
             if (s->step)
                 check_expr(u, f, sc, s->step);
             check_stmt(u, f, sc, s->body, 1);
@@ -178,9 +465,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
 }
 
 /* Conservative all-paths-return: a list returns if any statement in it
- * guarantees a return (whatever follows is unreachable); if/else
- * guarantees one only when both arms do; loops never do (the condition
- * may be false on entry). Refusing a maybe-missing return is honest —
+ * guarantees a return; if/else guarantees one only when both arms do;
+ * loops never do. Refusing a maybe-missing return is honest —
  * miscompiling one is not (THE RULE). */
 static int list_returns(struct stmt *s);
 
@@ -215,25 +501,26 @@ static void check_func(struct unit *u, struct func *f)
             diag_fatal(u->file, f->line,
                        "duplicate parameter '%s' in '%s'",
                        f->params[i], f->name);
-        scope_add(&sc, f->params[i]);
+        scope_add(&sc, f->params[i], f->param_tys[i]);
     }
 
     check_stmt(u, f, &sc, f->body, 0);
 
-    if (!list_returns(f->body))
+    if (f->ret_ty->kind != TY_VOID && !list_returns(f->body))
         diag_fatal(u->file, f->line,
                    "control may reach the end of '%s' — every path must "
                    "end in a return statement", f->name);
 
     f->nvars = sc.n;
-    free(sc.names);
+    f->var_tys = xmalloc((size_t)(sc.n ? sc.n : 1) * sizeof *f->var_tys);
+    for (int i = 0; i < sc.n; i++)
+        f->var_tys[i] = sc.vars[i].ty;
+    free(sc.vars);
 }
 
 /* Merge every later declaration of a name into its first (canonical)
- * node, so calls resolve to one place whether the definition came
- * before or after them. C's static rule is kept exactly: static-then-
- * non-static keeps internal linkage, non-static-then-static is an
- * error (matching gcc, so the subset stays strict). */
+ * node. C's static rule kept exactly: static-then-non-static keeps
+ * internal linkage, non-static-then-static is an error (gcc agrees). */
 static void merge_decls(struct unit *u)
 {
     for (struct func *f = u->funcs; f; f = f->next) {
@@ -244,12 +531,15 @@ static void merge_decls(struct unit *u)
             f->has_defn = f->defined;
             continue;
         }
-        if (canon->nparams != f->nparams)
+        int match = canon->nparams == f->nparams &&
+                    ty_equal(canon->ret_ty, f->ret_ty);
+        for (int i = 0; match && i < f->nparams; i++)
+            if (!ty_equal(canon->param_tys[i], f->param_tys[i]))
+                match = 0;
+        if (!match)
             diag_fatal(u->file, f->line,
-                       "'%s' declared with %d parameter%s but %d earlier "
-                       "(line %d)", f->name, f->nparams,
-                       f->nparams == 1 ? "" : "s", canon->nparams,
-                       canon->line);
+                       "conflicting declaration of '%s' (earlier one at "
+                       "line %d)", f->name, canon->line);
         if (f->is_static && !canon->is_static)
             diag_fatal(u->file, f->line,
                        "static declaration of '%s' follows non-static "
@@ -273,8 +563,7 @@ void sema_check(struct unit *u)
 
     /* Walk in source order so `declared` mirrors C's rule exactly: a
      * name is usable from its first declaration on, and a body is
-     * checked at its DEFINITION's position — everything declared above
-     * the definition is in scope inside it, prototype or not. */
+     * checked at its DEFINITION's position. */
     for (struct func *f = u->funcs; f; f = f->next) {
         struct func *canon = find_func(u, f->name);
         if (canon == f)

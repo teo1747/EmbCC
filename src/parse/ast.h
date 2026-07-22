@@ -10,10 +10,13 @@
 #ifndef EMBCC_PARSE_AST_H
 #define EMBCC_PARSE_AST_H
 
+#include "../sema/type.h"
+
 #define MAX_PARAMS 6
 
 enum expr_kind { EXPR_NUM, EXPR_VAR, EXPR_BINOP, EXPR_CALL, EXPR_ASSIGN,
-                 EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC };
+                 EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
+                 EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -29,11 +32,14 @@ enum binop {
 struct expr {
     enum expr_kind kind;
     int line;
+    struct type *ty;      /* set by sema on every node */
     long num;             /* EXPR_NUM */
-    const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_ASSIGN target */
-    int var_index;        /* EXPR_VAR/EXPR_ASSIGN: slot; set by sema */
+    const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_INCDEC target */
+    int var_index;        /* EXPR_VAR/EXPR_INCDEC: slot; set by sema */
     enum binop op;        /* EXPR_BINOP */
-    struct expr *lhs, *rhs; /* BINOP; NOT/NEG/BNOT/ASSIGN use rhs only */
+    struct expr *lhs, *rhs; /* BINOP + ASSIGN(lhs=target);
+                             * NOT/NEG/BNOT/DEREF/ADDR/CAST use rhs only */
+    struct type *cast_ty; /* EXPR_CAST target; EXPR_SIZEOF(type) */
     int is_post, delta;   /* EXPR_INCDEC: x++/x-- vs ++x/--x, +1/-1 */
     struct expr *args[MAX_PARAMS]; /* EXPR_CALL */
     int nargs;
@@ -47,6 +53,7 @@ struct stmt {
     enum stmt_kind kind;
     int line;
     const char *name;     /* STMT_DECL */
+    struct type *dty;     /* STMT_DECL: declared type */
     int var_index;        /* STMT_DECL: set by sema */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
     struct expr *cond;    /* IF/WHILE/FOR */
@@ -61,8 +68,11 @@ struct func {
     const char *name;
     int line;
     int is_static;
+    struct type *ret_ty;
     int nparams;
     const char *params[MAX_PARAMS]; /* names; NULL in unnamed prototypes */
+    struct type *param_tys[MAX_PARAMS];
+    struct type **var_tys;          /* sema: type of every var slot */
     struct stmt *body;
     int defined;          /* parse: THIS node syntactically had a body
                            * (may be NULL even so: "{ }" — sema rejects
