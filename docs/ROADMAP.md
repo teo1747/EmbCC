@@ -25,8 +25,13 @@ followed (.data/.bss, static/extern, OBJECT symbols), then the last big
 language surface: structs/unions/enums with SysV layout and padding,
 member access, typedef (incl. anonymous-struct form), enums as folded
 int constants — struct assignment/params/returns refused pending SysV
-classification. What remains of M2: the preprocessor, judged against
-newlib's headers, then the tally.c acceptance on the OS.
+classification. The preprocessor landed
+next and passed its judge: REAL newlib headers — <stdint.h> and <stddef.h>
+(the cdefs/_default_types chain that broke TCC) preprocess, compile, and
+run through EmbCC, with EmbCC's own compiler headers (include/) covering
+stddef/stdarg/stdbool/float. <stdio.h> is one language feature away:
+function pointer types (struct _reent's callbacks) — the next increment,
+then the tally.c acceptance on the OS.
 
 ---
 

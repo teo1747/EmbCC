@@ -22,6 +22,7 @@ SRCS := \
 	src/codegen/codegen.c \
 	src/asm/emit.c \
 	src/cpp/predef.c \
+	src/cpp/cpp.c \
 	src/elf/write.c
 
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)

@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "../codegen/codegen.h"
+#include "../cpp/cpp.h"
 #include "../cpp/predef.h"
 #include "../elf/write.h"
 #include "../ir/ir.h"
@@ -17,7 +18,7 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.6.0-m2.structs"
+#define EMBCC_VERSION "0.7.0-m2.preprocessor"
 
 static void print_version(void)
 {
@@ -28,14 +29,15 @@ static void print_version(void)
            "structs/unions/enums, typedef, string literals, globals, "
            "sizeof, casts, full control flow and operators, prototypes "
            "incl. variadic externals; compile with -c.\n");
-    printf("No preprocessor yet (M2), no linker yet (M3) — "
-           "link objects with the existing toolchain.\n");
+    printf("Preprocessor: #include (-I), #define incl. variadic/#/##, "
+           "conditionals, the x86_64-elf predefined set; -E to see it. "
+           "No linker yet (M3) — link with the existing toolchain.\n");
 }
 
 static void print_usage(FILE *out)
 {
     fprintf(out,
-            "usage: embcc -c FILE.c [-o FILE.o]\n"
+            "usage: embcc [-E] -c FILE.c [-o FILE.o] [-I DIR]...\n"
             "       embcc --version | --dump-predef"
             " | --emit-empty-object FILE\n");
 }
@@ -88,10 +90,19 @@ static const char *default_output(const char *in)
     return out;
 }
 
-static int compile(const char *in, const char *out)
+#define MAX_INCDIRS 16
+static const char *incdirs[MAX_INCDIRS];
+static int nincdirs;
+
+static int compile(const char *in, const char *out, int pp_only)
 {
     char *src = read_file(in);
-    struct unit *u = parse_unit(in, src);
+    char *pp = cpp_process(in, src, incdirs, nincdirs);
+    if (pp_only) {
+        fputs(pp, stdout);
+        return 0;
+    }
+    struct unit *u = parse_unit(in, pp);
     sema_check(u);
     struct ir_unit *iu = irgen(u);
 
@@ -244,7 +255,7 @@ static int has_c_suffix(const char *s)
 int main(int argc, char **argv)
 {
     const char *input = NULL, *output = NULL;
-    int compile_mode = 0;
+    int compile_mode = 0, pp_only = 0;
 
     if (argc < 2) {
         print_usage(stderr);
@@ -269,6 +280,20 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0) {
             compile_mode = 1;
+        } else if (strcmp(argv[i], "-E") == 0) {
+            pp_only = 1;
+        } else if (strncmp(argv[i], "-I", 2) == 0) {
+            const char *dir = argv[i][2] ? argv[i] + 2
+                                         : (i + 1 < argc ? argv[++i] : 0);
+            if (!dir) {
+                fprintf(stderr, "embcc: -I needs a directory\n");
+                return 1;
+            }
+            if (nincdirs >= MAX_INCDIRS) {
+                fprintf(stderr, "embcc: too many -I directories\n");
+                return 1;
+            }
+            incdirs[nincdirs++] = dir;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 == argc) {
                 fprintf(stderr, "embcc: -o needs a FILE\n");
@@ -294,6 +319,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "embcc: error: no input file\n");
         return 1;
     }
+    if (pp_only)
+        return compile(input, NULL, 1);
     if (!compile_mode) {
         fprintf(stderr,
                 "embcc: error: cannot link '%s': the integrated linker is "
@@ -301,5 +328,5 @@ int main(int argc, char **argv)
                 "the existing toolchain\n", input);
         return 1;
     }
-    return compile(input, output ? output : default_output(input));
+    return compile(input, output ? output : default_output(input), 0);
 }

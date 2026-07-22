@@ -67,6 +67,9 @@ static const struct {
     { "union", TOK_KW_UNION },
     { "enum", TOK_KW_ENUM },
     { "typedef", TOK_KW_TYPEDEF },
+    { "const", TOK_KW_CONST },
+    { "volatile", TOK_KW_VOLATILE },
+    { "restrict", TOK_KW_RESTRICT },
     { "if", TOK_KW_IF },
     { "else", TOK_KW_ELSE },
     { "while", TOK_KW_WHILE },
@@ -228,11 +231,35 @@ void lex_next(struct lexer *lx)
             t->kind = TOK_GT;
         }
         break;
-    case '#':
-        diag_fatal(lx->file, lx->line,
-                   "preprocessor directives are not supported yet "
-                   "(the preprocessor is M2 — see docs/ROADMAP.md)");
-        break;
+    case '#': {
+        /* a line marker from the preprocessor: # LINE "FILE" */
+        const char *p = lx->p + 1;
+        while (*p == ' ')
+            p++;
+        if (!isdigit((unsigned char)*p))
+            diag_fatal(lx->file, lx->line,
+                       "stray '#' (preprocessor directives are handled "
+                       "before the lexer)");
+        char *end;
+        long ln = strtol(p, &end, 10);
+        p = end;
+        while (*p == ' ')
+            p++;
+        if (*p != '"')
+            diag_fatal(lx->file, lx->line, "malformed line marker");
+        const char *fstart = ++p;
+        while (*p && *p != '"')
+            p++;
+        lx->file = xstrndup(fstart, (size_t)(p - fstart));
+        while (*p && *p != '\n')
+            p++;
+        if (*p == '\n')
+            p++;
+        lx->p = p;
+        lx->line = (int)ln;
+        lex_next(lx); /* the marker produced no token; go again */
+        return;
+    }
     case '\'': {
         lx->p++;
         long v;
@@ -357,6 +384,9 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_UNION: return "'union'";
     case TOK_KW_ENUM: return "'enum'";
     case TOK_KW_TYPEDEF: return "'typedef'";
+    case TOK_KW_CONST: return "'const'";
+    case TOK_KW_VOLATILE: return "'volatile'";
+    case TOK_KW_RESTRICT: return "'restrict'";
     case TOK_DOT: return "'.'";
     case TOK_ARROW: return "'->'";
     case TOK_KW_IF: return "'if'";

@@ -129,10 +129,18 @@ check global-vs-function \
 int f;
 int main(void) { return f(); }' \
     "both a function and a variable"
-check multi-declarator \
-    'int a, b;
+check unterminated-cond \
+    '#ifdef NEVER
 int main(void) { return 0; }' \
-    "one declarator per declaration"
+    "unterminated conditional"
+check error-directive \
+    '#error deliberately broken
+int main(void) { return 0; }' \
+    "deliberately broken"
+check missing-include \
+    '#include "no/such/file.h"
+int main(void) { return 0; }' \
+    "cannot find include"
 check struct-assign \
     'struct P { int x; };
 int main(void) { struct P a; struct P b; a.x = 1; b = a; return b.x; }' \
@@ -184,10 +192,10 @@ check typedef-redef \
 typedef long T;
 int main(void) { T v = 1; return (int)v; }' \
     "redefinition of typedef"
-check preprocessor \
+check angle-include-no-path \
     '#include <stdio.h>
 int main(void) { return 0; }' \
-    "preprocessor"
+    "cannot find include file"
 check float-type \
     'float main(void) { return 0; }' \
     "not supported"
