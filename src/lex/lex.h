@@ -25,6 +25,7 @@ enum tok_kind {
     TOK_KW_SIZEOF,
     TOK_KW_RETURN,
     TOK_KW_STATIC,
+    TOK_KW_EXTERN,
     TOK_KW_IF,
     TOK_KW_ELSE,
     TOK_KW_WHILE,

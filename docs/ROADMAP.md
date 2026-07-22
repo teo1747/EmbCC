@@ -20,9 +20,11 @@ usual arithmetic conversions, signed narrowing, unsigned div/shift/compare)
 — every implicit conversion materialized in the tree and cross-checked
 against gcc. Arrays (incl. 2-D, decay, sizeof) and string literals in
 .rodata landed next, with variadic external calls (al=0 per SysV):
-**an EmbCC-compiled hello world runs — puts and printf work.** Next:
-globals with .data/.bss, structs/unions/enums, and the preprocessor last,
-judged against newlib's headers.
+**an EmbCC-compiled hello world runs — puts and printf work.** Globals
+followed: .data/.bss with static/extern linkage, OBJECT symbols carrying
+real sizes, PC32 relocations against each global's own symbol. Next:
+structs/unions/enums, then the preprocessor last, judged against newlib's
+headers.
 
 ---
 

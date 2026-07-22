@@ -39,6 +39,8 @@ struct expr {
     const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_INCDEC target;
                            * EXPR_STR: the bytes */
     int var_index;        /* EXPR_VAR/EXPR_INCDEC: slot; set by sema */
+    struct global *gref;  /* EXPR_VAR/EXPR_INCDEC: the global, when the
+                           * name is not a local (sema) */
     int str_index;        /* EXPR_STR: unit string table slot (irgen) */
     enum binop op;        /* EXPR_BINOP */
     struct expr *lhs, *rhs; /* BINOP + ASSIGN(lhs=target);
@@ -68,9 +70,34 @@ struct stmt {
     struct stmt *next;
 };
 
+/* A file-scope variable. Like functions, later declarations merge into
+ * the first (canonical) node; `int g;` is a definition (the tentative-
+ * definition subtlety is collapsed — strictly simpler than C, and any
+ * program we accept means the same thing to gcc). */
+struct global {
+    const char *name;
+    int line;
+    int seq;              /* source order, shared counter with funcs —
+                           * enforces declare-before-use across kinds */
+    struct type *ty;
+    int is_static;
+    int is_extern;        /* THIS declaration was 'extern' */
+    int has_init;
+    long init;            /* constant initializer value */
+    struct global *next;
+
+    int defined;          /* sema, canonical: some declaration defines it */
+    int absorbed;         /* sema: merged into an earlier node */
+    int used;
+    int in_bss;           /* driver: zero-valued -> .bss, else .data */
+    int off;              /* driver: offset inside its section */
+    int sym_ndx;          /* driver: symbol index */
+};
+
 struct func {
     const char *name;
     int line;
+    int seq;              /* source order (see struct global) */
     int is_static;
     int is_varargs;       /* declared with a trailing ", ..." */
     struct type *ret_ty;
@@ -98,6 +125,7 @@ struct func {
 struct unit {
     const char *file;
     struct func *funcs;
+    struct global *globals;
 };
 
 #endif

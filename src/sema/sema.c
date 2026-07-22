@@ -41,7 +41,7 @@ static int scope_add(struct scope *sc, const char *name, struct type *ty)
 }
 
 /* Returns the canonical node for a name: the first declaration, into
- * which any later definition has been merged. */
+ * which any later declarations have been merged. */
 static struct func *find_func(struct unit *u, const char *name)
 {
     for (struct func *f = u->funcs; f; f = f->next)
@@ -49,6 +49,18 @@ static struct func *find_func(struct unit *u, const char *name)
             return f;
     return NULL;
 }
+
+static struct global *find_global(struct unit *u, const char *name)
+{
+    for (struct global *g = u->globals; g; g = g->next)
+        if (!g->absorbed && strcmp(g->name, name) == 0)
+            return g;
+    return NULL;
+}
+
+/* The source position of the function body being checked — a global is
+ * visible inside it only if declared above it (C's rule). */
+static int cur_body_seq;
 
 /* ---- conversions ---- */
 
@@ -162,16 +174,29 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     case EXPR_VAR: {
         int i = scope_find(sc, e->name);
-        if (i < 0) {
-            if (find_func(u, e->name))
+        if (i >= 0) {
+            e->var_index = i;
+            e->ty = sc->vars[i].ty;
+        } else {
+            struct global *g = find_global(u, e->name);
+            if (g && g->seq < cur_body_seq) {
+                e->gref = g;
+                g->used = 1;
+                e->ty = g->ty;
+            } else if (g) {
+                diag_fatal(u->file, e->line,
+                           "'%s' is used before its declaration "
+                           "(line %d)", e->name, g->line);
+            } else if (find_func(u, e->name)) {
                 diag_fatal(u->file, e->line,
                            "'%s' is a function; function pointers are "
                            "not supported yet", e->name);
-            diag_fatal(u->file, e->line,
-                       "'%s' is not declared in '%s'", e->name, f->name);
+            } else {
+                diag_fatal(u->file, e->line,
+                           "'%s' is not declared in '%s'", e->name,
+                           f->name);
+            }
         }
-        e->var_index = i;
-        e->ty = sc->vars[i].ty;
         if (e->ty->kind == TY_ARRAY) {
             e->undecayed = e->ty;
             e->ty = ty_ptr(e->ty->pointee);
@@ -192,12 +217,19 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     case EXPR_INCDEC: {
         int i = scope_find(sc, e->name);
-        if (i < 0)
-            diag_fatal(u->file, e->line,
-                       "++/-- on '%s', which is not declared in '%s'",
-                       e->name, f->name);
-        e->var_index = i;
-        e->ty = sc->vars[i].ty;
+        if (i >= 0) {
+            e->var_index = i;
+            e->ty = sc->vars[i].ty;
+        } else {
+            struct global *g = find_global(u, e->name);
+            if (!g || g->seq >= cur_body_seq)
+                diag_fatal(u->file, e->line,
+                           "++/-- on '%s', which is not declared in "
+                           "'%s'", e->name, f->name);
+            e->gref = g;
+            g->used = 1;
+            e->ty = g->ty;
+        }
         if (e->ty->kind == TY_PTR) {
             if (e->ty->pointee->kind == TY_VOID)
                 diag_fatal(u->file, e->line,
@@ -588,9 +620,53 @@ static void merge_decls(struct unit *u)
     }
 }
 
+/* Merge later declarations of each global into its canonical node.
+ * `int g;` counts as a definition (the tentative-definition subtlety is
+ * collapsed); extern declares without defining; at most one
+ * initializer. Same static linkage rules as functions. */
+static void merge_globals(struct unit *u)
+{
+    for (struct global *g = u->globals; g; g = g->next) {
+        if (g->absorbed)
+            continue;
+        if (g->ty->kind == TY_PTR && g->has_init && g->init != 0)
+            diag_fatal(u->file, g->line,
+                       "a pointer global can only be initialized to 0 "
+                       "for now");
+        struct global *canon = find_global(u, g->name);
+        if (find_func(u, g->name))
+            diag_fatal(u->file, g->line,
+                       "'%s' is declared as both a function and a "
+                       "variable", g->name);
+        if (canon == g) {
+            g->defined = !g->is_extern;
+            continue;
+        }
+        if (!ty_equal(canon->ty, g->ty))
+            diag_fatal(u->file, g->line,
+                       "conflicting types for '%s': %s here, %s at "
+                       "line %d", g->name, ty_name(g->ty),
+                       ty_name(canon->ty), canon->line);
+        if (g->is_static && !canon->is_static)
+            diag_fatal(u->file, g->line,
+                       "static declaration of '%s' follows non-static "
+                       "declaration (line %d)", g->name, canon->line);
+        if (g->has_init) {
+            if (canon->has_init)
+                diag_fatal(u->file, g->line, "redefinition of '%s'",
+                           g->name);
+            canon->has_init = 1;
+            canon->init = g->init;
+        }
+        canon->defined |= !g->is_extern;
+        g->absorbed = 1;
+    }
+}
+
 void sema_check(struct unit *u)
 {
     merge_decls(u);
+    merge_globals(u);
 
     /* Walk in source order so `declared` mirrors C's rule exactly: a
      * name is usable from its first declaration on, and a body is
@@ -599,8 +675,10 @@ void sema_check(struct unit *u)
         struct func *canon = find_func(u, f->name);
         if (canon == f)
             f->declared = 1;
-        if (f->defined)
+        if (f->defined) {
+            cur_body_seq = f->seq;
             check_func(u, canon);
+        }
     }
 
     /* An undefined non-static is an external: the linker gets a chance.

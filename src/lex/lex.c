@@ -62,6 +62,7 @@ static const struct {
     { "sizeof", TOK_KW_SIZEOF },
     { "return", TOK_KW_RETURN },
     { "static", TOK_KW_STATIC },
+    { "extern", TOK_KW_EXTERN },
     { "if", TOK_KW_IF },
     { "else", TOK_KW_ELSE },
     { "while", TOK_KW_WHILE },
@@ -348,6 +349,7 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_VOID: return "'void'";
     case TOK_KW_RETURN: return "'return'";
     case TOK_KW_STATIC: return "'static'";
+    case TOK_KW_EXTERN: return "'extern'";
     case TOK_KW_IF: return "'if'";
     case TOK_KW_ELSE: return "'else'";
     case TOK_KW_WHILE: return "'while'";

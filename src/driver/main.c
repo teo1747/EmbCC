@@ -17,7 +17,7 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.4.0-m2.types2"
+#define EMBCC_VERSION "0.5.0-m2.globals"
 
 static void print_version(void)
 {
@@ -25,9 +25,10 @@ static void print_version(void)
     printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
            EMBCC_VERSION);
     printf("C subset: char/short/int/long with unsigned, pointers, "
-           "arrays, string literals (.rodata), sizeof, casts, full "
-           "control flow and operators, prototypes incl. variadic "
-           "externals — printf works; compile with -c.\n");
+           "arrays, string literals (.rodata), globals (.data/.bss, "
+           "static/extern), sizeof, casts, full control flow and "
+           "operators, prototypes incl. variadic externals — printf "
+           "works; compile with -c.\n");
     printf("No preprocessor yet (M2), no linker yet (M3) — "
            "link objects with the existing toolchain.\n");
 }
@@ -98,8 +99,37 @@ static int compile(const char *in, const char *out)
     struct code text = { 0, 0, 0 };
     struct extcall *ext;
     struct strsite *strs;
-    int next, nstrs;
-    codegen_unit(iu, &text, &ext, &next, &strs, &nstrs);
+    struct gsite *gs;
+    int next, nstrs, ngs;
+    codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs);
+
+    /* Lay out the defined globals: initialized -> .data, zero -> .bss,
+     * each aligned to its (element) size. */
+    int data_len = 0, bss_len = 0;
+    for (struct global *g = u->globals; g; g = g->next) {
+        if (g->absorbed || !g->defined)
+            continue;
+        struct type *base = g->ty;
+        while (base->kind == TY_ARRAY)
+            base = base->pointee;
+        int align = ty_size(base);
+        g->in_bss = !g->has_init;
+        int *len = g->in_bss ? &bss_len : &data_len;
+        *len = (*len + align - 1) & ~(align - 1);
+        g->off = *len;
+        *len += ty_size(g->ty);
+    }
+    char *data = NULL;
+    if (data_len) {
+        data = xcalloc(1, (size_t)data_len);
+        for (struct global *g = u->globals; g; g = g->next) {
+            if (g->absorbed || !g->defined || g->in_bss)
+                continue;
+            unsigned long v = (unsigned long)g->init;
+            for (int b = 0; b < ty_size(g->ty); b++)
+                data[g->off + b] = (char)((v >> (8 * b)) & 0xff);
+        }
+    }
 
     /* .rodata: the string literals, at the offsets irgen assigned. */
     char *rodata = NULL;
@@ -119,6 +149,15 @@ static int compile(const char *in, const char *out)
         rodata_ndx = elfw_add_section(w, ".rodata", SHT_PROGBITS,
                                       SHF_ALLOC, rodata,
                                       (Elf64_Xword)iu->rodata_len, 1);
+    int data_ndx = 0, bss_ndx = 0;
+    if (data_len)
+        data_ndx = elfw_add_section(w, ".data", SHT_PROGBITS,
+                                    SHF_ALLOC | SHF_WRITE, data,
+                                    (Elf64_Xword)data_len, 8);
+    if (bss_len)
+        bss_ndx = elfw_add_section(w, ".bss", SHT_NOBITS,
+                                   SHF_ALLOC | SHF_WRITE, NULL,
+                                   (Elf64_Xword)bss_len, 8);
     elfw_add_symbol(w, in, 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_FILE), SHN_ABS);
     elfw_add_symbol(w, "", 0, 0,
@@ -138,12 +177,32 @@ static int compile(const char *in, const char *out)
                             (Elf64_Xword)f->code_len,
                             ELF64_ST_INFO(STB_LOCAL, STT_FUNC),
                             (Elf64_Half)text_ndx);
+    for (struct global *g = u->globals; g; g = g->next)
+        if (!g->absorbed && g->defined && g->is_static)
+            g->sym_ndx = elfw_add_symbol(
+                w, g->name, (Elf64_Addr)g->off,
+                (Elf64_Xword)ty_size(g->ty),
+                ELF64_ST_INFO(STB_LOCAL, STT_OBJECT),
+                (Elf64_Half)(g->in_bss ? bss_ndx : data_ndx));
     for (struct func *f = u->funcs; f; f = f->next)
         if (!f->absorbed && f->has_defn && !f->is_static)
             elfw_add_symbol(w, f->name, (Elf64_Addr)f->code_off,
                             (Elf64_Xword)f->code_len,
                             ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
                             (Elf64_Half)text_ndx);
+    for (struct global *g = u->globals; g; g = g->next)
+        if (!g->absorbed && g->defined && !g->is_static)
+            g->sym_ndx = elfw_add_symbol(
+                w, g->name, (Elf64_Addr)g->off,
+                (Elf64_Xword)ty_size(g->ty),
+                ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT),
+                (Elf64_Half)(g->in_bss ? bss_ndx : data_ndx));
+    /* extern-declared, used, never defined: the linker's problem */
+    for (struct global *g = u->globals; g; g = g->next)
+        if (!g->absorbed && !g->defined && g->used)
+            g->sym_ndx = elfw_add_symbol(
+                w, g->name, 0, 0,
+                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE), SHN_UNDEF);
 
     /* Every called external gets one UNDEF symbol, and every call site
      * a PLT32 relocation against it. addend -4: rel32 is relative to
@@ -167,6 +226,13 @@ static int compile(const char *in, const char *out)
         elfw_add_rela(w, text_ndx, (Elf64_Addr)strs[i].patch_off,
                       rodata_sym, R_X86_64_PC32, strs[i].str_off - 4);
     free(strs);
+
+    /* Global-variable addresses: PC32 against the global's own symbol
+     * (defined or UNDEF alike — the linker fills in either way). */
+    for (int i = 0; i < ngs; i++)
+        elfw_add_rela(w, text_ndx, (Elf64_Addr)gs[i].patch_off,
+                      gs[i].glob->sym_ndx, R_X86_64_PC32, -4);
+    free(gs);
 
     int rc = elfw_write(w, out);
     elfw_free(w);

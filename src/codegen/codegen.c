@@ -51,6 +51,8 @@ struct sites {
     int next, capext;
     struct strsite *str;
     int nstr, capstr;
+    struct gsite *g;
+    int ng, capg;
 };
 
 #define PUSH(arr, n, cap, item)                                          \
@@ -188,6 +190,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_store_slot(text, sd[i->dst], 8);
             break;
         }
+        case IR_GADDR: {
+            struct gsite gs;
+            gs.patch_off = x86_lea_rax_rip(text);
+            gs.glob = i->glob;
+            PUSH(st->g, st->ng, st->capg, gs);
+            x86_store_slot(text, sd[i->dst], 8);
+            break;
+        }
         case IR_LOAD:
             x86_load_slot(text, sd[i->a], 8, 0, 8); /* the address */
             x86_load_mem_rax(text, i->size, i->sign, i->w);
@@ -273,9 +283,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
 
 void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
-                  struct strsite **strs, int *nstrs)
+                  struct strsite **strs, int *nstrs,
+                  struct gsite **gs, int *ngs)
 {
-    struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
     for (int n = 0; n < iu->nfuncs; n++)
         gen_func(&iu->funcs[n], text, &st);
@@ -299,4 +310,6 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
     *next = st.next;
     *strs = st.str;
     *nstrs = st.nstr;
+    *gs = st.g;
+    *ngs = st.ng;
 }

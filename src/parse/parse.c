@@ -26,7 +26,7 @@ static void expect(struct parser *ps, enum tok_kind kind, const char *what)
  * them here turns "'struct' is not declared" into an honest "not
  * supported yet". Grows emptier as M2 proceeds. */
 static const char *const reserved_unsupported[] = {
-    "auto", "case", "const", "default", "do", "double", "enum", "extern",
+    "auto", "case", "const", "default", "do", "double", "enum",
     "float", "goto", "register", "struct", "switch", "typedef", "union",
     "volatile",
 };
@@ -582,34 +582,120 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     }
 }
 
-/* ---- functions ---- */
+/* ---- top level: functions and globals ---- */
 
-static struct func *parse_func(struct parser *ps)
+/* A file-scope variable, after the declarator name has been consumed. */
+static struct global *parse_global(struct parser *ps, struct type *ty,
+                                   const char *name, int line,
+                                   int is_static, int is_extern)
 {
-    struct func *f = xcalloc(1, sizeof *f);
+    struct global *g = xcalloc(1, sizeof *g);
+    g->name = name;
+    g->line = line;
+    g->is_static = is_static;
+    g->is_extern = is_extern;
+    g->ty = ty;
+
+    if (g->ty->kind == TY_VOID)
+        diag_fatal(ps->lx.file, line, "a variable cannot have type void");
+    if (cur(ps)->kind == TOK_LBRACKET) {
+        int dims[4];
+        int ndims = 0;
+        while (cur(ps)->kind == TOK_LBRACKET) {
+            advance(ps);
+            if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "array size must be a positive integer "
+                           "literal");
+            if (ndims >= 4)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "more than 4 array dimensions");
+            dims[ndims++] = (int)cur(ps)->num;
+            advance(ps);
+            expect(ps, TOK_RBRACKET, "']'");
+        }
+        for (int i = ndims - 1; i >= 0; i--)
+            g->ty = ty_array(g->ty, dims[i]);
+    }
+    if (cur(ps)->kind == TOK_ASSIGN) {
+        advance(ps);
+        if (is_extern)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "'extern' with an initializer");
+        if (g->ty->kind == TY_ARRAY)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "array initializers are not supported yet");
+        /* Constant initializers only: a literal, optionally negated —
+         * constant folding arrives with the preprocessor era. */
+        int neg = 0;
+        if (cur(ps)->kind == TOK_MINUS) {
+            neg = 1;
+            advance(ps);
+        }
+        if (cur(ps)->kind != TOK_NUM)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "a global initializer must be an integer literal "
+                       "for now");
+        g->has_init = 1;
+        g->init = neg ? -cur(ps)->num : cur(ps)->num;
+        advance(ps);
+    }
+    if (cur(ps)->kind == TOK_COMMA)
+        diag_fatal(ps->lx.file, cur(ps)->line,
+                   "one declarator per declaration, please");
+    expect(ps, TOK_SEMI, "';'");
+    return g;
+}
+
+/* Parses one top-level item into the unit: a function (prototype or
+ * definition) or a global variable. */
+static void parse_top(struct parser *ps, struct unit *u,
+                      struct func ***ftail, struct global ***gtail,
+                      int seq)
+{
+    int is_static = 0, is_extern = 0;
 
     if (cur(ps)->kind == TOK_KW_STATIC) {
-        f->is_static = 1;
+        is_static = 1;
+        advance(ps);
+    } else if (cur(ps)->kind == TOK_KW_EXTERN) {
+        is_extern = 1;
         advance(ps);
     }
     if (cur(ps)->kind == TOK_IDENT)
         reject_reserved(ps, cur(ps)->text, cur(ps)->line);
-    struct type *rt = parse_type_spec(ps);
-    if (!rt)
+    struct type *base = parse_type_spec(ps);
+    if (!base)
         diag_fatal(ps->lx.file, cur(ps)->line,
-                   "expected a return type before %s",
-                   tok_describe(cur(ps)));
-    f->ret_ty = parse_stars(ps, rt);
+                   "expected a type before %s", tok_describe(cur(ps)));
+    struct type *ty = parse_stars(ps, base);
     if (cur(ps)->kind != TOK_IDENT)
         diag_fatal(ps->lx.file, cur(ps)->line,
-                   "expected a function name before %s",
-                   tok_describe(cur(ps)));
-    f->name = cur(ps)->text;
-    f->line = cur(ps)->line;
+                   "expected a name before %s", tok_describe(cur(ps)));
+    const char *name = cur(ps)->text;
+    int line = cur(ps)->line;
     advance(ps);
-    expect(ps, TOK_LPAREN, "'('");
 
-    if (cur(ps)->kind == TOK_KW_VOID && ps->lx.tok.kind == TOK_KW_VOID) {
+    if (cur(ps)->kind != TOK_LPAREN) {
+        struct global *g = parse_global(ps, ty, name, line,
+                                        is_static, is_extern);
+        g->seq = seq;
+        **gtail = g;
+        *gtail = &g->next;
+        (void)u;
+        return;
+    }
+
+    struct func *f = xcalloc(1, sizeof *f);
+    /* 'extern' on a function is the default linkage — accept, ignore */
+    f->is_static = is_static;
+    f->ret_ty = ty;
+    f->name = name;
+    f->line = line;
+    f->seq = seq;
+    advance(ps); /* '(' */
+
+    if (cur(ps)->kind == TOK_KW_VOID) {
         /* "(void)" means no parameters; "(void *x)" is a parameter */
         struct lexer save = ps->lx;
         advance(ps);
@@ -673,26 +759,28 @@ static struct func *parse_func(struct parser *ps)
     expect(ps, TOK_RPAREN, "')'");
 
     if (cur(ps)->kind == TOK_SEMI) {
-        advance(ps);
-        return f; /* prototype */
-    }
-    if (cur(ps)->kind != TOK_LBRACE)
-        diag_fatal(ps->lx.file, cur(ps)->line,
-                   "expected '{' or ';' before %s", tok_describe(cur(ps)));
-    if (f->is_varargs)
-        diag_fatal(ps->lx.file, f->line,
-                   "defining a variadic function is not supported yet "
-                   "(no va_list); only calls to external variadic "
-                   "functions work");
-    for (int i = 0; i < f->nparams; i++)
-        if (!f->params[i])
+        advance(ps); /* prototype */
+    } else {
+        if (cur(ps)->kind != TOK_LBRACE)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected '{' or ';' before %s",
+                       tok_describe(cur(ps)));
+        if (f->is_varargs)
             diag_fatal(ps->lx.file, f->line,
-                       "parameter %d of '%s' needs a name in a "
-                       "definition", i + 1, f->name);
-    struct stmt *blk = parse_block(ps);
-    f->body = blk->body;
-    f->defined = 1;
-    return f;
+                       "defining a variadic function is not supported "
+                       "yet (no va_list); only calls to external "
+                       "variadic functions work");
+        for (int i = 0; i < f->nparams; i++)
+            if (!f->params[i])
+                diag_fatal(ps->lx.file, f->line,
+                           "parameter %d of '%s' needs a name in a "
+                           "definition", i + 1, f->name);
+        struct stmt *blk = parse_block(ps);
+        f->body = blk->body;
+        f->defined = 1;
+    }
+    **ftail = f;
+    *ftail = &f->next;
 }
 
 struct unit *parse_unit(const char *file, const char *src)
@@ -702,11 +790,11 @@ struct unit *parse_unit(const char *file, const char *src)
     u->file = file;
 
     lex_init(&ps.lx, file, src);
-    struct func **tail = &u->funcs;
-    while (cur(&ps)->kind != TOK_EOF) {
-        *tail = parse_func(&ps);
-        tail = &(*tail)->next;
-    }
+    struct func **ftail = &u->funcs;
+    struct global **gtail = &u->globals;
+    int seq = 0;
+    while (cur(&ps)->kind != TOK_EOF)
+        parse_top(&ps, u, &ftail, &gtail, seq++);
     if (!u->funcs)
         diag_fatal(file, 0, "no functions in file");
     return u;

@@ -20,6 +20,13 @@ struct strsite {
     int str_off;          /* target offset inside .rodata */
 };
 
+/* Global-variable address sites: lea rax,[rip+rel32], one
+ * R_X86_64_PC32 against the global's own symbol (addend -4). */
+struct gsite {
+    int patch_off;
+    struct global *glob;
+};
+
 /* Lowers the unit to x86-64 into one .text image and fills each
  * func's code_off/code_len. Intra-unit calls are resolved here (rel32
  * patched once all functions are placed); external call sites are
@@ -27,6 +34,7 @@ struct strsite {
  * malloc'd; caller frees. */
 void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
-                  struct strsite **strs, int *nstrs);
+                  struct strsite **strs, int *nstrs,
+                  struct gsite **gs, int *ngs);
 
 #endif

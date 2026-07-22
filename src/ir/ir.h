@@ -39,6 +39,7 @@ enum ir_op {
     IR_STVAR, /* var dst = a          (size: truncating store) */
     IR_ADDR,  /* dst = &var a         (always w=8) */
     IR_STRADDR, /* dst = &.rodata string (label = string index) */
+    IR_GADDR, /* dst = &global (glob) */
     IR_LOAD,  /* dst = *(temp a)      (size, sign, w: extend) */
     IR_STORE, /* *(temp a) = b        (size) */
     IR_EXT,   /* dst = a re-extended  (size, sign: from; w: to) */
@@ -59,6 +60,7 @@ struct ir_ins {
     enum binop pred;         /* IR_CMP */
     int label;               /* IR_LABEL/IR_JMP/IR_BRZ */
     struct func *callee;     /* IR_CALL */
+    struct global *glob;     /* IR_GADDR */
     int args[MAX_PARAMS];    /* IR_CALL: argument vregs */
     int nargs;
 };

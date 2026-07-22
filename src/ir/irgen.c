@@ -102,6 +102,38 @@ static void emit_stvar(struct ir_func *fn, int v, int val,
     i->size = ty_size(t);
 }
 
+static int emit_gaddr(struct ir_func *fn, struct global *g)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_GADDR;
+    i->glob = g;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
+/* Typed load/store through an address temp. */
+static int emit_load(struct ir_func *fn, int addr, const struct type *t)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_LOAD;
+    i->a = addr;
+    i->size = ty_size(t);
+    i->sign = ty_signed_int(t);
+    i->w = ty_w(t);
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
+static void emit_store(struct ir_func *fn, int addr, int val,
+                       const struct type *t)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_STORE;
+    i->a = addr;
+    i->b = val;
+    i->size = ty_size(t);
+}
+
 static int log2_size(int size)
 {
     switch (size) {
@@ -206,6 +238,12 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return i->dst;
     }
     case EXPR_VAR:
+        if (e->gref) {
+            int addr = emit_gaddr(fn, e->gref);
+            if (e->undecayed)
+                return addr; /* a global array's name is its address */
+            return emit_load(fn, addr, e->ty);
+        }
         if (e->undecayed) {
             /* an array's name IS the address of its first element */
             struct ir_ins *i = emit(fn);
@@ -216,26 +254,26 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         return emit_ldvar(fn, e->var_index, e->ty);
     case EXPR_ASSIGN: {
-        if (e->lhs->kind == EXPR_VAR) {
+        if (e->lhs->kind == EXPR_VAR && !e->lhs->gref) {
             int v = gen_expr(fn, e->rhs);
             emit_stvar(fn, e->lhs->var_index, v, e->ty);
             return v;
         }
-        /* *p = v */
-        int addr = gen_expr(fn, e->lhs->rhs);
+        /* global or *p: both are a store through an address */
+        int addr = e->lhs->kind == EXPR_VAR
+                       ? emit_gaddr(fn, e->lhs->gref)
+                       : gen_expr(fn, e->lhs->rhs);
         int v = gen_expr(fn, e->rhs);
-        struct ir_ins *i = emit(fn);
-        i->op = IR_STORE;
-        i->a = addr;
-        i->b = v;
-        i->size = ty_size(e->ty);
+        emit_store(fn, addr, v, e->ty);
         return v;
     }
     case EXPR_INCDEC: {
         struct type *t = e->ty;
         int scale = t->kind == TY_PTR ? ty_size(t->pointee) : 1;
         int w = ty_w(t);
-        int cur = emit_ldvar(fn, e->var_index, t);
+        int gaddr = e->gref ? emit_gaddr(fn, e->gref) : -1;
+        int cur = e->gref ? emit_load(fn, gaddr, t)
+                          : emit_ldvar(fn, e->var_index, t);
         int old = -1;
         if (e->is_post) {
             struct ir_ins *save = emit(fn);
@@ -256,7 +294,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             i->dst = new_temp(fn);
             sum = i->dst;
         }
-        emit_stvar(fn, e->var_index, sum, t);
+        if (e->gref)
+            emit_store(fn, gaddr, sum, t);
+        else
+            emit_stvar(fn, e->var_index, sum, t);
         return e->is_post ? old : sum;
     }
     case EXPR_NOT: {
@@ -288,6 +329,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     }
     case EXPR_ADDR:
         if (e->rhs->kind == EXPR_VAR) {
+            if (e->rhs->gref)
+                return emit_gaddr(fn, e->rhs->gref);
             struct ir_ins *i = emit(fn);
             i->op = IR_ADDR;
             i->a = e->rhs->var_index;

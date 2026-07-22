@@ -97,6 +97,42 @@ check varargs-too-few \
     'int printf(char *fmt, ...);
 int main(void) { printf(); return 0; }' \
     "takes at least 1 argument"
+check global-conflicting-types \
+    'int g;
+long g;
+int main(void) { return g; }' \
+    "conflicting types"
+check global-two-inits \
+    'int g = 1;
+int g = 2;
+int main(void) { return g; }' \
+    "redefinition"
+check global-nonconst-init \
+    'int a = 1;
+int b = a;
+int main(void) { return b; }' \
+    "must be an integer literal"
+check extern-with-init \
+    'extern int g = 5;
+int main(void) { return g; }' \
+    "'extern' with an initializer"
+check ptr-global-bad-init \
+    'int *p = 42;
+int main(void) { return !p; }' \
+    "initialized to 0"
+check global-use-before-decl \
+    'int main(void) { return g; }
+int g = 42;' \
+    "used before its declaration"
+check global-vs-function \
+    'static int f(void) { return 1; }
+int f;
+int main(void) { return f(); }' \
+    "both a function and a variable"
+check multi-declarator \
+    'int a, b;
+int main(void) { return 0; }' \
+    "one declarator per declaration"
 check preprocessor \
     '#include <stdio.h>
 int main(void) { return 0; }' \
