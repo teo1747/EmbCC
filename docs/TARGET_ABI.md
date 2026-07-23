@@ -9,6 +9,30 @@ something breaking, the breakage is recorded — those are the expensive facts.*
 **Target triple in spirit:** `x86_64-elf`, System V AMD64 calling convention,
 LP64, no PIE, no `ld.so`.
 
+**Two targets, present and future.** Everything in this document describes the
+**current** target EmbCC emits for: an **ELF** executable linked against
+**newlib**, which is what runs on EmbLinkOS today and is the substrate for
+porting foreign source (git/CPython/C++). That target is not going away — it is
+how the OS meets the existing software world.
+
+The **native** target, which EmbCC grows into (DECISIONS D-003, D-009), is:
+- **format:** **EMBX** — `myos/docs/EMBX_Specification_v2.md`, byte-exact, with
+  a working in-kernel loader. Same SysV/LP64/no-PIE code inside; a different,
+  capability-carrying container around it. An EMBX APP is fully linked (no
+  relocations), so the whole dynamic-linking §4 complexity below does **not**
+  apply to it. The one addition is the **capability table** (spec §5): the
+  binary declares the resource classes it needs, checked at load against the
+  spawning process's set.
+- **libc:** **emlibc** — `myos/docs/EMLIBC_Requirements.md`, non-POSIX,
+  EmbLink-shaped. The crt0 contract (§2) and the syscall convention (§3) are
+  the parts emlibc keeps from what is documented here; the POSIX-costume parts
+  fall away.
+
+Read the rest of this document as the **current** contract, which is also the
+foundation the native target is derived from — the SysV ABI, the crt0 entry,
+and the `int 0x80` convention are shared by both. EMBX and emlibc change the
+*container* and the *library shape*, not the instruction-level contract.
+
 ---
 
 ## 1. The rule that shapes everything: the kernel *is* the linker

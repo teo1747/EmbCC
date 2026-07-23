@@ -56,9 +56,13 @@ turns out to be painful in C and obvious in the other language.
 
 ---
 
-## D-003 — Emit **ELF**. A native format, if ever, is an ELF *superset*
+## D-003 — Emit **EMBX** (native, capability-carrying) + keep ELF for porting
 
-**Decided:** 2026-07-19 (design). **Status:** firm.
+**Decided:** 2026-07-19 (design). **REVISED 2026-07-24 — the reopen condition
+at the bottom triggered.** The original decision (emit ELF, native format only
+as an ELF superset) and its reasoning are kept below because the reasoning is
+still correct; what changed is the conclusion, and honestly so — see the
+revision block.
 
 EmbCC emits ELF in the exact shape EmbLinkOS's in-kernel loader accepts
 (see TARGET_ABI.md). It does **not** invent a container format.
@@ -88,8 +92,39 @@ then consider format work.
 container before deciding what it declares inverts the discipline the OS's own
 docs insist on (derive the on-disk shape *last*, from the invariants).
 
-**Reopens if:** a capability model lands and genuinely cannot be expressed in
-ELF notes.
+### Revision — 2026-07-24
+
+This decision **predicted its own supersession** and got the ordering right: it
+said a declared capability manifest was the one thing that could justify a
+native format, and to **build the model first**. That is exactly what happened.
+
+1. **The capability model landed** in EmbLinkOS: a per-process capability set,
+   seeded at init and attenuated at spawn, with a spawn-syscall path and a
+   first handle-install gate (kernel `capabilities.h`, `sys_getcaps`,
+   `SPAWN_ACTION_SET_CAPS`). The model came first, from invariants — the
+   discipline this decision insisted on.
+2. **Then the format**, EMBX (`myos/docs/EMBX_Specification_v2.md`), byte-exact,
+   with a **working in-kernel loader** that enforces the capability check at
+   load (§6 step 9). The declaration flows: binary table → step-9 check → the
+   process's cap set → a gated handle.
+
+**Honest note on the reopen basis.** This decision's stated reopen was "if the
+model *cannot be expressed in ELF notes*." Strictly, it could have been — a
+`.note.embx.caps` section would have worked. The reopen is therefore on a
+*different* basis than anticipated: a deliberate **ownership** choice, made by
+the OS's author, consistent with how EmbLinkOS already runs a dual-format world
+for filesystems (EMBKFS native for its own data, FAT32 to read foreign disks).
+Executables now mirror that: **EMBX for programs built for EmbLink, ELF kept as
+the porting substrate** (foreign source recompiled — the git/CPython/C++ path).
+It is a dual *loader*, not a converter. So EmbCC's eventual output is EMBX; ELF
+stays for as long as porting does.
+
+**Reopens if:** never for "ELF-only" again. The open question is now the
+inverse — when EmbCC gains a relocation model, whether EMBX's `.embdll` linkage
+contract (spec §4.2, still deferred) is the right shape.
+
+**Original reopen (kept for the record):** a capability model lands and
+genuinely cannot be expressed in ELF notes.
 
 ---
 
@@ -193,3 +228,45 @@ C-only world) and it gets its own decision record when it becomes concrete.
 
 **Reopens if:** the ten-lines test (D-002) passes convincingly for the typed
 values language — the gate is unchanged, only the expectation is.
+
+
+---
+
+## D-009 — Own libc: **emlibc**, non-POSIX, EmbLink-shaped
+
+**Decided:** 2026-07-23. **Status:** current intent, deferred; requirements
+written (`myos/docs/EMLIBC_Requirements.md`), no implementation.
+
+EmbCC's eventual link target is **emlibc**, EmbLinkOS's own C library, not
+newlib (nor musl/glibc). The requirements doc is the OS-side artifact; EmbCC
+consumes its contract, the same relationship it has with the EMBX format spec.
+
+**Why.** The ownership loop D-003 and D-008 point at closes only if the *library*
+is owned too: language + compiler + libc + format + loader + OS, one system.
+musl/glibc were weighed and declined — both are written against the Linux
+syscall ABI and would drag the system toward host-the-world, the pole
+EmbLinkOS deliberately sits opposite. The OS's author is "only half okay" with
+depending on a ported POSIX libc forever.
+
+**What keeps it tractable** (and why it is not "rewrite a libc"): most of a libc
+is OS-agnostic (string/math/malloc/printf number-formatting) and may be **lifted**
+from a permissive source — D-006 applied to ourselves, a from-scratch `cosf` is
+authorship without capability. POSIX lives only in the thin OS-facing rim
+(I/O, process, time, entropy), and EmbLinkOS **already owns that rim**
+(`crt0.c`, `syscalls.c`, the errno map). So emlibc is incremental: own the rim,
+grow the agnostic bulk header by header, expose the capability-aware surface
+newlib cannot (`getcaps`, spawn+file-actions instead of `fork`), and eventually
+be **compiled by EmbCC itself** (the closed loop) and shipped as **EMBX**.
+
+**Rejected:** a POSIX-compatible libc (musl/glibc port), because POSIX
+compatibility is exactly the thing the OS's non-POSIX model refuses. picolibc
+remains a legitimate *interim* upgrade over newlib if raw completeness is wanted
+before emlibc exists — but as a stopgap, never the destination.
+
+**Order:** after the C compiler is real (M1–M3) and alongside/after C++ (D-008);
+emlibc is not the opening move. It gets its own milestones when it becomes
+concrete.
+
+**Reopens if:** the interim (picolibc) proves good enough that owning the libc
+never earns itself under D-006 — the same earn-by-capability gate everything
+here answers to.

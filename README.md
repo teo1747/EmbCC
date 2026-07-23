@@ -45,11 +45,17 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 - **A C compiler first, not a new language.** Compiling a subset of C to the
   EmbLink ABI makes every increment testable *on the OS* the day it can emit a
   valid object. A language of its own is a possible future, not the opening move.
-- **Emit ELF, EmbLink-ABI.** The format stays ELF — specifically the exact shape
-  EmbLinkOS's in-kernel loader already binds (there is no `ld.so`; **the kernel
-  is the linker**). A native format, if it ever comes, is an **ELF superset**
-  (ELF-plus-notes, derived from a real need such as a capability manifest),
-  never a from-scratch container that forces converters forever.
+- **Emit ELF today; grow into EMBX + emlibc.** The *current* target is ELF
+  linked against newlib — the shape the in-kernel loader binds (there is no
+  `ld.so`; **the kernel is the linker**), and the substrate for porting foreign
+  source. The *native* target EmbCC grows into (DECISIONS D-003/D-009) is
+  **EMBX**, EmbLinkOS's own capability-carrying format
+  (`myos/docs/EMBX_Specification_v2.md`, byte-exact, working loader), linked
+  against **emlibc**, the OS's own non-POSIX libc
+  (`myos/docs/EMLIBC_Requirements.md`). ELF stays as the porting lane — a dual
+  *loader*, not a converter, mirroring EMBKFS-native-plus-FAT32 for disks. The
+  earlier "ELF superset only" plan was **revised** once the capability model
+  landed and the OS's author chose to own the format; D-003 records why.
 - **The milestones are loops.** EmbCC compiles a program the OS runs (exit 42);
   then EmbCC compiles *itself*; then EmbBuild builds EmbCC from `/data/src` on
   the OS. Each is the self-hosting loop, one ring deeper.
