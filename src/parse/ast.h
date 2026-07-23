@@ -17,7 +17,7 @@
 enum expr_kind { EXPR_NUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
-                 EXPR_MEMBER };
+                 EXPR_MEMBER, EXPR_COND, EXPR_COMMA };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -42,6 +42,8 @@ struct expr {
     int var_index;        /* EXPR_VAR/EXPR_INCDEC: slot; set by sema */
     struct global *gref;  /* EXPR_VAR/EXPR_INCDEC: the global, when the
                            * name is not a local (sema) */
+    struct func *fref;    /* EXPR_VAR: a function used as a value —
+                           * decays to pointer-to-function (sema) */
     int str_index;        /* EXPR_STR: unit string table slot (irgen) */
     enum binop op;        /* EXPR_BINOP */
     struct expr *lhs, *rhs; /* BINOP + ASSIGN(lhs=target);
@@ -52,9 +54,11 @@ struct expr {
      * memb is resolved by sema (offset + type). */
     int is_arrow;
     struct member *memb;
-    struct expr *args[MAX_PARAMS]; /* EXPR_CALL */
+    struct expr *args[MAX_PARAMS]; /* EXPR_CALL; lhs is the callee
+                           * expression (a VAR for direct calls) */
     int nargs;
-    struct func *callee;  /* EXPR_CALL: resolved by sema */
+    struct func *callee;  /* EXPR_CALL: direct target (sema), or NULL
+                           * for a call through a function pointer */
 };
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
@@ -124,7 +128,7 @@ struct func {
     int used;             /* sema: at least one call resolves here */
     /* codegen bookkeeping: position inside .text (defined funcs only) */
     int code_off, code_len;
-    int sym_ndx;          /* driver: UNDEF symbol index (externals only) */
+    int sym_ndx;          /* driver: symbol index (defined or UNDEF) */
 };
 
 /* An enumerator: a named int constant at file scope. */

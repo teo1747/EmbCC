@@ -272,6 +272,13 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return i->dst;
     }
     case EXPR_VAR:
+        if (e->fref) { /* function designator: its address */
+            struct ir_ins *i = emit(fn);
+            i->op = IR_FADDR;
+            i->callee = e->fref;
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
         /* arrays and structs are represented by their address */
         if (e->undecayed || e->ty->kind == TY_STRUCT)
             return gen_addr(fn, e);
@@ -300,9 +307,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         struct type *t = e->ty;
         int scale = t->kind == TY_PTR ? ty_size(t->pointee) : 1;
         int w = ty_w(t);
-        int gaddr = e->gref ? emit_gaddr(fn, e->gref) : -1;
-        int cur = e->gref ? emit_load(fn, gaddr, t)
-                          : emit_ldvar(fn, e->var_index, t);
+        int local = e->lhs->kind == EXPR_VAR && !e->lhs->gref;
+        int addr = local ? -1 : gen_addr(fn, e->lhs);
+        int cur = local ? emit_ldvar(fn, e->lhs->var_index, t)
+                        : emit_load(fn, addr, t);
         int old = -1;
         if (e->is_post) {
             struct ir_ins *save = emit(fn);
@@ -323,10 +331,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             i->dst = new_temp(fn);
             sum = i->dst;
         }
-        if (e->gref)
-            emit_store(fn, gaddr, sum, t);
+        if (local)
+            emit_stvar(fn, e->lhs->var_index, sum, t);
         else
-            emit_stvar(fn, e->var_index, sum, t);
+            emit_store(fn, addr, sum, t);
         return e->is_post ? old : sum;
     }
     case EXPR_NOT: {
@@ -345,7 +353,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     }
     case EXPR_DEREF: {
         int addr = gen_expr(fn, e->rhs);
-        /* row of a 2-D array, or a struct: the address is the value */
+        /* *fp is fp (the OPERAND points at a function — nothing to
+         * load); rows of 2-D arrays and structs are addresses too */
+        if (e->rhs->ty->pointee->kind == TY_FUNC)
+            return addr;
         if (e->undecayed || e->ty->kind == TY_STRUCT)
             return addr;
         struct ir_ins *i = emit(fn);
@@ -485,13 +496,44 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         }
     }
+    case EXPR_COMMA:
+        gen_expr(fn, e->lhs); /* for side effects */
+        return gen_expr(fn, e->rhs);
+    case EXPR_COND: {
+        int dst = new_temp(fn);
+        int l_else = new_label(fn);
+        int l_end = new_label(fn);
+        int c = gen_expr(fn, e->args[0]);
+        emit_brz(fn, c, ty_w(e->args[0]->ty), l_else);
+        int a = gen_expr(fn, e->lhs);
+        struct ir_ins *m1 = emit(fn);
+        m1->op = IR_MOV;
+        m1->a = a;
+        m1->dst = dst;
+        emit_jmp(fn, l_end);
+        emit_label(fn, l_else);
+        int b = gen_expr(fn, e->rhs);
+        struct ir_ins *m2 = emit(fn);
+        m2->op = IR_MOV;
+        m2->a = b;
+        m2->dst = dst;
+        emit_label(fn, l_end);
+        return dst;
+    }
     case EXPR_CALL: {
         int args[MAX_PARAMS];
+        int fptemp = -1;
+        if (!e->callee) /* through a pointer: evaluate the callee */
+            fptemp = gen_expr(fn, e->lhs);
         for (int k = 0; k < e->nargs; k++)
             args[k] = gen_expr(fn, e->args[k]);
         struct ir_ins *i = emit(fn);
         i->op = IR_CALL;
         i->callee = e->callee;
+        i->indirect = !e->callee;
+        i->a = fptemp;
+        i->call_varargs = e->callee ? e->callee->is_varargs
+                                    : e->lhs->ty->pointee->is_varargs;
         i->nargs = e->nargs;
         for (int k = 0; k < e->nargs; k++)
             i->args[k] = args[k];
@@ -606,15 +648,21 @@ struct ir_unit *irgen(struct unit *u)
     cur_unit = iu;
 
     /* Only canonical, defined functions produce code; prototypes of
-     * externals produce symbols and relocations instead (driver). */
+     * externals produce symbols and relocations instead (driver).
+     * UNUSED static functions are skipped entirely — headers define
+     * static inline helpers wholesale (newlib stdio does), and
+     * emitting the unused ones would drag their callees into every
+     * link. Internal linkage makes this invisible to other objects. */
     for (struct func *f = u->funcs; f; f = f->next)
-        if (!f->absorbed && f->has_defn)
+        if (!f->absorbed && f->has_defn &&
+            (!f->is_static || f->used || strcmp(f->name, "main") == 0))
             iu->nfuncs++;
     iu->funcs = xcalloc((size_t)iu->nfuncs, sizeof *iu->funcs);
 
     int n = 0;
     for (struct func *f = u->funcs; f; f = f->next)
-        if (!f->absorbed && f->has_defn)
+        if (!f->absorbed && f->has_defn &&
+            (!f->is_static || f->used || strcmp(f->name, "main") == 0))
             gen_func(&iu->funcs[n++], f);
     return iu;
 }

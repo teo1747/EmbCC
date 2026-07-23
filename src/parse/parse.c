@@ -112,6 +112,114 @@ static int at_type_start(struct parser *ps)
            find_typedef(ps, cur(ps)->text) != NULL;
 }
 
+static struct type *parse_fn_params(struct parser *ps, struct type *ret);
+static struct type *parse_stars(struct parser *ps, struct type *t);
+static struct type *parse_array_dims(struct parser *ps, struct type *t);
+static struct type *parse_type_spec(struct parser *ps, int allow_body);
+
+/* Declarator over a base type: leading stars, then either the function-
+ * pointer form '( * [*...] [name] [dims] ) ( params )' or a plain
+ * [name] [dims]. name_out is NULL when no name appeared (legal in
+ * prototypes and abstract declarators). */
+static struct type *parse_declarator(struct parser *ps, struct type *base,
+                                     const char **name_out)
+{
+    base = parse_stars(ps, base);
+    *name_out = NULL;
+    if (cur(ps)->kind == TOK_LPAREN) {
+        struct lexer save = ps->lx;
+        advance(ps);
+        if (cur(ps)->kind == TOK_STAR) {
+            advance(ps);
+            int extra = 0;
+            while (cur(ps)->kind == TOK_STAR) {
+                advance(ps);
+                extra++;
+            }
+            skip_quals(ps);
+            if (cur(ps)->kind == TOK_IDENT) {
+                *name_out = cur(ps)->text;
+                advance(ps);
+            }
+            int adims[4];
+            int nad = 0;
+            while (cur(ps)->kind == TOK_LBRACKET) {
+                advance(ps);
+                if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "array size must be a positive integer "
+                               "literal");
+                if (nad >= 4)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "more than 4 array dimensions");
+                adims[nad++] = (int)cur(ps)->num;
+                advance(ps);
+                expect(ps, TOK_RBRACKET, "']'");
+            }
+            expect(ps, TOK_RPAREN, "')'");
+            struct type *t = ty_ptr(parse_fn_params(ps, base));
+            for (int i = 0; i < extra; i++)
+                t = ty_ptr(t);
+            for (int i = nad - 1; i >= 0; i--)
+                t = ty_array(t, adims[i]);
+            return t;
+        }
+        ps->lx = save; /* not a function-pointer declarator */
+    }
+    if (cur(ps)->kind == TOK_IDENT) {
+        *name_out = cur(ps)->text;
+        advance(ps);
+    }
+    return parse_array_dims(ps, base);
+}
+
+/* The '(params)' of a function TYPE (as in a function pointer). */
+static struct type *parse_fn_params(struct parser *ps, struct type *ret)
+{
+    expect(ps, TOK_LPAREN, "'('");
+    struct type *pt[8];
+    int n = 0, varargs = 0;
+
+    if (cur(ps)->kind == TOK_KW_VOID) {
+        struct lexer save = ps->lx;
+        advance(ps);
+        if (cur(ps)->kind != TOK_RPAREN)
+            ps->lx = save;
+    }
+    if (cur(ps)->kind != TOK_RPAREN) {
+        for (;;) {
+            if (cur(ps)->kind == TOK_ELLIPSIS) {
+                varargs = 1;
+                advance(ps);
+                break;
+            }
+            struct type *spec = parse_type_spec(ps, 0);
+            if (!spec)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a parameter type before %s",
+                           tok_describe(cur(ps)));
+            const char *dummy;
+            struct type *t = parse_declarator(ps, spec, &dummy);
+            if (t->kind == TY_ARRAY)
+                t = ty_ptr(t->pointee); /* C's adjustment */
+            if (t->kind == TY_FUNC)
+                t = ty_ptr(t);
+            if (t->kind == TY_VOID)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "a parameter cannot have type void");
+            if (n >= 8)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "too many parameters in a function type");
+            pt[n++] = t;
+            if (cur(ps)->kind != TOK_COMMA)
+                break;
+            advance(ps);
+        }
+    }
+    expect(ps, TOK_RPAREN, "')'");
+    return ty_func(ret, pt, n, varargs);
+}
+
 static struct type *parse_struct_body(struct parser *ps, struct type *t);
 static void parse_enum_body(struct parser *ps);
 
@@ -264,14 +372,20 @@ static struct type *parse_array_dims(struct parser *ps, struct type *t)
     int ndims = 0;
     while (cur(ps)->kind == TOK_LBRACKET) {
         advance(ps);
-        if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "array size must be a positive integer literal");
+        int dim = 0; /* [] : legal for params (adjusts to a pointer);
+                        elsewhere caught as an incomplete type */
+        if (cur(ps)->kind != TOK_RBRACKET) {
+            if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "array size must be a positive integer "
+                           "literal");
+            dim = (int)cur(ps)->num;
+            advance(ps);
+        }
         if (ndims >= 4)
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "more than 4 array dimensions");
-        dims[ndims++] = (int)cur(ps)->num;
-        advance(ps);
+        dims[ndims++] = dim;
         expect(ps, TOK_RBRACKET, "']'");
     }
     for (int i = ndims - 1; i >= 0; i--)
@@ -293,18 +407,20 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
                        "expected a member type before %s",
                        tok_describe(cur(ps)));
         for (;;) { /* declarators share the base: int a, *b, c[4]; */
-            struct type *mty = parse_stars(ps, spec);
+            int mline = cur(ps)->line;
+            const char *mname;
+            struct type *mty = parse_declarator(ps, spec, &mname);
             if (mty->kind == TY_VOID)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_fatal(ps->lx.file, mline,
                            "a member cannot have type void");
-            if (cur(ps)->kind != TOK_IDENT)
+            if (mty->kind == TY_FUNC)
+                diag_fatal(ps->lx.file, mline,
+                           "a member cannot be a function — use a "
+                           "function pointer");
+            if (!mname)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
-            const char *mname = cur(ps)->text;
-            int mline = cur(ps)->line;
-            advance(ps);
-            mty = parse_array_dims(ps, mty);
             if (ty_size(mty) == 0)
                 diag_fatal(ps->lx.file, mline,
                            "member '%s' has incomplete type %s",
@@ -392,6 +508,7 @@ static struct expr *new_expr(enum expr_kind kind, int line)
 }
 
 static struct expr *parse_expr(struct parser *ps);
+static struct expr *parse_comma(struct parser *ps);
 static struct expr *parse_unary(struct parser *ps);
 static struct expr *binop(enum binop op, struct expr *lhs,
                           struct expr *rhs);
@@ -420,36 +537,14 @@ static struct expr *parse_primary(struct parser *ps)
         return e;
     case TOK_LPAREN:
         advance(ps);
-        e = parse_expr(ps);
+        e = parse_comma(ps);
         expect(ps, TOK_RPAREN, "')'");
         return e;
     case TOK_IDENT: {
-        const char *name = t->text;
-        int line = t->line;
-        reject_reserved(ps, name, line);
+        reject_reserved(ps, t->text, t->line);
+        e = new_expr(EXPR_VAR, t->line);
+        e->name = t->text;
         advance(ps);
-        if (cur(ps)->kind != TOK_LPAREN) {
-            e = new_expr(EXPR_VAR, line);
-            e->name = name;
-            return e;
-        }
-        advance(ps); /* '(' */
-        e = new_expr(EXPR_CALL, line);
-        e->name = name;
-        if (cur(ps)->kind != TOK_RPAREN) {
-            for (;;) {
-                if (e->nargs >= MAX_PARAMS)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
-                               "more than %d call arguments "
-                               "(register args only for now)",
-                               MAX_PARAMS);
-                e->args[e->nargs++] = parse_expr(ps);
-                if (cur(ps)->kind != TOK_COMMA)
-                    break;
-                advance(ps);
-            }
-        }
-        expect(ps, TOK_RPAREN, "')'");
         return e;
     }
     default:
@@ -462,12 +557,9 @@ static struct expr *parse_primary(struct parser *ps)
 static struct expr *incdec(struct parser *ps, struct expr *target,
                            int line, int is_post, int delta)
 {
-    if (target->kind != EXPR_VAR)
-        diag_fatal(ps->lx.file, line,
-                   "++/-- needs a plain variable (not through a pointer "
-                   "yet)");
+    (void)ps;
     struct expr *e = new_expr(EXPR_INCDEC, line);
-    e->name = target->name;
+    e->lhs = target;
     e->is_post = is_post;
     e->delta = delta;
     return e;
@@ -477,7 +569,30 @@ static struct expr *parse_postfix(struct parser *ps)
 {
     struct expr *e = parse_primary(ps);
     for (;;) {
-        if (cur(ps)->kind == TOK_LBRACKET) {
+        if (cur(ps)->kind == TOK_LPAREN) {
+            /* a call — through a name or any pointer-valued expression */
+            int line = cur(ps)->line;
+            advance(ps);
+            struct expr *call = new_expr(EXPR_CALL, line);
+            call->lhs = e;
+            if (e->kind == EXPR_VAR)
+                call->name = e->name;
+            if (cur(ps)->kind != TOK_RPAREN) {
+                for (;;) {
+                    if (call->nargs >= MAX_PARAMS)
+                        diag_fatal(ps->lx.file, cur(ps)->line,
+                                   "more than %d call arguments "
+                                   "(register args only for now)",
+                                   MAX_PARAMS);
+                    call->args[call->nargs++] = parse_expr(ps);
+                    if (cur(ps)->kind != TOK_COMMA)
+                        break;
+                    advance(ps);
+                }
+            }
+            expect(ps, TOK_RPAREN, "')'");
+            e = call;
+        } else if (cur(ps)->kind == TOK_LBRACKET) {
             /* p[i] is sugar for *(p + i); the scaling by the pointee
              * size happens in irgen off the types. */
             int line = cur(ps)->line;
@@ -659,9 +774,40 @@ static const struct {
     { TOK_SHLEQ, B_SHL },    { TOK_SHREQ, B_SHR },
 };
 
-static struct expr *parse_expr(struct parser *ps)
+/* Full expressions (statements, parens, conditions) allow the comma
+ * operator; argument lists and initializers use parse_expr, where a
+ * comma separates. */
+static struct expr *parse_comma(struct parser *ps)
+{
+    struct expr *e = parse_expr(ps);
+    while (cur(ps)->kind == TOK_COMMA) {
+        struct expr *c = new_expr(EXPR_COMMA, cur(ps)->line);
+        advance(ps);
+        c->lhs = e;
+        c->rhs = parse_expr(ps);
+        e = c;
+    }
+    return e;
+}
+
+static struct expr *parse_cond(struct parser *ps)
 {
     struct expr *e = parse_lor(ps);
+    if (cur(ps)->kind != TOK_QUESTION)
+        return e;
+    struct expr *r = new_expr(EXPR_COND, cur(ps)->line);
+    advance(ps);
+    r->args[0] = e;
+    r->nargs = 1;
+    r->lhs = parse_comma(ps); /* the then-branch is a FULL expression */
+    expect(ps, TOK_COLON, "':'");
+    r->rhs = parse_cond(ps); /* right-associative, as in C */
+    return r;
+}
+
+static struct expr *parse_expr(struct parser *ps)
+{
+    struct expr *e = parse_cond(ps);
     enum tok_kind k = cur(ps)->kind;
     int line = cur(ps)->line;
 
@@ -746,18 +892,18 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         struct stmt *head = NULL, **dtail = &head;
         for (;;) {
             s = new_stmt(STMT_DECL, t->line);
-            s->dty = parse_stars(ps, base);
-            if (s->dty->kind == TY_VOID)
+            const char *dname;
+            s->dty = parse_declarator(ps, base, &dname);
+            if (s->dty->kind == TY_VOID || s->dty->kind == TY_FUNC)
                 diag_fatal(ps->lx.file, t->line,
-                           "a variable cannot have type void");
-            if (cur(ps)->kind != TOK_IDENT)
+                           "a variable cannot have type %s",
+                           ty_name(s->dty));
+            if (!dname)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a variable name before %s",
                            tok_describe(cur(ps)));
-            s->name = cur(ps)->text;
-            advance(ps);
-            int was_array = cur(ps)->kind == TOK_LBRACKET;
-            s->dty = parse_array_dims(ps, s->dty);
+            s->name = dname;
+            int was_array = s->dty->kind == TY_ARRAY;
             if (ty_size(s->dty) == 0)
                 diag_fatal(ps->lx.file, s->line,
                            "'%s' has incomplete type %s", s->name,
@@ -820,13 +966,13 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                        "declarations in for-init are not supported yet; "
                        "declare the variable before the loop");
         if (cur(ps)->kind != TOK_SEMI)
-            s->init = parse_expr(ps);
+            s->init = parse_comma(ps);
         expect(ps, TOK_SEMI, "';'");
         if (cur(ps)->kind != TOK_SEMI) /* NULL cond = forever; break exits */
             s->cond = parse_expr(ps);
         expect(ps, TOK_SEMI, "';'");
         if (cur(ps)->kind != TOK_RPAREN)
-            s->step = parse_expr(ps);
+            s->step = parse_comma(ps);
         expect(ps, TOK_RPAREN, "')'");
         s->body = parse_controlled(ps);
         return s;
@@ -854,7 +1000,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         if (t->kind == TOK_IDENT)
             reject_reserved(ps, t->text, t->line);
         s = new_stmt(STMT_EXPR, t->line);
-        s->expr = parse_expr(ps);
+        s->expr = parse_comma(ps);
         expect(ps, TOK_SEMI, "';'");
         return s;
     default:
@@ -936,14 +1082,12 @@ static void parse_top(struct parser *ps, struct unit *u,
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "expected a type after 'typedef'");
         for (;;) {
-            struct type *tt = parse_stars(ps, tbase);
-            if (cur(ps)->kind != TOK_IDENT)
+            const char *tname;
+            struct type *tt = parse_declarator(ps, tbase, &tname);
+            if (!tname)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "typedef needs a name, got %s",
                            tok_describe(cur(ps)));
-            const char *tname = cur(ps)->text;
-            advance(ps);
-            tt = parse_array_dims(ps, tt);
             struct type *prev = find_typedef(ps, tname);
             if (prev && !ty_equal(prev, tt))
                 diag_fatal(ps->lx.file, cur(ps)->line,
@@ -974,31 +1118,36 @@ static void parse_top(struct parser *ps, struct unit *u,
         advance(ps);
         return;
     }
+    struct lexer fork = ps->lx;
     struct type *ty = parse_stars(ps, base);
-    if (cur(ps)->kind != TOK_IDENT)
-        diag_fatal(ps->lx.file, cur(ps)->line,
-                   "expected a name before %s", tok_describe(cur(ps)));
-    const char *name = cur(ps)->text;
+    const char *name = NULL;
     int line = cur(ps)->line;
-    advance(ps);
-
-    if (cur(ps)->kind != TOK_LPAREN) {
+    if (cur(ps)->kind == TOK_IDENT) {
+        name = cur(ps)->text;
+        advance(ps);
+    }
+    if (!name || cur(ps)->kind != TOK_LPAREN) {
+        /* not a function: rewind and parse global declarators */
+        ps->lx = fork;
         for (;;) {
-            struct global *g = parse_global(ps, ty, name, line,
+            const char *gname;
+            int gline = cur(ps)->line;
+            struct type *gt = parse_declarator(ps, base, &gname);
+            if (!gname)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a name before %s",
+                           tok_describe(cur(ps)));
+            if (gt->kind == TY_FUNC)
+                diag_fatal(ps->lx.file, gline,
+                           "a variable cannot have a function type — "
+                           "did you mean a function pointer (*)?");
+            struct global *g = parse_global(ps, gt, gname, gline,
                                             is_static, is_extern);
             g->seq = seq;
             **gtail = g;
             *gtail = &g->next;
             if (cur(ps)->kind != TOK_COMMA)
                 break;
-            advance(ps);
-            ty = parse_stars(ps, base);
-            if (cur(ps)->kind != TOK_IDENT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "expected a name before %s",
-                           tok_describe(cur(ps)));
-            name = cur(ps)->text;
-            line = cur(ps)->line;
             advance(ps);
         }
         expect(ps, TOK_SEMI, "';'");
@@ -1042,12 +1191,17 @@ static void parse_top(struct parser *ps, struct unit *u,
             }
             if (cur(ps)->kind == TOK_IDENT)
                 reject_reserved(ps, cur(ps)->text, cur(ps)->line);
-            struct type *pt = parse_type_spec(ps, 0);
-            if (!pt)
+            struct type *spec = parse_type_spec(ps, 0);
+            if (!spec)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a parameter type before %s",
                            tok_describe(cur(ps)));
-            pt = parse_stars(ps, pt);
+            const char *pname;
+            struct type *pt = parse_declarator(ps, spec, &pname);
+            if (pt->kind == TY_ARRAY)
+                pt = ty_ptr(pt->pointee); /* C's adjustment */
+            if (pt->kind == TY_FUNC)
+                pt = ty_ptr(pt);
             if (pt->kind == TY_VOID)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "a parameter cannot have type void");
@@ -1061,24 +1215,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                            "more than %d parameters "
                            "(register args only for now)", MAX_PARAMS);
             f->param_tys[f->nparams] = pt;
-            /* The name is optional in a prototype; a definition with a
-             * nameless parameter is rejected below. */
-            if (cur(ps)->kind == TOK_IDENT) {
-                f->params[f->nparams] = cur(ps)->text;
-                advance(ps);
-            } else {
-                f->params[f->nparams] = NULL;
-            }
-            /* C adjusts an array parameter to a pointer to its element;
-             * the size, if given, is documentation. */
-            if (cur(ps)->kind == TOK_LBRACKET) {
-                advance(ps);
-                if (cur(ps)->kind == TOK_NUM)
-                    advance(ps);
-                expect(ps, TOK_RBRACKET, "']'");
-                f->param_tys[f->nparams] =
-                    ty_ptr(f->param_tys[f->nparams]);
-            }
+            f->params[f->nparams] = pname; /* NULL fine in prototypes */
             f->nparams++;
             if (cur(ps)->kind != TOK_COMMA)
                 break;

@@ -29,8 +29,33 @@ CEOF
 rm -f "$out_dir/nl.o" "$out_dir/nl"
 "$EMBCC" -c "$out_dir/nl.c" -o "$out_dir/nl.o" \
     -I include -I "$NEWLIB" || { echo "compile failed"; exit 1; }
-cc -o "$out_dir/nl" "$out_dir/nl.o" || { echo "link failed"; exit 1; }
+cc -no-pie -o "$out_dir/nl" "$out_dir/nl.o" || { echo "link failed"; exit 1; }
 "$out_dir/nl"
 got=$?
 [ "$got" -eq 42 ] || { echo "exit $got, expected 42"; exit 1; }
 echo "newlib stdint.h/stddef.h: compiled, linked, ran, exit 42"
+
+# The M2 goal sentence, literally: a program that #includes <stdio.h>
+# and calls the real libc. (Function pointers in struct __sFILE, the
+# getc/putc inline maze, string.h — the whole gauntlet.)
+cat > "$out_dir/nlstdio.c" << 'CEOF'
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    char buf[32];
+    strcpy(buf, "stdio via ");
+    strcat(buf, "embcc");
+    printf("%s (%d chars)\n", buf, (int)strlen(buf));
+    return 42;
+}
+CEOF
+rm -f "$out_dir/nlstdio.o" "$out_dir/nlstdio"
+"$EMBCC" -c "$out_dir/nlstdio.c" -o "$out_dir/nlstdio.o" \
+    -I include -I "$NEWLIB" || { echo "stdio.h compile failed"; exit 1; }
+cc -no-pie -o "$out_dir/nlstdio" "$out_dir/nlstdio.o" || {
+    echo "stdio.h link failed"; exit 1; }
+out=$("$out_dir/nlstdio"); got=$?
+[ "$got" -eq 42 ] || { echo "stdio.h run: exit $got"; exit 1; }
+echo "$out" | grep -q "stdio via embcc (15 chars)" || {
+    echo "stdio.h run: wrong output: $out"; exit 1; }
+echo "newlib stdio.h: compiled, linked, ran — M2's goal sentence works"

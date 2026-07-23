@@ -76,4 +76,9 @@ int x86_jmp_rel32(struct code *c);
 /* call rel32 with a zero placeholder; returns the rel32 field offset. */
 int x86_call_rel32(struct code *c);
 
+/* Indirect calls go through r11 — caller-saved, never an argument
+ * register, and it leaves al free for the varargs convention. */
+void x86_mov_r11_slot(struct code *c, int disp);
+void x86_call_r11(struct code *c);
+
 #endif

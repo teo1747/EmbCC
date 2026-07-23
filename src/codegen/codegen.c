@@ -53,6 +53,8 @@ struct sites {
     int nstr, capstr;
     struct gsite *g;
     int ng, capg;
+    struct fsite *f;
+    int nf, capf;
 };
 
 #define PUSH(arr, n, cap, item)                                          \
@@ -198,6 +200,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_store_slot(text, sd[i->dst], 8);
             break;
         }
+        case IR_FADDR: {
+            struct fsite fs;
+            fs.patch_off = x86_lea_rax_rip(text);
+            fs.target = i->callee;
+            PUSH(st->f, st->nf, st->capf, fs);
+            x86_store_slot(text, sd[i->dst], 8);
+            break;
+        }
         case IR_LOAD:
             x86_load_slot(text, sd[i->a], 8, 0, 8); /* the address */
             x86_load_mem_rax(text, i->size, i->sign, i->w);
@@ -238,19 +248,25 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_CALL: {
             for (int k = 0; k < i->nargs; k++)
                 x86_load_arg(text, k, sd[i->args[k]]);
-            if (i->callee->is_varargs)
+            if (i->indirect)
+                x86_mov_r11_slot(text, sd[i->a]);
+            if (i->call_varargs)
                 x86_zero_eax(text); /* SysV: al = # of vector args = 0 */
-            int patch = x86_call_rel32(text);
-            if (i->callee->has_defn) {
-                struct callsite cs;
-                cs.patch_off = patch;
-                cs.target = i->callee;
-                PUSH(st->call, st->ncall, st->capcall, cs);
+            if (i->indirect) {
+                x86_call_r11(text);
             } else {
-                struct extcall ec;
-                ec.patch_off = patch;
-                ec.callee = i->callee;
-                PUSH(st->ext, st->next, st->capext, ec);
+                int patch = x86_call_rel32(text);
+                if (i->callee->has_defn) {
+                    struct callsite cs;
+                    cs.patch_off = patch;
+                    cs.target = i->callee;
+                    PUSH(st->call, st->ncall, st->capcall, cs);
+                } else {
+                    struct extcall ec;
+                    ec.patch_off = patch;
+                    ec.callee = i->callee;
+                    PUSH(st->ext, st->next, st->capext, ec);
+                }
             }
             x86_store_slot(text, sd[i->dst], 8);
             break;
@@ -284,9 +300,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
 void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
                   struct strsite **strs, int *nstrs,
-                  struct gsite **gs, int *ngs)
+                  struct gsite **gs, int *ngs,
+                  struct fsite **fs, int *nfs)
 {
-    struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
     for (int n = 0; n < iu->nfuncs; n++)
         gen_func(&iu->funcs[n], text, &st);
@@ -312,4 +329,6 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
     *nstrs = st.nstr;
     *gs = st.g;
     *ngs = st.ng;
+    *fs = st.f;
+    *nfs = st.nf;
 }

@@ -36,9 +36,9 @@ check switch-stmt \
 check do-while \
     'int main(void) { int i = 0; do { i++; } while (i < 3); return 0; }' \
     "not supported"
-check ternary \
-    'int main(void) { return 1 ? 42 : 0; }' \
-    "not supported"
+check cond-incompatible \
+    'int main(void) { int x; int *p = &x; return 1 ? p : 5; }' \
+    "incompatible"
 check break-outside-loop \
     'int main(void) { break; return 0; }' \
     "outside of a loop"
@@ -66,10 +66,17 @@ check compound-through-pointer \
 check addr-of-rvalue \
     'int main(void) { int x = 1; return !&(x + 1); }' \
     "needs a variable"
-check function-pointer \
+check assign-to-function \
     'static int f(void) { return 1; }
-int main(void) { return !&f; }' \
-    "function pointers are not supported"
+int main(void) { f = 0; return f(); }' \
+    "cannot assign to a function"
+check call-non-function \
+    'int main(void) { int x = 1; return x(); }' \
+    "called object is not a function"
+check fp-type-mismatch \
+    'static int f(int x) { return x; }
+int main(void) { long (*fp)(int) = f; return 0; }' \
+    "without a cast"
 check void-variable \
     'int main(void) { void v; return 0; }' \
     "cannot have type void"
@@ -96,7 +103,7 @@ check member-dot-on-int \
 check varargs-too-few \
     'int printf(char *fmt, ...);
 int main(void) { printf(); return 0; }' \
-    "takes at least 1 argument"
+    "needs at least 1 argument"
 check global-conflicting-types \
     'int g;
 long g;
@@ -182,7 +189,7 @@ check block-scope-struct \
 check bitfield \
     'struct B { int f : 3; };
 int main(void) { return 0; }' \
-    "not supported"
+    "before ':'"
 check empty-struct \
     'struct E { };
 int main(void) { return 0; }' \
@@ -239,7 +246,7 @@ check fallthrough-if \
 check arity \
     'static int f(int a, int b) { return a + b; }
 int main(void) { return f(1); }' \
-    "takes 2 arguments, called with 1"
+    "needs 2 arguments, got 1"
 check string-as-int \
     'int main(void) { return "x"; }' \
     "converting char \* to int"

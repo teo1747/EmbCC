@@ -82,7 +82,9 @@ enum tok_kind {
     TOK_SHLEQ,
     TOK_SHREQ,
     TOK_PLUSPLUS,
-    TOK_MINUSMINUS
+    TOK_MINUSMINUS,
+    TOK_QUESTION,
+    TOK_COLON
 };
 
 struct token {

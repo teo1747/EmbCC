@@ -29,9 +29,13 @@ classification. The preprocessor landed
 next and passed its judge: REAL newlib headers — <stdint.h> and <stddef.h>
 (the cdefs/_default_types chain that broke TCC) preprocess, compile, and
 run through EmbCC, with EmbCC's own compiler headers (include/) covering
-stddef/stdarg/stdbool/float. <stdio.h> is one language feature away:
-function pointer types (struct _reent's callbacks) — the next increment,
-then the tally.c acceptance on the OS.
+stddef/stdarg/stdbool/float. Function pointers landed next
+(declarators, decay, indirect calls via r11, PC32 function-address
+relocations), pulling ?:, the comma operator, and ++/-- on arbitrary
+lvalues along with them — and with that, **the M2 goal sentence works: a
+program that #includes <stdio.h> and calls the real libc compiles, links,
+and runs** (host-proven; golden-tested). What remains: the tally.c + sval
+acceptance on the OS itself.
 
 ---
 

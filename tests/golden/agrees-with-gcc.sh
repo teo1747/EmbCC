@@ -15,9 +15,9 @@ for c in tests/exec/*.c; do
           "$out_dir/$name.embcc.o"
     "$EMBCC" -c "$c" -o "$out_dir/$name.embcc.o" || {
         echo "$name: embcc failed"; exit 1; }
-    cc -o "$out_dir/$name.embcc" "$out_dir/$name.embcc.o" || {
+    cc -no-pie -o "$out_dir/$name.embcc" "$out_dir/$name.embcc.o" || {
         echo "$name: link of embcc object failed"; exit 1; }
-    cc -std=c99 -o "$out_dir/$name.gcc" "$c" || {
+    cc -std=c99 -no-pie -o "$out_dir/$name.gcc" "$c" || {
         echo "$name: not valid C99 — the M1 subset must stay a strict"
         echo "subset of C, or golden comparisons are impossible"
         exit 1; }

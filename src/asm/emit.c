@@ -412,3 +412,17 @@ int x86_call_rel32(struct code *c)
     code_u32(c, 0);
     return off;
 }
+
+void x86_mov_r11_slot(struct code *c, int disp)
+{
+    code_byte(c, 0x4c); /* REX.WR: mov r11, [rbp+disp] */
+    code_byte(c, 0x8b);
+    modrm_rbp(c, 3, disp);
+}
+
+void x86_call_r11(struct code *c)
+{
+    code_byte(c, 0x41); /* REX.B */
+    code_byte(c, 0xff); /* call r/m64: /2 */
+    code_byte(c, 0xd3);
+}

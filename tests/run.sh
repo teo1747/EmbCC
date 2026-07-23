@@ -59,7 +59,7 @@ for c in tests/exec/*.c; do
         bad "$c" "embcc failed" "$msg"
         continue
     fi
-    if ! msg=$(cc -o "$exe" "$obj" 2>&1); then
+    if ! msg=$(cc -no-pie -o "$exe" "$obj" 2>&1); then
         bad "$c" "host link failed" "$msg"
         continue
     fi

@@ -18,17 +18,18 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.7.0-m2.preprocessor"
+#define EMBCC_VERSION "0.8.0-m2.funcptrs"
 
 static void print_version(void)
 {
     /* Honest: names what exists and what does not. */
     printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
            EMBCC_VERSION);
-    printf("C subset: the integer types, pointers, arrays, "
-           "structs/unions/enums, typedef, string literals, globals, "
-           "sizeof, casts, full control flow and operators, prototypes "
-           "incl. variadic externals; compile with -c.\n");
+    printf("C subset: the integer types, pointers incl. function "
+           "pointers, arrays, structs/unions/enums, typedef, ?:, the "
+           "comma operator, string literals, globals, sizeof, casts, "
+           "full control flow and operators; compile with -c — "
+           "#include <stdio.h> works against real newlib headers.\n");
     printf("Preprocessor: #include (-I), #define incl. variadic/#/##, "
            "conditionals, the x86_64-elf predefined set; -E to see it. "
            "No linker yet (M3) — link with the existing toolchain.\n");
@@ -110,8 +111,10 @@ static int compile(const char *in, const char *out, int pp_only)
     struct extcall *ext;
     struct strsite *strs;
     struct gsite *gs;
-    int next, nstrs, ngs;
-    codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs);
+    struct fsite *fs;
+    int next, nstrs, ngs, nfs;
+    codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
+                 &fs, &nfs);
 
     /* Lay out the defined globals: initialized -> .data, zero -> .bss,
      * each aligned to its (element) size. */
@@ -179,11 +182,12 @@ static int compile(const char *in, const char *out, int pp_only)
     /* Locals before globals — the writer enforces the gABI ordering.
      * Only canonical, defined functions own code. */
     for (struct func *f = u->funcs; f; f = f->next)
-        if (!f->absorbed && f->has_defn && f->is_static)
-            elfw_add_symbol(w, f->name, (Elf64_Addr)f->code_off,
-                            (Elf64_Xword)f->code_len,
-                            ELF64_ST_INFO(STB_LOCAL, STT_FUNC),
-                            (Elf64_Half)text_ndx);
+        if (!f->absorbed && f->has_defn && f->is_static && f->used)
+            f->sym_ndx = elfw_add_symbol(
+                w, f->name, (Elf64_Addr)f->code_off,
+                (Elf64_Xword)f->code_len,
+                ELF64_ST_INFO(STB_LOCAL, STT_FUNC),
+                (Elf64_Half)text_ndx);
     for (struct global *g = u->globals; g; g = g->next)
         if (!g->absorbed && g->defined && g->is_static)
             g->sym_ndx = elfw_add_symbol(
@@ -193,10 +197,11 @@ static int compile(const char *in, const char *out, int pp_only)
                 (Elf64_Half)(g->in_bss ? bss_ndx : data_ndx));
     for (struct func *f = u->funcs; f; f = f->next)
         if (!f->absorbed && f->has_defn && !f->is_static)
-            elfw_add_symbol(w, f->name, (Elf64_Addr)f->code_off,
-                            (Elf64_Xword)f->code_len,
-                            ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
-                            (Elf64_Half)text_ndx);
+            f->sym_ndx = elfw_add_symbol(
+                w, f->name, (Elf64_Addr)f->code_off,
+                (Elf64_Xword)f->code_len,
+                ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
+                (Elf64_Half)text_ndx);
     for (struct global *g = u->globals; g; g = g->next)
         if (!g->absorbed && g->defined && !g->is_static)
             g->sym_ndx = elfw_add_symbol(
@@ -240,6 +245,19 @@ static int compile(const char *in, const char *out, int pp_only)
         elfw_add_rela(w, text_ndx, (Elf64_Addr)gs[i].patch_off,
                       gs[i].glob->sym_ndx, R_X86_64_PC32, -4);
     free(gs);
+
+    /* Function addresses: PC32 against the function's symbol; an
+     * address-taken external gets an UNDEF symbol like a called one. */
+    for (int i = 0; i < nfs; i++) {
+        struct func *tf = fs[i].target;
+        if (!tf->sym_ndx)
+            tf->sym_ndx = elfw_add_symbol(
+                w, tf->name, 0, 0,
+                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE), SHN_UNDEF);
+        elfw_add_rela(w, text_ndx, (Elf64_Addr)fs[i].patch_off,
+                      tf->sym_ndx, R_X86_64_PC32, -4);
+    }
+    free(fs);
 
     int rc = elfw_write(w, out);
     elfw_free(w);

@@ -37,6 +37,19 @@ struct type *ty_array(struct type *elem, int count)
     return t;
 }
 
+struct type *ty_func(struct type *ret, struct type **ptypes, int n,
+                     int is_varargs)
+{
+    struct type *t = xcalloc(1, sizeof *t);
+    t->kind = TY_FUNC;
+    t->ret = ret;
+    for (int i = 0; i < n; i++)
+        t->ptypes[i] = ptypes[i];
+    t->nptypes = n;
+    t->is_varargs = is_varargs;
+    return t;
+}
+
 struct type *ty_struct(const char *tag, int is_union)
 {
     struct type *t = xcalloc(1, sizeof *t);
@@ -90,6 +103,7 @@ int ty_size(const struct type *t)
     case TY_PTR: return 8;
     case TY_ARRAY: return t->count * ty_size(t->pointee);
     case TY_STRUCT: return t->size; /* 0 while incomplete */
+    case TY_FUNC: break;            /* no size; only pointers to it */
     case TY_VOID: break;
     }
     return 0;
@@ -114,6 +128,15 @@ int ty_equal(const struct type *a, const struct type *b)
         return a->count == b->count && ty_equal(a->pointee, b->pointee);
     if (a->kind == TY_STRUCT)
         return a == b; /* one node per tag: identity is equality */
+    if (a->kind == TY_FUNC) {
+        if (a->nptypes != b->nptypes || a->is_varargs != b->is_varargs ||
+            !ty_equal(a->ret, b->ret))
+            return 0;
+        for (int i = 0; i < a->nptypes; i++)
+            if (!ty_equal(a->ptypes[i], b->ptypes[i]))
+                return 0;
+        return 1;
+    }
     return 1;
 }
 
@@ -175,6 +198,9 @@ const char *ty_name(const struct type *t)
                  t->is_union ? "union" : "struct",
                  t->tag ? t->tag : "<anonymous>");
         base = structbuf;
+        break;
+    case TY_FUNC:
+        base = "function";
         break;
     default: base = "?"; break;
     }

@@ -27,6 +27,13 @@ struct gsite {
     struct global *glob;
 };
 
+/* Function-address sites (&f / passing f): lea rax,[rip+rel32] with an
+ * R_X86_64_PC32 against the function's symbol. */
+struct fsite {
+    int patch_off;
+    struct func *target;
+};
+
 /* Lowers the unit to x86-64 into one .text image and fills each
  * func's code_off/code_len. Intra-unit calls are resolved here (rel32
  * patched once all functions are placed); external call sites are
@@ -35,6 +42,7 @@ struct gsite {
 void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
                   struct strsite **strs, int *nstrs,
-                  struct gsite **gs, int *ngs);
+                  struct gsite **gs, int *ngs,
+                  struct fsite **fs, int *nfs);
 
 #endif

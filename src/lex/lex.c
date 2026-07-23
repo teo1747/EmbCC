@@ -158,6 +158,8 @@ void lex_next(struct lexer *lx)
     case ',': t->kind = TOK_COMMA; break;
     case ';': t->kind = TOK_SEMI; break;
     case '~': t->kind = TOK_TILDE; break;
+    case '?': t->kind = TOK_QUESTION; break;
+    case ':': t->kind = TOK_COLON; break;
     case '+':
         if (lx->p[1] == '+') { t->kind = TOK_PLUSPLUS; lx->p++; }
         else if (lx->p[1] == '=') { t->kind = TOK_PLUSEQ; lx->p++; }
@@ -436,6 +438,8 @@ const char *tok_describe(const struct token *t)
     case TOK_SHREQ: return "'>>='";
     case TOK_PLUSPLUS: return "'++'";
     case TOK_MINUSMINUS: return "'--'";
+    case TOK_QUESTION: return "'?'";
+    case TOK_COLON: return "':'";
     }
     return "?";
 }

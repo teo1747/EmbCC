@@ -204,13 +204,20 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                            "'%s' is used before its declaration "
                            "(line %d)", e->name, g->line);
             } else if (find_func(u, e->name)) {
-                diag_fatal(u->file, e->line,
-                           "'%s' is a function; function pointers are "
-                           "not supported yet", e->name);
+                struct func *fd = find_func(u, e->name);
+                if (!fd->declared)
+                    diag_fatal(u->file, e->line,
+                               "'%s' is used before its declaration",
+                               e->name);
+                e->fref = fd;
+                fd->used = 1;
+                e->ty = ty_ptr(ty_func(fd->ret_ty, fd->param_tys,
+                                       fd->nparams, fd->is_varargs));
             } else {
                 diag_fatal(u->file, e->line,
-                           "'%s' is not declared in '%s'", e->name,
-                           f->name);
+                           "'%s' is not declared in '%s' — for a call, "
+                           "add a prototype or define it first",
+                           e->name, f->name);
             }
         }
         if (e->ty->kind == TY_ARRAY) {
@@ -226,6 +233,8 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                                          "lvalue");
         if (e->lhs->undecayed)
             diag_fatal(u->file, e->line, "cannot assign to an array");
+        if (e->lhs->fref)
+            diag_fatal(u->file, e->line, "cannot assign to a function");
         if (e->lhs->ty->kind == TY_STRUCT)
             diag_fatal(u->file, e->line,
                        "struct assignment is not supported yet — copy "
@@ -236,24 +245,15 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         e->ty = e->lhs->ty;
         break;
     case EXPR_INCDEC: {
-        int i = scope_find(sc, e->name);
-        if (i >= 0) {
-            e->var_index = i;
-            e->ty = sc->vars[i].ty;
-        } else {
-            struct global *g = find_global(u, e->name);
-            if (!g || g->seq >= cur_body_seq)
-                diag_fatal(u->file, e->line,
-                           "++/-- on '%s', which is not declared in "
-                           "'%s'", e->name, f->name);
-            e->gref = g;
-            g->used = 1;
-            e->ty = g->ty;
-        }
+        check_expr(u, f, sc, e->lhs);
+        if (!is_lvalue(e->lhs) || e->lhs->undecayed || e->lhs->fref)
+            diag_fatal(u->file, e->line, "++/-- needs an lvalue");
+        e->ty = e->lhs->ty;
         if (e->ty->kind == TY_PTR) {
-            if (e->ty->pointee->kind == TY_VOID)
-                diag_fatal(u->file, e->line,
-                           "++/-- on a void pointer");
+            if (e->ty->pointee->kind == TY_VOID ||
+                e->ty->pointee->kind == TY_FUNC)
+                diag_fatal(u->file, e->line, "++/-- on %s",
+                           ty_name(e->ty));
         } else if (!ty_is_integer(e->ty)) {
             diag_fatal(u->file, e->line, "++/-- needs an integer or "
                                          "pointer, got %s",
@@ -278,6 +278,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (e->rhs->ty->kind != TY_PTR)
             diag_fatal(u->file, e->line, "cannot dereference %s",
                        ty_name(e->rhs->ty));
+        if (e->rhs->ty->pointee->kind == TY_FUNC) {
+            e->ty = e->rhs->ty; /* *fp is fp, as in C */
+            break;
+        }
         if (e->rhs->ty->pointee->kind == TY_VOID)
             diag_fatal(u->file, e->line, "cannot dereference void *");
         e->ty = e->rhs->ty->pointee;
@@ -290,6 +294,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     case EXPR_ADDR:
         check_expr(u, f, sc, e->rhs);
+        if (e->rhs->fref) {
+            *e = *e->rhs; /* &f is f: already a pointer-to-function */
+            break;
+        }
         if (!is_lvalue(e->rhs))
             diag_fatal(u->file, e->line,
                        "'&' needs a variable or *pointer");
@@ -307,6 +315,45 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        ty_name(e->cast_ty));
         e->ty = e->cast_ty;
         break;
+    case EXPR_COMMA:
+        check_expr(u, f, sc, e->lhs); /* evaluated, value discarded */
+        check_expr(u, f, sc, e->rhs);
+        e->ty = e->rhs->ty;
+        break;
+    case EXPR_COND: {
+        check_expr(u, f, sc, e->args[0]);
+        need_scalar(u, e->args[0], "'?:'");
+        check_expr(u, f, sc, e->lhs);
+        check_expr(u, f, sc, e->rhs);
+        struct type *a = e->lhs->ty, *b = e->rhs->ty;
+        if (ty_is_integer(a) && ty_is_integer(b)) {
+            e->ty = arith_common(a, b);
+            e->lhs = mk_cast(e->lhs, e->ty);
+            e->rhs = mk_cast(e->rhs, e->ty);
+        } else if (a->kind == TY_PTR && b->kind == TY_PTR) {
+            if (!ty_equal(a, b) && a->pointee->kind != TY_VOID &&
+                b->pointee->kind != TY_VOID)
+                diag_fatal(u->file, e->line,
+                           "'?:' branches have incompatible pointer "
+                           "types (%s vs %s)", ty_name(a), ty_name(b));
+            e->ty = a->pointee->kind == TY_VOID ? b : a;
+            e->lhs = mk_cast(e->lhs, e->ty);
+            e->rhs = mk_cast(e->rhs, e->ty);
+        } else if (a->kind == TY_PTR && is_null_const(e->rhs)) {
+            e->ty = a;
+            e->rhs = mk_cast(e->rhs, a);
+        } else if (b->kind == TY_PTR && is_null_const(e->lhs)) {
+            e->ty = b;
+            e->lhs = mk_cast(e->lhs, b);
+        } else if (a->kind == TY_VOID && b->kind == TY_VOID) {
+            e->ty = a;
+        } else {
+            diag_fatal(u->file, e->line,
+                       "'?:' branches have incompatible types "
+                       "(%s vs %s)", ty_name(a), ty_name(b));
+        }
+        break;
+    }
     case EXPR_MEMBER: {
         check_expr(u, f, sc, e->lhs);
         struct type *base = e->lhs->ty;
@@ -384,9 +431,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                     diag_fatal(u->file, e->line,
                                "subtracting incompatible pointers "
                                "(%s vs %s)", ty_name(lt), ty_name(rt));
-                if (lt->pointee->kind == TY_VOID)
-                    diag_fatal(u->file, e->line,
-                               "arithmetic on void *");
+                if (lt->pointee->kind == TY_VOID ||
+                    lt->pointee->kind == TY_FUNC)
+                    diag_fatal(u->file, e->line, "arithmetic on %s",
+                               ty_name(lt));
                 e->ty = ty_base(TY_LONG, 0); /* ptrdiff_t */
             } else if (lp || rp) {
                 if (rp && e->op == B_SUB)
@@ -395,8 +443,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                                "integer");
                 struct expr **ip = lp ? &e->rhs : &e->lhs;
                 struct type *pt = lp ? lt : rt;
-                if (pt->pointee->kind == TY_VOID)
-                    diag_fatal(u->file, e->line, "arithmetic on void *");
+                if (pt->pointee->kind == TY_VOID ||
+                    pt->pointee->kind == TY_FUNC)
+                    diag_fatal(u->file, e->line, "arithmetic on %s",
+                               ty_name(pt));
                 need_integer(u, *ip, "pointer arithmetic");
                 *ip = mk_cast(*ip, ty_base(TY_LONG, 0));
                 e->ty = pt;
@@ -462,38 +512,51 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     }
     case EXPR_CALL: {
-        struct func *callee = find_func(u, e->name);
-        if (!callee)
+        /* Direct when the callee is a name that is not a variable in
+         * scope and names a function; otherwise a call through a
+         * function-pointer value. */
+        struct type *ft = NULL;
+        e->callee = NULL;
+        if (e->lhs->kind == EXPR_VAR &&
+            scope_find(sc, e->lhs->name) < 0 &&
+            !find_global(u, e->lhs->name) &&
+            find_func(u, e->lhs->name)) {
+            struct func *callee = find_func(u, e->lhs->name);
+            if (!callee->declared)
+                diag_fatal(u->file, e->line,
+                           "call to '%s' before its declaration — "
+                           "declare or define functions before their "
+                           "callers", e->lhs->name);
+            e->callee = callee;
+            callee->used = 1;
+            ft = ty_func(callee->ret_ty, callee->param_tys,
+                         callee->nparams, callee->is_varargs);
+        } else {
+            check_expr(u, f, sc, e->lhs);
+            if (e->lhs->ty->kind != TY_PTR ||
+                e->lhs->ty->pointee->kind != TY_FUNC)
+                diag_fatal(u->file, e->line,
+                           "called object is not a function (type %s)",
+                           ty_name(e->lhs->ty));
+            ft = e->lhs->ty->pointee;
+        }
+        if (ft->is_varargs ? e->nargs < ft->nptypes
+                           : e->nargs != ft->nptypes)
             diag_fatal(u->file, e->line,
-                       "call to '%s', which is not declared — add a "
-                       "prototype ('int %s(...);') or define it first",
-                       e->name, e->name);
-        if (!callee->declared)
-            diag_fatal(u->file, e->line,
-                       "call to '%s' before its declaration — declare "
-                       "or define functions before their callers",
-                       e->name);
-        if (callee->is_varargs ? e->nargs < callee->nparams
-                               : e->nargs != callee->nparams)
-            diag_fatal(u->file, e->line,
-                       "'%s' takes %s%d argument%s, called with %d",
-                       e->name, callee->is_varargs ? "at least " : "",
-                       callee->nparams,
-                       callee->nparams == 1 ? "" : "s", e->nargs);
-        e->callee = callee;
-        callee->used = 1;
+                       "this call needs %s%d argument%s, got %d",
+                       ft->is_varargs ? "at least " : "", ft->nptypes,
+                       ft->nptypes == 1 ? "" : "s", e->nargs);
         for (int i = 0; i < e->nargs; i++) {
             check_expr(u, f, sc, e->args[i]);
             need_scalar(u, e->args[i], "an argument");
-            if (i < callee->nparams)
+            if (i < ft->nptypes)
                 e->args[i] = convert_assign(u, e->args[i],
-                                            callee->param_tys[i],
-                                            "argument");
+                                            ft->ptypes[i], "argument");
             else /* variadic tail: default argument promotions */
                 e->args[i] = mk_cast(e->args[i],
                                      promote(e->args[i]->ty));
         }
-        e->ty = callee->ret_ty;
+        e->ty = ft->ret;
         break;
     }
     }
