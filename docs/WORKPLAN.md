@@ -45,6 +45,44 @@ preprocessor. The pace-setter for M2.
 object shape (ET_REL, .text/.rela.text/.symtab). Both are stable; stream B
 and C build against them without asking.
 
+## The EMBX finding: the linker owns the native format
+
+*Added 2026-07-24, when EMBX landed (DECISIONS D-003, revised).*
+
+EMBX changes the toolchain's shape less than it looks, and the reason is
+one line of the spec: **an APP is "fully linked, fixed virtual addresses,
+no relocations" (§4.1).** EmbCC emits *relocatable objects*. So the thing
+that can produce an `.embx` is whatever performs the final link — never
+the compiler proper.
+
+**Therefore "EmbCC emits EMBX" means "EmbLD emits EMBX."** Concretely:
+
+- **EmbCC** keeps emitting ELF relocatable objects. Unchanged by EMBX.
+- **EmbLD** (stream B) gains a second output shape: ET_EXEC ELF *and*
+  EMBX APP, from the same linked image. Both are "write the layout you
+  already computed, in a different container."
+- **`mkembx.py`** (in the OS tree) is the bridge until then: it
+  repackages a fully-linked ELF into an `.embx`. It is not a stopgap to
+  be ashamed of — it is exactly the right tool for the window where the
+  linker does not exist yet, and it is what proves the format works.
+- **The capability table** is the one thing that has no ELF source. Today
+  it comes from `mkembx.py --cap NAME`. The end state is the *program*
+  declaring its own authority in source, EmbCC recording it, EmbLD
+  collecting it — a real compiler-side feature, and the only part of
+  EMBX that reaches back into the frontend.
+
+This *raises* stream B's priority: it now gates the native format as well
+as self-hosting. It does not change stream A's order.
+
+**Tool family, mapped onto the streams** (the names from the OS side):
+
+| Tool | What it is | Where it lives |
+|---|---|---|
+| `embread` | EMBX dumper + verifier | **done** — `tools/embread/`, EMBX spec §9 |
+| `EmbLD` | the integrated linker; emits ELF ET_EXEC and EMBX | stream B |
+| `emlibc` | the OS's own non-POSIX libc | DECISIONS D-009, deferred; OS-side requirements exist |
+| `EmbDBG` | debugger | needs debug info first (DWARF, or the spec's `.embdbg` sidecar) — after M3 |
+
 ## Stream B — the integrated linker (M3's long pole, started now)
 
 **Scope:** `src/link/` — ELF reading, symbol resolution, section merging,
@@ -74,6 +112,12 @@ test case:
 EmbLinkOS — the M1 program, but linked by ours instead of cross-ld. Every
 step proven on the host first with readelf/objdump diffs against what
 cross-ld produces from identical inputs (DECISIONS D-005).
+
+**Contract B also consumes:** `src/embx/embx.h` — the EMBX container,
+byte-exact, mirroring the kernel's `embx.h` (which is the authority).
+`embread` reads what EmbLD will write, so it is stream B's verifier from
+day one: produce an image, run `embread` over it, and every §8 guard is
+checked on the host before the OS ever sees it.
 
 **Contract B consumes:** `src/elf/elf.h` (shared structures — additions
 coordinated in review, never forked). **Nothing in stream B may block on

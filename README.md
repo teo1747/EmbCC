@@ -1,10 +1,13 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
 **Status: M1 complete — EmbLinkOS ran EmbCC's output (exit 42, 2026-07-20).
-M2 in progress.** The decision record below still governs. `embcc -c` compiles
-a growing C subset to genuine x86_64-elf relocatable objects, cross-checked
-against gcc on the host and proven on the OS. No preprocessor yet (M2 brings
-it), no linker yet (M3); nothing in EmbLinkOS depends on this.
+M2 near done.** The decision record below still governs. `embcc -c` compiles a
+substantial C subset — the integer types, pointers (incl. function pointers),
+arrays, structs/unions/enums, globals, the full operator set, and a
+preprocessor that digests **real newlib headers**, so `#include <stdio.h>`
+compiles, links and runs — to genuine x86_64-elf relocatable objects,
+cross-checked against gcc on every test. `embread` dumps and verifies EMBX
+images. No linker yet (M3); nothing in EmbLinkOS depends on this.
 
 EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
 for, and eventually *by*, the OS itself. It is the next ring of ownership after
@@ -71,6 +74,7 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M0–M4, each with a concrete acceptance test |
 | [docs/WORKPLAN.md](docs/WORKPLAN.md) | The team's three parallel streams (core, linker, proving ground) and the process that keeps them off each other's critical path |
+| [src/embx/embx.h](src/embx/embx.h) | The EMBX container, byte-exact — mirrors the kernel's loader header; read by `embread`, to be written by the linker |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The discipline inherited from EmbLinkOS (prove on the host, selftest the invariant, THE RULE) |
 
 ## When work starts

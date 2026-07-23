@@ -37,6 +37,15 @@ program that #includes <stdio.h> and calls the real libc compiles, links,
 and runs** (host-proven; golden-tested). What remains: the tally.c + sval
 acceptance on the OS itself.
 
+**Target update, 2026-07-24 (DECISIONS D-003 revised):** EmbLinkOS now has a
+native binary format, **EMBX**, with a working in-kernel loader and a live
+capability contract. EmbCC's eventual output is EMBX; ELF stays as the porting
+substrate. This does **not** change M1–M2 — an EMBX APP is fully linked
+(spec §4.1), so the producer of an `.embx` is the LINKER, which makes M3's
+integrated linker the gate for the native format as well as for self-hosting
+(see WORKPLAN "The EMBX finding"). Landed already: `embread`, the EMBX
+dumper/verifier, checked against the OS's own images.
+
 ---
 
 ## M0 — Scaffolding and the host harness

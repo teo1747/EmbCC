@@ -27,10 +27,17 @@ SRCS := \
 
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 
-all: embcc
+all: embcc embread
 
 embcc: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS)
+
+# embread — the EMBX dumper/verifier (EMBX spec §9). A separate binary,
+# not part of embcc: it reads images, it does not compile. The EMBX
+# container definition it shares with the future linker lives in
+# src/embx/, exactly as src/elf/ is shared by asm and link.
+embread: tools/embread/embread.c src/embx/embx.c src/embx/embx.h
+	$(CC) $(CFLAGS) -o $@ tools/embread/embread.c src/embx/embx.c
 
 $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)
@@ -40,10 +47,10 @@ $(BUILD)/%.o: src/%.c
 # enough and cannot go stale (CONTRIBUTING lie #1).
 $(OBJS): $(wildcard src/*/*.h)
 
-test: embcc
+test: embcc embread
 	tests/run.sh
 
 clean:
-	rm -rf $(BUILD) embcc
+	rm -rf $(BUILD) embcc embread
 
 .PHONY: all test clean

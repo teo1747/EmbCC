@@ -4,6 +4,7 @@
 *.a
 *.elf
 embcc
+embread
 embcc-stage1
 embcc-stage2
 
