@@ -65,6 +65,29 @@ static void emit_brnz(struct ir_func *fn, int v, int w, int label)
     i->label = label;
 }
 
+/* A floating constant is just its BIT PATTERN moved into the slot: a
+ * float temp's slot holds raw bits, so no xmm and no constant pool are
+ * involved. Same reason loads and stores need no float path. */
+static int emit_fconst(struct ir_func *fn, double d, int w)
+{
+    long bits = 0;
+    if (w == 8) {
+        double v = d;
+        memcpy(&bits, &v, 8);
+    } else {
+        float v = (float)d;
+        unsigned int u = 0;
+        memcpy(&u, &v, 4);
+        bits = (long)u;
+    }
+    struct ir_ins *i = emit(fn);
+    i->op = IR_CONST;
+    i->imm = bits;
+    i->w = w;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
 static int emit_const(struct ir_func *fn, long imm, int w)
 {
     struct ir_ins *i = emit(fn);
@@ -85,6 +108,18 @@ static int emit_bin(struct ir_func *fn, enum ir_op op, int a, int b,
     i->b = b;
     i->w = w;
     i->sign = sign;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
+static int emit_fbin(struct ir_func *fn, enum ir_op op, int a, int b, int w)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = op;
+    i->a = a;
+    i->b = b;
+    i->w = w;
+    i->flt = 1;
     i->dst = new_temp(fn);
     return i->dst;
 }
@@ -241,6 +276,59 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
     int fsize = ty_size(from), tsize = ty_size(to);
     int fw = ty_w(from), tw = ty_w(to);
 
+    /* Floating conversions are real instructions, not reinterpretations
+     * — the bit patterns have nothing in common. */
+    if (ty_is_float(from) || ty_is_float(to)) {
+        struct ir_ins *i;
+        if (ty_is_float(from) && ty_is_float(to)) {
+            if (fsize == tsize)
+                return v;
+            i = emit(fn);
+            i->op = IR_F2F;
+            i->a = v;
+            i->size = fsize;
+            i->w = tsize;
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
+        if (ty_is_float(to)) {
+            /* int -> float. The source slot already holds the value
+             * extended to 64 bits (loads extend), so converting from
+             * the 64-bit form is exact for every signed type AND for
+             * unsigned int — which is why only unsigned long needs the
+             * refusal sema issues. */
+            i = emit(fn);
+            i->op = IR_I2F;
+            i->a = v;
+            i->size = 8;
+            i->sign = 1;
+            i->w = tsize;
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
+        /* float -> int: truncates toward zero, as C requires. Convert
+         * to the 64-bit form then narrow, so unsigned int lands right. */
+        i = emit(fn);
+        i->op = IR_F2I;
+        i->a = v;
+        i->size = fsize;
+        i->w = 8;
+        i->sign = 1;
+        i->dst = new_temp(fn);
+        int iv = i->dst;
+        if (tsize <= 2) {
+            struct ir_ins *x = emit(fn);
+            x->op = IR_EXT;
+            x->a = iv;
+            x->size = tsize;
+            x->sign = ty_signed_int(to);
+            x->w = 4;
+            x->dst = new_temp(fn);
+            return x->dst;
+        }
+        return iv;
+    }
+
     if (tsize <= 2) {
         /* to char/short: truncate + extend per TARGET's signedness */
         struct ir_ins *i = emit(fn);
@@ -273,6 +361,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     switch (e->kind) {
     case EXPR_NUM:
         return emit_const(fn, e->num, ty_w(e->ty));
+    case EXPR_FNUM:
+        return emit_fconst(fn, e->fnum, ty_size(e->ty));
     case EXPR_STR: {
         e->str_index = intern_str(e->name, (int)e->num);
         struct ir_ins *i = emit(fn);
@@ -354,6 +444,16 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     case EXPR_NEG:
     case EXPR_BNOT: {
         int v = gen_expr(fn, e->rhs);
+        if (e->kind == EXPR_NEG && ty_is_float(e->ty)) {
+            /* -x on a float flips the sign BIT: exact for -0.0 and for
+             * NaN, which 0.0-x is not, and it needs no new instruction
+             * because the slot already holds the pattern. */
+            int sz = ty_size(e->ty);
+            int mask = emit_const(fn,
+                                  sz == 8 ? (long)0x8000000000000000LL
+                                          : (long)0x80000000L, sz);
+            return emit_bin(fn, IR_XOR, v, mask, sz, 0);
+        }
         struct ir_ins *i = emit(fn);
         i->op = e->kind == EXPR_NEG ? IR_NEG : IR_BNOT;
         i->a = v;
@@ -472,8 +572,11 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             /* plain arithmetic */
             int a = gen_expr(fn, e->lhs);
             int b = gen_expr(fn, e->rhs);
-            return emit_bin(fn, e->op == B_ADD ? IR_ADD : IR_SUB, a, b,
-                            ty_w(e->ty), ty_signed_int(e->ty));
+            enum ir_op o = e->op == B_ADD ? IR_ADD : IR_SUB;
+            if (ty_is_float(e->ty))
+                return emit_fbin(fn, o, a, b, ty_size(e->ty));
+            return emit_bin(fn, o, a, b, ty_w(e->ty),
+                            ty_signed_int(e->ty));
         }
         case B_EQ:
         case B_NE:
@@ -488,7 +591,12 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             i->pred = e->op;
             i->a = a;
             i->b = b;
-            i->w = ty_w(lt);
+            if (ty_is_float(lt)) {
+                i->flt = 1;
+                i->w = ty_size(lt);
+            } else {
+                i->w = ty_w(lt);
+            }
             /* pointers compare unsigned, as C requires */
             i->sign = ty_signed_int(lt);
             i->dst = new_temp(fn);
@@ -501,6 +609,9 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             };
             int a = gen_expr(fn, e->lhs);
             int b = gen_expr(fn, e->rhs);
+            if (ty_is_float(e->ty))
+                return emit_fbin(fn, map[e->op - B_ADD], a, b,
+                                 ty_size(e->ty));
             return emit_bin(fn, map[e->op - B_ADD], a, b,
                             ty_w(e->ty), ty_signed_int(e->ty));
         }
@@ -545,8 +656,13 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         i->call_varargs = e->callee ? e->callee->is_varargs
                                     : e->lhs->ty->pointee->is_varargs;
         i->nargs = e->nargs;
-        for (int k = 0; k < e->nargs; k++)
+        for (int k = 0; k < e->nargs; k++) {
             i->args[k] = args[k];
+            i->argflt[k] = ty_is_float(e->args[k]->ty);
+            i->argw[k] = ty_size(e->args[k]->ty);
+        }
+        i->flt = ty_is_float(e->ty);
+        i->w = i->flt ? ty_size(e->ty) : 8;
         i->dst = new_temp(fn);
         return i->dst;
     }
@@ -586,6 +702,10 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             i = emit(fn);
             i->op = IR_RET;
             i->a = v;
+            if (s->expr && ty_is_float(s->expr->ty)) {
+                i->flt = 1; /* the value goes home in xmm0, not rax */
+                i->w = ty_size(s->expr->ty);
+            }
             break;
         }
         case STMT_IF: {

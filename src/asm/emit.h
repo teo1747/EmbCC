@@ -60,6 +60,23 @@ void x86_mov_eax_edx(struct code *c, int w);      /* remainder to eax */
 void x86_mov_ecx_mem(struct code *c, int disp, int w);
 void x86_shift_eax_cl(struct code *c, int kind, int w); /* '<' shl, '>' sar, 'u' shr */
 void x86_neg_eax(struct code *c, int w);
+
+/* ---- SSE2 scalar floating point ----------------------------------
+ * w is 4 (single, 'ss') or 8 (double, 'sd'). Values live in the same
+ * stack slots as everything else — a float slot just holds the raw bit
+ * pattern, which is why loads, stores and constants need no float path
+ * at all: only the ARITHMETIC has to reach xmm. */
+void x86_movs_load(struct code *c, int xmm, int disp, int w);
+void x86_movs_store(struct code *c, int xmm, int disp, int w);
+void x86_sse_alu_mem(struct code *c, int op, int disp, int w); /* + - * / */
+void x86_ucomis_mem(struct code *c, int disp, int w);
+/* setcc pair for float == and != : ordered equality is "equal AND not
+ * unordered", because a NaN compares equal to nothing, itself included. */
+void x86_set_float_eq(struct code *c, int ne);
+void x86_cvtsi2s(struct code *c, int disp, int srcw, int dstw);
+void x86_cvtts2si(struct code *c, int disp, int srcw, int dstw);
+void x86_cvts2s(struct code *c, int disp, int srcw);
+void x86_mov_al_imm(struct code *c, int v); /* varargs: xmm count in al */
 void x86_not_eax(struct code *c, int w);
 
 /* cmp eax/rax with a slot, then set al by condition and zero-extend.

@@ -364,6 +364,104 @@ void x86_not_eax(struct code *c, int w)
     code_byte(c, 0xd0);
 }
 
+/* The SSE2 prefix that selects scalar single vs scalar double. */
+static void sse_prefix(struct code *c, int w)
+{
+    code_byte(c, w == 4 ? 0xf3 : 0xf2);
+}
+
+void x86_movs_load(struct code *c, int xmm, int disp, int w)
+{
+    sse_prefix(c, w);
+    code_byte(c, 0x0f);
+    code_byte(c, 0x10); /* movss/movsd xmm, m */
+    modrm_rbp(c, xmm, disp);
+}
+
+void x86_movs_store(struct code *c, int xmm, int disp, int w)
+{
+    sse_prefix(c, w);
+    code_byte(c, 0x0f);
+    code_byte(c, 0x11); /* movss/movsd m, xmm */
+    modrm_rbp(c, xmm, disp);
+}
+
+void x86_sse_alu_mem(struct code *c, int op, int disp, int w)
+{
+    sse_prefix(c, w);
+    code_byte(c, 0x0f);
+    switch (op) {
+    case '+': code_byte(c, 0x58); break; /* addss/addsd */
+    case '-': code_byte(c, 0x5c); break; /* subss/subsd */
+    case '*': code_byte(c, 0x59); break; /* mulss/mulsd */
+    case '/': code_byte(c, 0x5e); break; /* divss/divsd */
+    default:
+        fprintf(stderr, "embcc: internal: no SSE encoding for '%c'\n", op);
+        exit(1);
+    }
+    modrm_rbp(c, 0, disp); /* always xmm0 */
+}
+
+void x86_ucomis_mem(struct code *c, int disp, int w)
+{
+    if (w == 8)
+        code_byte(c, 0x66); /* ucomisd */
+    code_byte(c, 0x0f);
+    code_byte(c, 0x2e);
+    modrm_rbp(c, 0, disp);
+}
+
+void x86_set_float_eq(struct code *c, int ne)
+{
+    /* ucomis sets ZF=PF=CF=1 for unordered. == must be false for NaN,
+     * != must be true, so neither is a single setcc. */
+    code_byte(c, 0x0f);
+    code_byte(c, ne ? 0x95 : 0x94); /* setne/sete al */
+    code_byte(c, 0xc0);
+    code_byte(c, 0x0f);
+    code_byte(c, ne ? 0x9a : 0x9b); /* setp/setnp cl */
+    code_byte(c, 0xc1);
+    code_byte(c, ne ? 0x08 : 0x20); /* or/and al, cl */
+    code_byte(c, 0xc8);
+    code_byte(c, 0x0f); /* movzx eax, al */
+    code_byte(c, 0xb6);
+    code_byte(c, 0xc0);
+}
+
+void x86_cvtsi2s(struct code *c, int disp, int srcw, int dstw)
+{
+    sse_prefix(c, dstw);
+    if (srcw == 8)
+        code_byte(c, 0x48); /* REX.W: 64-bit integer source */
+    code_byte(c, 0x0f);
+    code_byte(c, 0x2a); /* cvtsi2ss/cvtsi2sd xmm0, r/m */
+    modrm_rbp(c, 0, disp);
+}
+
+void x86_cvtts2si(struct code *c, int disp, int srcw, int dstw)
+{
+    sse_prefix(c, srcw);
+    if (dstw == 8)
+        code_byte(c, 0x48); /* REX.W: 64-bit integer destination */
+    code_byte(c, 0x0f);
+    code_byte(c, 0x2c); /* cvttss2si/cvttsd2si rax, xmm/m (truncating) */
+    modrm_rbp(c, 0, disp);
+}
+
+void x86_cvts2s(struct code *c, int disp, int srcw)
+{
+    sse_prefix(c, srcw);
+    code_byte(c, 0x0f);
+    code_byte(c, 0x5a); /* cvtss2sd / cvtsd2ss */
+    modrm_rbp(c, 0, disp);
+}
+
+void x86_mov_al_imm(struct code *c, int v)
+{
+    code_byte(c, 0xb0); /* mov al, imm8 */
+    code_byte(c, v & 0xff);
+}
+
 void x86_cmp_eax_mem(struct code *c, int disp, int w)
 {
     rexw(c, w);

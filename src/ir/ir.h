@@ -44,6 +44,9 @@ enum ir_op {
     IR_LOAD,  /* dst = *(temp a)      (size, sign, w: extend) */
     IR_STORE, /* *(temp a) = b        (size) */
     IR_EXT,   /* dst = a re-extended  (size, sign: from; w: to) */
+    IR_I2F,   /* dst = (float)a       (size,sign: int src; w: float dst) */
+    IR_F2I,   /* dst = (int)a         (size: float src; w,sign: int dst) */
+    IR_F2F,   /* dst = (float)a       (size: src width; w: dst width) */
     IR_CALL,  /* dst = callee(args...); indirect: target fp in a */
     IR_RET,   /* return a (a == -1: void return) */
     IR_LABEL, /* label: (id in `label`) */
@@ -58,6 +61,7 @@ struct ir_ins {
     int w;                   /* 4 or 8: operation width class */
     int size;                /* 1/2/4/8: memory width for LD/ST/EXT */
     int sign;                /* signed variant of the op */
+    int flt;                 /* operate in xmm at width w (SSE scalar) */
     long imm;                /* IR_CONST */
     enum binop pred;         /* IR_CMP */
     int label;               /* IR_LABEL/IR_JMP/IR_BRZ */
@@ -66,6 +70,11 @@ struct ir_ins {
     int call_varargs;        /* al = 0 needed at the call */
     struct global *glob;     /* IR_GADDR */
     int args[MAX_PARAMS];    /* IR_CALL: argument vregs */
+    /* SysV splits the argument REGISTERS by class: integers walk
+     * rdi..r9, floats walk xmm0..7, independently. So each argument
+     * carries its class and width. */
+    int argflt[MAX_PARAMS];
+    int argw[MAX_PARAMS];
     int nargs;
 };
 

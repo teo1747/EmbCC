@@ -15,7 +15,8 @@
 #ifndef EMBCC_SEMA_TYPE_H
 #define EMBCC_SEMA_TYPE_H
 
-enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG, TY_PTR,
+enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
+               TY_FLOAT, TY_DOUBLE, TY_PTR,
                TY_ARRAY, TY_STRUCT, TY_FUNC };
 
 struct member {
@@ -63,6 +64,8 @@ int ty_size(const struct type *t);          /* bytes; void has none */
 int ty_align(const struct type *t);
 int ty_equal(const struct type *a, const struct type *b);
 int ty_is_integer(const struct type *t);
+int ty_is_float(const struct type *t);
+int ty_is_arith(const struct type *t);   /* integer or floating */
 int ty_is_scalar(const struct type *t);     /* integer or pointer */
 int ty_wide(const struct type *t);          /* 1 = 64-bit value class */
 int ty_signed_int(const struct type *t);    /* signed integer? */

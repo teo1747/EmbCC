@@ -56,6 +56,8 @@ static const struct {
     { "char", TOK_KW_CHAR },
     { "short", TOK_KW_SHORT },
     { "long", TOK_KW_LONG },
+    { "float", TOK_KW_FLOAT },
+    { "double", TOK_KW_DOUBLE },
     { "unsigned", TOK_KW_UNSIGNED },
     { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
@@ -94,6 +96,49 @@ void lex_next(struct lexer *lx)
     if (!*lx->p) {
         t->kind = TOK_EOF;
         return;
+    }
+
+    /* A floating constant: digits with a '.', or an exponent, or the
+     * leading-dot form. Decided BEFORE the integer path so 1.5 never
+     * lexes as 1 followed by .5 (see also the '.' operator case). */
+    if (isdigit((unsigned char)*lx->p) ||
+        (*lx->p == '.' && isdigit((unsigned char)lx->p[1]))) {
+        int is_hex = lx->p[0] == '0' &&
+                     (lx->p[1] == 'x' || lx->p[1] == 'X');
+        const char *scan = lx->p;
+        int looks_float = 0;
+        if (!is_hex) {
+            while (isdigit((unsigned char)*scan))
+                scan++;
+            if (*scan == '.') {
+                looks_float = 1;
+            } else if ((*scan == 'e' || *scan == 'E') &&
+                       (isdigit((unsigned char)scan[1]) ||
+                        ((scan[1] == '+' || scan[1] == '-') &&
+                         isdigit((unsigned char)scan[2])))) {
+                looks_float = 1;
+            }
+        }
+        if (looks_float) {
+            char *fend;
+            double d = strtod(lx->p, &fend);
+            t->kind = TOK_FNUM;
+            t->fnum = d;
+            t->fnum_is_float = 0;
+            if (*fend == 'f' || *fend == 'F') {
+                t->fnum_is_float = 1;
+                fend++;
+            } else if (*fend == 'l' || *fend == 'L') {
+                /* long double is not a distinct type here; it is
+                 * double, and saying so beats pretending otherwise. */
+                fend++;
+            }
+            if (isalnum((unsigned char)*fend) || *fend == '.')
+                diag_fatal(lx->file, lx->line,
+                           "malformed floating constant");
+            lx->p = fend;
+            return;
+        }
     }
 
     if (isdigit((unsigned char)*lx->p)) {
@@ -370,6 +415,7 @@ const char *tok_describe(const struct token *t)
     case TOK_NUM:
         snprintf(buf, sizeof buf, "number %ld", t->num);
         return buf;
+    case TOK_FNUM: return "a floating constant";
     case TOK_STR: return "a string literal";
     case TOK_ELLIPSIS: return "'...'";
     case TOK_IDENT:
@@ -379,6 +425,8 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_CHAR: return "'char'";
     case TOK_KW_SHORT: return "'short'";
     case TOK_KW_LONG: return "'long'";
+    case TOK_KW_FLOAT: return "'float'";
+    case TOK_KW_DOUBLE: return "'double'";
     case TOK_KW_UNSIGNED: return "'unsigned'";
     case TOK_KW_SIGNED: return "'signed'";
     case TOK_KW_SIZEOF: return "'sizeof'";

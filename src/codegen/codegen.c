@@ -106,8 +106,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
     f->code_off = text->len;
 
     x86_prologue(text, frame);
-    for (int i = 0; i < f->nparams; i++)
-        x86_store_arg(text, i, sd[i]);
+    {   /* the same two-file split, in reverse */
+        int ireg = 0, freg = 0;
+        for (int i = 0; i < f->nparams; i++) {
+            if (ty_is_float(f->param_tys[i]))
+                x86_movs_store(text, freg++, sd[i],
+                               ty_size(f->param_tys[i]));
+            else
+                x86_store_arg(text, ireg++, sd[i]);
+        }
+    }
 
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
@@ -126,6 +134,15 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_AND:
         case IR_OR:
         case IR_XOR:
+            if (i->flt) {
+                x86_movs_load(text, 0, sd[i->a], i->w);
+                x86_sse_alu_mem(text,
+                                i->op == IR_ADD ? '+' :
+                                i->op == IR_SUB ? '-' : '*',
+                                sd[i->b], i->w);
+                x86_movs_store(text, 0, sd[i->dst], i->w);
+                break;
+            }
             x86_load_slot(text, sd[i->a], i->w, 0, i->w);
             x86_alu_eax_mem(text,
                             i->op == IR_ADD ? '+' :
@@ -138,6 +155,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         case IR_DIV:
         case IR_MOD:
+            if (i->flt) { /* only DIV is ever float; MOD is integers */
+                x86_movs_load(text, 0, sd[i->a], i->w);
+                x86_sse_alu_mem(text, '/', sd[i->b], i->w);
+                x86_movs_store(text, 0, sd[i->dst], i->w);
+                break;
+            }
             x86_load_slot(text, sd[i->a], i->w, 0, i->w);
             if (i->sign)
                 x86_cdq(text, i->w);
@@ -167,10 +190,40 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_store_slot(text, sd[i->dst], 8);
             break;
         case IR_CMP:
+            if (i->flt) {
+                /* ucomis sets the UNSIGNED flags, so >,>= use seta/setae
+                 * directly and <,<= are the same test with the operands
+                 * swapped — which is also what makes NaN compare false
+                 * in every direction. */
+                int swap = i->pred == B_LT || i->pred == B_LE;
+                x86_movs_load(text, 0, sd[swap ? i->b : i->a], i->w);
+                x86_ucomis_mem(text, sd[swap ? i->a : i->b], i->w);
+                if (i->pred == B_EQ || i->pred == B_NE)
+                    x86_set_float_eq(text, i->pred == B_NE);
+                else
+                    x86_setcc_eax(text,
+                                  cc_for(i->pred == B_LT ? B_GT :
+                                         i->pred == B_LE ? B_GE : i->pred,
+                                         0));
+                x86_store_slot(text, sd[i->dst], 8);
+                break;
+            }
             x86_load_slot(text, sd[i->a], i->w, 0, i->w);
             x86_cmp_eax_mem(text, sd[i->b], i->w);
             x86_setcc_eax(text, cc_for(i->pred, i->sign));
             x86_store_slot(text, sd[i->dst], 8);
+            break;
+        case IR_I2F:
+            x86_cvtsi2s(text, sd[i->a], i->size, i->w);
+            x86_movs_store(text, 0, sd[i->dst], i->w);
+            break;
+        case IR_F2I:
+            x86_cvtts2si(text, sd[i->a], i->size, i->w);
+            x86_store_slot(text, sd[i->dst], 8);
+            break;
+        case IR_F2F:
+            x86_cvts2s(text, sd[i->a], i->size);
+            x86_movs_store(text, 0, sd[i->dst], i->w);
             break;
         case IR_LDVAR:
             x86_load_slot(text, sd[i->a], i->size, i->sign, i->w);
@@ -248,12 +301,28 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
         case IR_CALL: {
-            for (int k = 0; k < i->nargs; k++)
-                x86_load_arg(text, k, sd[i->args[k]]);
+            /* SysV walks TWO register files independently: integers and
+             * pointers take rdi..r9, floats take xmm0..7. */
+            int ireg = 0, freg = 0;
+            for (int k = 0; k < i->nargs; k++) {
+                if (i->argflt[k])
+                    x86_movs_load(text, freg++, sd[i->args[k]],
+                                  i->argw[k]);
+                else
+                    x86_load_arg(text, ireg++, sd[i->args[k]]);
+            }
             if (i->indirect)
                 x86_mov_r11_slot(text, sd[i->a]);
-            if (i->call_varargs)
-                x86_zero_eax(text); /* SysV: al = # of vector args = 0 */
+            /* al = the number of VECTOR registers used. Zero was right
+             * only while no floats existed; a variadic callee reads it
+             * to find the register save area, so a wrong al is exactly
+             * the kind of silent wrongness THE RULE is about. */
+            if (i->call_varargs) {
+                if (freg)
+                    x86_mov_al_imm(text, freg);
+                else
+                    x86_zero_eax(text);
+            }
             if (i->indirect) {
                 x86_call_r11(text);
             } else {
@@ -270,11 +339,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
                     PUSH(st->ext, st->next, st->capext, ec);
                 }
             }
-            x86_store_slot(text, sd[i->dst], 8);
+            if (i->flt)
+                x86_movs_store(text, 0, sd[i->dst], i->w);
+            else
+                x86_store_slot(text, sd[i->dst], 8);
             break;
         }
         case IR_RET:
-            if (i->a >= 0)
+            if (i->a >= 0 && i->flt)
+                x86_movs_load(text, 0, sd[i->a], i->w);
+            else if (i->a >= 0)
                 x86_load_slot(text, sd[i->a], 8, 0, 8);
             x86_epilogue(text);
             break;

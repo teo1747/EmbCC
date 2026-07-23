@@ -7,12 +7,14 @@
 
 /* [kind][is_unsigned] — TY_PTR/TY_ARRAY/TY_STRUCT handled separately.
  * Designated initializers so this table survives struct type growing. */
-static struct type bases[5][2] = {
+static struct type bases[7][2] = {
     { { .kind = TY_VOID }, { .kind = TY_VOID } },
     { { .kind = TY_CHAR }, { .kind = TY_CHAR, .is_unsigned = 1 } },
     { { .kind = TY_SHORT }, { .kind = TY_SHORT, .is_unsigned = 1 } },
     { { .kind = TY_INT }, { .kind = TY_INT, .is_unsigned = 1 } },
     { { .kind = TY_LONG }, { .kind = TY_LONG, .is_unsigned = 1 } },
+    { { .kind = TY_FLOAT }, { .kind = TY_FLOAT } },   /* never unsigned */
+    { { .kind = TY_DOUBLE }, { .kind = TY_DOUBLE } },
 };
 
 struct type *ty_base(enum ty_kind kind, int is_unsigned)
@@ -100,6 +102,8 @@ int ty_size(const struct type *t)
     case TY_SHORT: return 2;
     case TY_INT: return 4;
     case TY_LONG: return 8;
+    case TY_FLOAT: return 4;
+    case TY_DOUBLE: return 8;
     case TY_PTR: return 8;
     case TY_ARRAY: return t->count * ty_size(t->pointee);
     case TY_STRUCT: return t->size; /* 0 while incomplete */
@@ -146,14 +150,27 @@ int ty_is_integer(const struct type *t)
            t->kind == TY_INT || t->kind == TY_LONG;
 }
 
-int ty_is_scalar(const struct type *t)
+int ty_is_float(const struct type *t)
 {
-    return ty_is_integer(t) || t->kind == TY_PTR;
+    return t->kind == TY_FLOAT || t->kind == TY_DOUBLE;
 }
 
+int ty_is_arith(const struct type *t)
+{
+    return ty_is_integer(t) || ty_is_float(t);
+}
+
+int ty_is_scalar(const struct type *t)
+{
+    return ty_is_arith(t) || t->kind == TY_PTR;
+}
+
+/* 64-bit value class. Floats have their own register file, so this
+ * answers width only — never "which register bank". */
 int ty_wide(const struct type *t)
 {
-    return t->kind == TY_LONG || t->kind == TY_PTR;
+    return t->kind == TY_LONG || t->kind == TY_PTR ||
+           t->kind == TY_DOUBLE;
 }
 
 int ty_signed_int(const struct type *t)
@@ -193,6 +210,8 @@ const char *ty_name(const struct type *t)
     case TY_SHORT: base = t->is_unsigned ? "unsigned short" : "short"; break;
     case TY_INT: base = t->is_unsigned ? "unsigned int" : "int"; break;
     case TY_LONG: base = t->is_unsigned ? "unsigned long" : "long"; break;
+    case TY_FLOAT: base = "float"; break;
+    case TY_DOUBLE: base = "double"; break;
     case TY_STRUCT:
         snprintf(structbuf, sizeof structbuf, "%s %s",
                  t->is_union ? "union" : "struct",

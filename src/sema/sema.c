@@ -92,11 +92,28 @@ static struct type *promote(struct type *t)
     return t;
 }
 
+/* The DEFAULT ARGUMENT promotions, which are the integer promotions
+ * PLUS float -> double. Distinct from promote() on purpose: a variadic
+ * callee reads a float argument as a double, so passing a bare float
+ * would hand printf garbage. */
+static struct type *default_arg_promote(struct type *t)
+{
+    if (t->kind == TY_FLOAT)
+        return ty_base(TY_DOUBLE, 0);
+    return promote(t);
+}
+
 /* Usual arithmetic conversions, LP64: ranks are int(32) and long(64);
  * long can represent every unsigned int, so mixed int/long keeps the
  * long's signedness. */
 static struct type *arith_common(struct type *a, struct type *b)
 {
+    /* Floating types outrank every integer, and double outranks float
+     * — the usual arithmetic conversions, floating half first. */
+    if (a->kind == TY_DOUBLE || b->kind == TY_DOUBLE)
+        return ty_base(TY_DOUBLE, 0);
+    if (a->kind == TY_FLOAT || b->kind == TY_FLOAT)
+        return ty_base(TY_FLOAT, 0);
     a = promote(a);
     b = promote(b);
     int wa = ty_wide(a), wb = ty_wide(b);
@@ -125,13 +142,44 @@ static void need_integer(struct unit *u, struct expr *e, const char *what)
                    what, ty_name(e->ty));
 }
 
+static void need_arith(struct unit *u, struct expr *e, const char *what)
+{
+    if (!ty_is_arith(e->ty))
+        diag_fatal(u->file, e->line,
+                   "%s needs an arithmetic value, got %s", what,
+                   ty_name(e->ty));
+}
+
 /* The conversions assignment performs (also used for arguments and
  * return values). Explicit casts are looser; this is the implicit set. */
+/* SSE2 has no instruction converting between a 64-bit UNSIGNED integer
+ * and a float: cvtsi2sd and cvttsd2si are both signed, so anything at
+ * or above 2^63 would come out wrong. gcc emits a branchy fixup; EmbCC
+ * refuses instead of quietly producing the wrong number (THE RULE).
+ * Every other combination is exact: narrower integers are converted
+ * through their 64-bit form. */
+static void check_u64_float(struct unit *u, int line, struct type *a,
+                            struct type *b)
+{
+    struct type *i = ty_is_float(a) ? b : a;
+    struct type *fp = ty_is_float(a) ? a : b;
+    if (!ty_is_float(fp) || !ty_is_integer(i))
+        return;
+    if (i->kind == TY_LONG && i->is_unsigned)
+        diag_fatal(u->file, line,
+                   "converting between unsigned long and %s is not "
+                   "supported yet (SSE2 has no unsigned 64-bit "
+                   "conversion; cast through a signed long if the value "
+                   "fits)", ty_name(fp));
+}
+
 static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                                    struct type *to, const char *ctx)
 {
-    if (ty_is_integer(to) && ty_is_integer(rhs->ty))
+    if (ty_is_arith(to) && ty_is_arith(rhs->ty)) {
+        check_u64_float(u, rhs->line, to, rhs->ty);
         return mk_cast(rhs, to);
+    }
     if (to->kind == TY_PTR) {
         if (rhs->ty->kind == TY_PTR &&
             (ty_equal(rhs->ty, to) || to->pointee->kind == TY_VOID ||
@@ -143,6 +191,9 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                    "%s: cannot convert %s to %s without a cast",
                    ctx, ty_name(rhs->ty), ty_name(to));
     }
+    if (ty_is_float(to) && rhs->ty->kind == TY_PTR)
+        diag_fatal(u->file, rhs->line,
+                   "%s: a pointer cannot become %s", ctx, ty_name(to));
     if (ty_is_integer(to) && rhs->ty->kind == TY_PTR)
         diag_fatal(u->file, rhs->line,
                    "%s: converting %s to %s needs an explicit cast",
@@ -165,6 +216,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
 {
     switch (e->kind) {
     case EXPR_NUM:
+    case EXPR_FNUM:
         /* type assigned by the parser from the literal's shape */
         break;
     case EXPR_STR:
@@ -254,7 +306,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 e->ty->pointee->kind == TY_FUNC)
                 diag_fatal(u->file, e->line, "++/-- on %s",
                            ty_name(e->ty));
-        } else if (!ty_is_integer(e->ty)) {
+        } else if (!ty_is_arith(e->ty)) {
             diag_fatal(u->file, e->line, "++/-- needs an integer or "
                                          "pointer, got %s",
                        ty_name(e->ty));
@@ -267,9 +319,14 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         e->ty = ty_base(TY_INT, 0);
         break;
     case EXPR_NEG:
+        check_expr(u, f, sc, e->rhs);
+        need_arith(u, e->rhs, "unary '-'");
+        e->ty = promote(e->rhs->ty);
+        e->rhs = mk_cast(e->rhs, e->ty);
+        break;
     case EXPR_BNOT:
         check_expr(u, f, sc, e->rhs);
-        need_integer(u, e->rhs, e->kind == EXPR_NEG ? "unary '-'" : "'~'");
+        need_integer(u, e->rhs, "'~'");
         e->ty = promote(e->rhs->ty);
         e->rhs = mk_cast(e->rhs, e->ty);
         break;
@@ -313,6 +370,13 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (!ty_is_scalar(e->cast_ty))
             diag_fatal(u->file, e->line, "cannot cast to %s",
                        ty_name(e->cast_ty));
+        if ((ty_is_float(e->cast_ty) && e->rhs->ty->kind == TY_PTR) ||
+            (e->cast_ty->kind == TY_PTR && ty_is_float(e->rhs->ty)))
+            diag_fatal(u->file, e->line,
+                       "cannot convert between %s and %s",
+                       ty_name(e->rhs->ty), ty_name(e->cast_ty));
+        if (ty_is_arith(e->cast_ty) && ty_is_arith(e->rhs->ty))
+            check_u64_float(u, e->line, e->cast_ty, e->rhs->ty);
         e->ty = e->cast_ty;
         break;
     case EXPR_COMMA:
@@ -326,7 +390,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         check_expr(u, f, sc, e->lhs);
         check_expr(u, f, sc, e->rhs);
         struct type *a = e->lhs->ty, *b = e->rhs->ty;
-        if (ty_is_integer(a) && ty_is_integer(b)) {
+        if (ty_is_arith(a) && ty_is_arith(b)) {
             e->ty = arith_common(a, b);
             e->lhs = mk_cast(e->lhs, e->ty);
             e->rhs = mk_cast(e->rhs, e->ty);
@@ -451,8 +515,8 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 *ip = mk_cast(*ip, ty_base(TY_LONG, 0));
                 e->ty = pt;
             } else {
-                need_integer(u, e->lhs, "arithmetic");
-                need_integer(u, e->rhs, "arithmetic");
+                need_arith(u, e->lhs, "arithmetic");
+                need_arith(u, e->rhs, "arithmetic");
                 e->ty = arith_common(lt, rt);
                 e->lhs = mk_cast(e->lhs, e->ty);
                 e->rhs = mk_cast(e->rhs, e->ty);
@@ -484,8 +548,8 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                     *ip = mk_cast(*ip, lp ? lt : rt);
                 }
             } else {
-                need_integer(u, e->lhs, "comparison");
-                need_integer(u, e->rhs, "comparison");
+                need_arith(u, e->lhs, "comparison");
+                need_arith(u, e->rhs, "comparison");
                 struct type *ct = arith_common(lt, rt);
                 e->lhs = mk_cast(e->lhs, ct);
                 e->rhs = mk_cast(e->rhs, ct);
@@ -501,9 +565,17 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->lhs = mk_cast(e->lhs, e->ty);
             e->rhs = mk_cast(e->rhs, ty_base(TY_INT, 0));
             break;
-        default: /* MUL DIV MOD AND OR XOR */
-            need_integer(u, e->lhs, "arithmetic");
-            need_integer(u, e->rhs, "arithmetic");
+        case B_MUL:
+        case B_DIV:
+            need_arith(u, e->lhs, "arithmetic");
+            need_arith(u, e->rhs, "arithmetic");
+            e->ty = arith_common(lt, rt);
+            e->lhs = mk_cast(e->lhs, e->ty);
+            e->rhs = mk_cast(e->rhs, e->ty);
+            break;
+        default: /* MOD AND OR XOR — integers only, as in C */
+            need_integer(u, e->lhs, "this operator");
+            need_integer(u, e->rhs, "this operator");
             e->ty = arith_common(lt, rt);
             e->lhs = mk_cast(e->lhs, e->ty);
             e->rhs = mk_cast(e->rhs, e->ty);
@@ -554,7 +626,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                                             ft->ptypes[i], "argument");
             else /* variadic tail: default argument promotions */
                 e->args[i] = mk_cast(e->args[i],
-                                     promote(e->args[i]->ty));
+                                     default_arg_promote(e->args[i]->ty));
         }
         e->ty = ft->ret;
         break;

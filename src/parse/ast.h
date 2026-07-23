@@ -14,7 +14,7 @@
 
 #define MAX_PARAMS 6
 
-enum expr_kind { EXPR_NUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
+enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA };
@@ -37,6 +37,7 @@ struct expr {
     struct type *undecayed; /* sema: original array type when ty is the
                              * decayed pointer (sizeof needs it) */
     long num;             /* EXPR_NUM; EXPR_STR: byte length incl NUL */
+    double fnum;          /* EXPR_FNUM */
     const char *name;     /* EXPR_VAR, EXPR_CALL, EXPR_INCDEC target;
                            * EXPR_STR: the bytes */
     int var_index;        /* EXPR_VAR/EXPR_INCDEC: slot; set by sema */

@@ -65,7 +65,7 @@ static void expect(struct parser *ps, enum tok_kind kind, const char *what)
  * them here turns "'struct' is not declared" into an honest "not
  * supported yet". Grows emptier as M2 proceeds. */
 static const char *const reserved_unsupported[] = {
-    "auto", "double", "float", "goto", "register",
+    "auto", "goto", "register",
 };
 
 static void reject_reserved(struct parser *ps, const char *name, int line)
@@ -87,7 +87,8 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_LONG || k == TOK_KW_UNSIGNED ||
            k == TOK_KW_SIGNED || k == TOK_KW_VOID ||
            k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM ||
-           k == TOK_KW_CONST || k == TOK_KW_VOLATILE;
+           k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
+           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE;
 }
 
 /* const/volatile/restrict are accepted and IGNORED: EmbCC does not
@@ -318,10 +319,13 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     /* base specifiers in any order: unsigned long int, long unsigned... */
     int uns = -1, nlong = 0, nshort = 0, nchar = 0, nint = 0, nvoid = 0;
+    int nfloat = 0, ndouble = 0;
     int any = 0;
     for (;;) {
         enum tok_kind k = cur(ps)->kind;
-        if (k == TOK_KW_UNSIGNED) uns = 1;
+        if (k == TOK_KW_FLOAT) nfloat++;
+        else if (k == TOK_KW_DOUBLE) ndouble++;
+        else if (k == TOK_KW_UNSIGNED) uns = 1;
         else if (k == TOK_KW_SIGNED) uns = 0;
         else if (k == TOK_KW_LONG) nlong++;
         else if (k == TOK_KW_SHORT) nshort++;
@@ -336,6 +340,15 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     if (!any)
         return NULL;
+    if (nfloat || ndouble) {
+        if (uns != -1 || nchar || nshort || nint || nvoid ||
+            (nfloat && ndouble))
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "invalid type specifier combination");
+        /* 'long double' is accepted AS double — there is no 80-bit
+         * type here, and saying so beats pretending. */
+        return ty_base(nfloat ? TY_FLOAT : TY_DOUBLE, 0);
+    }
     if (nvoid) {
         if (any > 1)
             diag_fatal(ps->lx.file, cur(ps)->line,
@@ -522,6 +535,12 @@ static struct expr *parse_primary(struct parser *ps)
         e = new_expr(EXPR_NUM, t->line);
         e->num = t->num;
         e->ty = ty_base(t->num_long ? TY_LONG : TY_INT, t->num_uns);
+        advance(ps);
+        return e;
+    case TOK_FNUM:
+        e = new_expr(EXPR_FNUM, t->line);
+        e->fnum = t->fnum;
+        e->ty = ty_base(t->fnum_is_float ? TY_FLOAT : TY_DOUBLE, 0);
         advance(ps);
         return e;
     case TOK_STR:
@@ -1022,6 +1041,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         return s;
     case TOK_IDENT:
     case TOK_NUM:
+    case TOK_FNUM:
     case TOK_LPAREN:
     case TOK_BANG:
     case TOK_MINUS:
