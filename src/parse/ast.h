@@ -62,7 +62,8 @@ struct expr {
 };
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
-                 STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE };
+                 STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE,
+                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT };
 
 struct stmt {
     enum stmt_kind kind;
@@ -77,6 +78,11 @@ struct stmt {
     struct stmt *body;    /* WHILE/FOR: the controlled statement;
                            * BLOCK: the child list */
     struct stmt *next;
+    /* STMT_CASE: the label's constant value, folded by sema. Case and
+     * default are position MARKERS in the switch body's statement list —
+     * C's fallthrough means they cannot be nested nodes. */
+    long cval;
+    int label;            /* irgen: the marker's label id */
 };
 
 /* A file-scope variable. Like functions, later declarations merge into

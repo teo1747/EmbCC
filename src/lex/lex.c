@@ -76,6 +76,10 @@ static const struct {
     { "for", TOK_KW_FOR },
     { "break", TOK_KW_BREAK },
     { "continue", TOK_KW_CONTINUE },
+    { "do", TOK_KW_DO },
+    { "switch", TOK_KW_SWITCH },
+    { "case", TOK_KW_CASE },
+    { "default", TOK_KW_DEFAULT },
 };
 
 void lex_next(struct lexer *lx)
@@ -397,6 +401,10 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_FOR: return "'for'";
     case TOK_KW_BREAK: return "'break'";
     case TOK_KW_CONTINUE: return "'continue'";
+    case TOK_KW_DO: return "'do'";
+    case TOK_KW_SWITCH: return "'switch'";
+    case TOK_KW_CASE: return "'case'";
+    case TOK_KW_DEFAULT: return "'default'";
     case TOK_LPAREN: return "'('";
     case TOK_RPAREN: return "')'";
     case TOK_LBRACE: return "'{'";

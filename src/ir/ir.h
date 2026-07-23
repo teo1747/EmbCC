@@ -48,7 +48,8 @@ enum ir_op {
     IR_RET,   /* return a (a == -1: void return) */
     IR_LABEL, /* label: (id in `label`) */
     IR_JMP,   /* goto label */
-    IR_BRZ    /* if (a == 0) goto label  (w) */
+    IR_BRZ,   /* if (a == 0) goto label  (w) */
+    IR_BRNZ   /* if (a != 0) goto label  (w) */
 };
 
 struct ir_ins {

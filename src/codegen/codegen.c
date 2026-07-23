@@ -227,14 +227,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
             label_off[i->label] = text->len;
             break;
         case IR_JMP:
-        case IR_BRZ: {
+        case IR_BRZ:
+        case IR_BRNZ: {
             int patch;
-            if (i->op == IR_BRZ) {
+            if (i->op == IR_JMP) {
+                patch = x86_jmp_rel32(text);
+            } else {
                 x86_load_slot(text, sd[i->a], i->w, 0, i->w);
                 x86_test_eax(text, i->w);
-                patch = x86_jz_rel32(text);
-            } else {
-                patch = x86_jmp_rel32(text);
+                patch = i->op == IR_BRZ ? x86_jz_rel32(text)
+                                        : x86_jnz_rel32(text);
             }
             if (nbrs == capbrs) {
                 capbrs = capbrs ? capbrs * 2 : 16;

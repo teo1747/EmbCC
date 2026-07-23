@@ -65,8 +65,7 @@ static void expect(struct parser *ps, enum tok_kind kind, const char *what)
  * them here turns "'struct' is not declared" into an honest "not
  * supported yet". Grows emptier as M2 proceeds. */
 static const char *const reserved_unsupported[] = {
-    "auto", "case", "default", "do", "double",
-    "float", "goto", "register", "switch",
+    "auto", "double", "float", "goto", "register",
 };
 
 static void reject_reserved(struct parser *ps, const char *name, int line)
@@ -975,6 +974,41 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             s->step = parse_comma(ps);
         expect(ps, TOK_RPAREN, "')'");
         s->body = parse_controlled(ps);
+        return s;
+    case TOK_KW_DO:
+        s = new_stmt(STMT_DO, t->line);
+        advance(ps);
+        s->body = parse_controlled(ps);
+        if (cur(ps)->kind != TOK_KW_WHILE)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected 'while' after a do-body, got %s",
+                       tok_describe(cur(ps)));
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'('");
+        s->cond = parse_comma(ps);
+        expect(ps, TOK_RPAREN, "')'");
+        expect(ps, TOK_SEMI, "';'");
+        return s;
+    case TOK_KW_SWITCH:
+        s = new_stmt(STMT_SWITCH, t->line);
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'('");
+        s->cond = parse_comma(ps);
+        expect(ps, TOK_RPAREN, "')'");
+        s->body = parse_controlled(ps);
+        return s;
+    case TOK_KW_CASE:
+        /* a position MARKER in the switch body's list, not a wrapper —
+         * C's fallthrough is what forces that shape */
+        s = new_stmt(STMT_CASE, t->line);
+        advance(ps);
+        s->expr = parse_cond(ps); /* folded to a constant by sema */
+        expect(ps, TOK_COLON, "':'");
+        return s;
+    case TOK_KW_DEFAULT:
+        s = new_stmt(STMT_DEFAULT, t->line);
+        advance(ps);
+        expect(ps, TOK_COLON, "':'");
         return s;
     case TOK_KW_BREAK:
         s = new_stmt(STMT_BREAK, t->line);

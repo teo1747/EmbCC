@@ -562,21 +562,128 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     }
 }
 
+/* Enough constant folding for a case label. Anything it cannot fold is
+ * refused by name rather than guessed at — case labels must be integer
+ * constant expressions, and a label we cannot evaluate is a label we
+ * cannot dispatch on (THE RULE). */
+static int const_fold(const struct expr *e, long *out)
+{
+    long a, b;
+
+    switch (e->kind) {
+    case EXPR_NUM:
+        *out = e->num;
+        return 1;
+    case EXPR_CAST:
+        return const_fold(e->rhs, out);
+    case EXPR_NEG:
+        if (!const_fold(e->rhs, &a))
+            return 0;
+        *out = -a;
+        return 1;
+    case EXPR_BNOT:
+        if (!const_fold(e->rhs, &a))
+            return 0;
+        *out = ~a;
+        return 1;
+    case EXPR_NOT:
+        if (!const_fold(e->rhs, &a))
+            return 0;
+        *out = !a;
+        return 1;
+    case EXPR_BINOP:
+        if (!const_fold(e->lhs, &a) || !const_fold(e->rhs, &b))
+            return 0;
+        switch (e->op) {
+        case B_ADD: *out = a + b; return 1;
+        case B_SUB: *out = a - b; return 1;
+        case B_MUL: *out = a * b; return 1;
+        case B_DIV: if (!b) return 0; *out = a / b; return 1;
+        case B_MOD: if (!b) return 0; *out = a % b; return 1;
+        case B_AND: *out = a & b; return 1;
+        case B_OR:  *out = a | b; return 1;
+        case B_XOR: *out = a ^ b; return 1;
+        case B_SHL: *out = a << b; return 1;
+        case B_SHR: *out = a >> b; return 1;
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
+/* The statement list a switch dispatches over: its body, unwrapped when
+ * it is the usual brace block. Case markers must live at THIS level. */
+struct stmt *switch_stmts(struct stmt *body)
+{
+    if (body && body->kind == STMT_BLOCK)
+        return body->body;
+    return body;
+}
+
 /* Declarations anywhere in the function share one flat scope, and
  * shadowing is rejected outright. C gives inner blocks their own scope;
  * refusing shadowed names accepts strictly fewer programs than C does,
  * so the subset stays a subset. */
 static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
-                       struct stmt *s, int in_loop)
+                       struct stmt *s, int in_loop, int in_switch,
+                       int at_sw_level)
 {
     for (; s; s = s->next) {
         switch (s->kind) {
         case STMT_BREAK:
+            /* break leaves the nearest loop OR switch; continue only
+             * ever belongs to a loop. */
+            if (!in_loop && !in_switch)
+                diag_fatal(u->file, s->line,
+                           "'break' outside of a loop or switch");
+            break;
         case STMT_CONTINUE:
             if (!in_loop)
+                diag_fatal(u->file, s->line, "'continue' outside of a loop");
+            break;
+        case STMT_CASE:
+        case STMT_DEFAULT:
+            if (!at_sw_level)
                 diag_fatal(u->file, s->line,
-                           "'%s' outside of a loop",
-                           s->kind == STMT_BREAK ? "break" : "continue");
+                           "'%s' must appear directly in its switch body "
+                           "(labels inside a nested block are not "
+                           "supported)",
+                           s->kind == STMT_CASE ? "case" : "default");
+            if (s->kind == STMT_CASE) {
+                check_expr(u, f, sc, s->expr);
+                need_integer(u, s->expr, "a case label");
+                if (!const_fold(s->expr, &s->cval))
+                    diag_fatal(u->file, s->line,
+                               "a case label must be an integer constant "
+                               "expression");
+            }
+            break;
+        case STMT_SWITCH: {
+            check_expr(u, f, sc, s->cond);
+            need_integer(u, s->cond, "'switch'");
+            struct stmt *list = switch_stmts(s->body);
+            check_stmt(u, f, sc, list, in_loop, 1, 1);
+            /* duplicate labels and a second default are parse-time
+             * errors, not a runtime coin flip about which one wins */
+            int ndefault = 0;
+            for (struct stmt *a = list; a; a = a->next) {
+                if (a->kind == STMT_DEFAULT && ++ndefault > 1)
+                    diag_fatal(u->file, a->line,
+                               "a switch can have only one 'default'");
+                if (a->kind != STMT_CASE)
+                    continue;
+                for (struct stmt *b = a->next; b; b = b->next)
+                    if (b->kind == STMT_CASE && b->cval == a->cval)
+                        diag_fatal(u->file, b->line,
+                                   "duplicate case label %ld", b->cval);
+            }
+            break;
+        }
+        case STMT_DO:
+            check_stmt(u, f, sc, s->body, 1, in_switch, 0);
+            check_expr(u, f, sc, s->cond);
+            need_scalar(u, s->cond, "'do'/'while'");
             break;
         case STMT_DECL:
             if (s->expr) {
@@ -614,14 +721,14 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
         case STMT_IF:
             check_expr(u, f, sc, s->cond);
             need_scalar(u, s->cond, "'if'");
-            check_stmt(u, f, sc, s->thn, in_loop);
+            check_stmt(u, f, sc, s->thn, in_loop, in_switch, 0);
             if (s->els)
-                check_stmt(u, f, sc, s->els, in_loop);
+                check_stmt(u, f, sc, s->els, in_loop, in_switch, 0);
             break;
         case STMT_WHILE:
             check_expr(u, f, sc, s->cond);
             need_scalar(u, s->cond, "'while'");
-            check_stmt(u, f, sc, s->body, 1);
+            check_stmt(u, f, sc, s->body, 1, in_switch, 0);
             break;
         case STMT_FOR:
             if (s->init)
@@ -632,10 +739,10 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             }
             if (s->step)
                 check_expr(u, f, sc, s->step);
-            check_stmt(u, f, sc, s->body, 1);
+            check_stmt(u, f, sc, s->body, 1, in_switch, 0);
             break;
         case STMT_BLOCK:
-            check_stmt(u, f, sc, s->body, in_loop);
+            check_stmt(u, f, sc, s->body, in_loop, in_switch, 0);
             break;
         }
     }
@@ -681,7 +788,7 @@ static void check_func(struct unit *u, struct func *f)
         scope_add(&sc, f->params[i], f->param_tys[i]);
     }
 
-    check_stmt(u, f, &sc, f->body, 0);
+    check_stmt(u, f, &sc, f->body, 0, 0, 0);
 
     if (f->ret_ty->kind != TY_VOID && !list_returns(f->body))
         diag_fatal(u->file, f->line,

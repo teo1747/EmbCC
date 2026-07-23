@@ -397,6 +397,15 @@ int x86_jz_rel32(struct code *c)
     return off;
 }
 
+int x86_jnz_rel32(struct code *c)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0x85); /* jnz rel32 */
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
 int x86_jmp_rel32(struct code *c)
 {
     code_byte(c, 0xe9);

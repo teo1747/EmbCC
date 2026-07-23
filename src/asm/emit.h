@@ -71,6 +71,7 @@ void x86_setcc_eax(struct code *c, int cc);
  * return the patch offset, resolved per-function by codegen. */
 void x86_test_eax(struct code *c, int w);
 int x86_jz_rel32(struct code *c);
+int x86_jnz_rel32(struct code *c);
 int x86_jmp_rel32(struct code *c);
 
 /* call rel32 with a zero placeholder; returns the rel32 field offset. */

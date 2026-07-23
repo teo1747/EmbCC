@@ -30,12 +30,27 @@ check() { # name source expected-message-grep
     echo "case $1: refused with a diagnostic"
 }
 
-check switch-stmt \
-    'int main(void) { switch (1) { } return 0; }' \
-    "not supported"
-check do-while \
-    'int main(void) { int i = 0; do { i++; } while (i < 3); return 0; }' \
-    "not supported"
+check case-outside-switch \
+    'int main(void) { case 1: return 0; }' \
+    "directly in its switch body"
+check case-nested-in-block \
+    'int main(void) { int x = 1; switch (x) { { case 1: return 1; } } return 0; }' \
+    "directly in its switch body"
+check duplicate-case \
+    'int main(void) { int x = 1; switch (x) { case 2: break; case 2: break; } return 0; }' \
+    "duplicate case label 2"
+check two-defaults \
+    'int main(void) { int x = 1; switch (x) { default: break; default: break; } return 0; }' \
+    "only one .default."
+check non-constant-case \
+    'int main(void) { int x = 1; int y = 2; switch (x) { case y: break; } return 0; }' \
+    "integer constant"
+check switch-on-pointer \
+    'int main(void) { int x; int *p = &x; switch (p) { case 1: break; } return 0; }' \
+    "needs an integer"
+check continue-in-switch-no-loop \
+    'int main(void) { int x = 1; switch (x) { case 1: continue; } return 0; }' \
+    "outside of a loop"
 check cond-incompatible \
     'int main(void) { int x; int *p = &x; return 1 ? p : 5; }' \
     "incompatible"

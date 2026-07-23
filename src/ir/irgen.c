@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "../driver/util.h"
+#include "../sema/sema.h"
 #include "../sema/type.h"
 
 static struct ir_ins *emit(struct ir_func *fn)
@@ -50,6 +51,15 @@ static void emit_brz(struct ir_func *fn, int v, int w, int label)
 {
     struct ir_ins *i = emit(fn);
     i->op = IR_BRZ;
+    i->a = v;
+    i->w = w;
+    i->label = label;
+}
+
+static void emit_brnz(struct ir_func *fn, int v, int w, int label)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_BRNZ;
     i->a = v;
     i->w = w;
     i->label = label;
@@ -592,6 +602,66 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             } else {
                 emit_label(fn, l_else);
             }
+            break;
+        }
+        case STMT_DO: {
+            /* body first, THEN the test — the whole point of do-while;
+             * continue re-tests, so it targets the condition. */
+            struct loopctx lc;
+            int l_top = new_label(fn);
+            lc.cont = new_label(fn);
+            lc.brk = new_label(fn);
+            emit_label(fn, l_top);
+            gen_stmt(fn, s->body, &lc);
+            emit_label(fn, lc.cont);
+            int c = gen_expr(fn, s->cond);
+            emit_brnz(fn, c, ty_w(s->cond->ty), l_top);
+            emit_label(fn, lc.brk);
+            break;
+        }
+        case STMT_CASE:
+        case STMT_DEFAULT:
+            emit_label(fn, s->label);
+            break;
+        case STMT_SWITCH: {
+            /* A compare-and-branch chain: correct and slow, the house
+             * rule (ARCHITECTURE §3). A jump table is an OPTIMIZATION
+             * and belongs to the optimizer era, not here. */
+            struct loopctx lc;
+            lc.brk = new_label(fn);
+            /* continue inside a switch belongs to the enclosing LOOP;
+             * sema has already refused it when there is none. */
+            lc.cont = loop ? loop->cont : -1;
+
+            int v = gen_expr(fn, s->cond);
+            int w = ty_w(s->cond->ty);
+            int sign = ty_signed_int(s->cond->ty);
+            struct stmt *list = switch_stmts(s->body);
+            int dflt = -1;
+
+            for (struct stmt *c = list; c; c = c->next) {
+                if (c->kind == STMT_DEFAULT) {
+                    c->label = new_label(fn);
+                    dflt = c->label;
+                    continue;
+                }
+                if (c->kind != STMT_CASE)
+                    continue;
+                c->label = new_label(fn);
+                int k = emit_const(fn, c->cval, w);
+                struct ir_ins *i = emit(fn);
+                i->op = IR_CMP;
+                i->pred = B_EQ;
+                i->a = v;
+                i->b = k;
+                i->w = w;
+                i->sign = sign;
+                i->dst = new_temp(fn);
+                emit_brnz(fn, i->dst, 4, c->label);
+            }
+            emit_jmp(fn, dflt >= 0 ? dflt : lc.brk);
+            gen_stmt(fn, list, &lc); /* fallthrough is just: no jumps */
+            emit_label(fn, lc.brk);
             break;
         }
         case STMT_WHILE: {

@@ -606,6 +606,58 @@ static long eval_if(struct src *s, const char *line)
     return v;
 }
 
+/* A function-like macro invocation may span physical lines:
+ *     int select __P ((int __n, fd_set *__readfds,
+ *                      struct timeval *__timeout));
+ * The scanner is line-oriented, so an invocation whose ')' has not
+ * arrived yet needs more input before it can be expanded. Returns 1
+ * when the text ends inside such an argument list. */
+static int needs_more_input(struct cpp *cpp, const char *text)
+{
+    const char *p = text;
+
+    while (*p) {
+        if (*p == '"' || *p == '\'') {
+            p += copy_literal(p, NULL);
+            continue;
+        }
+        if (!is_id0(*p)) {
+            p++;
+            continue;
+        }
+        size_t n = 0;
+        while (is_idc(p[n]))
+            n++;
+        struct macro *m = find_macro(cpp, p, n);
+        const char *q = p + n;
+        while (*q == ' ' || *q == '\t')
+            q++;
+        if (m && m->is_func && *q == '(') {
+            int depth = 0;
+            const char *r = q;
+            while (*r) {
+                if (*r == '"' || *r == '\'') {
+                    r += copy_literal(r, NULL);
+                    continue;
+                }
+                if (*r == '(') {
+                    depth++;
+                } else if (*r == ')') {
+                    if (--depth == 0)
+                        break;
+                }
+                r++;
+            }
+            if (!*r)
+                return 1; /* the ')' never arrived on this line */
+            p = r + 1;
+            continue;
+        }
+        p += n;
+    }
+    return 0;
+}
+
 /* ---- the line-oriented driver ---- */
 
 /* Reads one logical line (backslash-newline spliced, comments
@@ -940,6 +992,18 @@ static void process_file(struct cpp *cpp, const char *path,
         }
 
         if (live) {
+            /* Pull continuation lines while a function-like macro
+             * invocation is still open (see needs_more_input). */
+            while (needs_more_input(cpp, lineb.p ? lineb.p : "")) {
+                int more_nl = 0;
+                tb_putc(&lineb, ' ');
+                if (!read_logical_line(&s, &lineb, &more_nl)) {
+                    cerr(&s, "unterminated macro argument list at end "
+                             "of file", NULL);
+                    break;
+                }
+                nl += more_nl;
+            }
             s.line = startline;
             expand_text(&s, lineb.p ? lineb.p : "", out);
         }

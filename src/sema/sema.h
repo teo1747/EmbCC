@@ -8,4 +8,9 @@
  * EXPR_CALL a callee, and every func its nvars. */
 void sema_check(struct unit *u);
 
+/* The statement list a switch dispatches over: its body, unwrapped when
+ * it is the usual brace block. Shared with irgen so both agree on which
+ * statements carry the case markers. */
+struct stmt *switch_stmts(struct stmt *body);
+
 #endif
