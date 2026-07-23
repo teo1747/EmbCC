@@ -62,6 +62,11 @@ struct src {
     const char *file;
     const char *p;
     int line;
+    /* Index into incdirs of the directory this file was found in, or -1
+     * for the main file / a "..."-relative hit. #include_next resumes
+     * the search AFTER it — that is the whole mechanism, and it is how
+     * a header can wrap the system one of the same name. */
+    int incdir_idx;
 };
 
 static void cerr(struct src *s, const char *msg, const char *arg)
@@ -730,9 +735,10 @@ static char *read_file_or_null(const char *path, long *len)
 }
 
 static void process_file(struct cpp *cpp, const char *path,
-                         const char *src, struct tbuf *out);
+                         const char *src, struct tbuf *out, int incdir_idx);
 
-static void do_include(struct src *s, const char *arg, struct tbuf *out)
+static void do_include(struct src *s, const char *arg, struct tbuf *out,
+                       int is_next)
 {
     char path[512];
     char fname[256];
@@ -762,7 +768,12 @@ static void do_include(struct src *s, const char *arg, struct tbuf *out)
 
     char *text = NULL;
     long len;
-    if (!angle) {
+    int found_idx = -1;
+    /* #include_next starts after the directory THIS file came from;
+     * a plain #include starts at the beginning. */
+    int start = is_next ? s->incdir_idx + 1 : 0;
+
+    if (!angle && !is_next) {
         /* relative to the including file's directory first */
         const char *slash = strrchr(s->file, '/');
         if (slash)
@@ -772,15 +783,19 @@ static void do_include(struct src *s, const char *arg, struct tbuf *out)
             snprintf(path, sizeof path, "%s", fname);
         text = read_file_or_null(path, &len);
     }
-    for (int i = 0; !text && i < s->cpp->nincdirs; i++) {
+    for (int i = start; !text && i < s->cpp->nincdirs; i++) {
         snprintf(path, sizeof path, "%s/%s", s->cpp->incdirs[i], fname);
         text = read_file_or_null(path, &len);
+        if (text)
+            found_idx = i;
     }
     if (!text)
-        cerr(s, "cannot find include file \"%s\"", fname);
+        cerr(s, is_next ? "cannot find a NEXT include file \"%s\""
+                        : "cannot find include file \"%s\"", fname);
 
     s->cpp->depth++;
-    process_file(s->cpp, xstrndup(path, strlen(path)), text, out);
+    process_file(s->cpp, xstrndup(path, strlen(path)), text, out,
+                 found_idx);
     s->cpp->depth--;
 }
 
@@ -864,13 +879,14 @@ static void define_macro(struct src *s, const char *line)
 enum cond_state { COND_LIVE, COND_DEAD, COND_DONE };
 
 static void process_file(struct cpp *cpp, const char *path,
-                         const char *src, struct tbuf *out)
+                         const char *src, struct tbuf *out, int incdir_idx)
 {
     struct src s;
     s.cpp = cpp;
     s.file = path;
     s.p = src;
     s.line = 1;
+    s.incdir_idx = incdir_idx;
 
     enum cond_state cond[MAX_COND_DEPTH];
     int ncond = 0;
@@ -964,8 +980,8 @@ static void process_file(struct cpp *cpp, const char *path,
                 if (!idn)
                     cerr(&s, "#undef needs a name", NULL);
                 undef_macro(cpp, arg, idn);
-            } else if (DIR("include")) {
-                do_include(&s, arg, out);
+            } else if (DIR("include") || DIR("include_next")) {
+                do_include(&s, arg, out, DIR("include_next"));
                 s.line = startline + nl;
                 snprintf(marker, sizeof marker, "# %d \"%s\"\n",
                          s.line, path);
@@ -1064,6 +1080,7 @@ char *cpp_process(const char *path, const char *src,
     boot.file = "<built-in>";
     boot.p = "";
     boot.line = 0;
+    boot.incdir_idx = -1;
     define_macro(&boot, "__EMBCC__ 1");
     /* gcc-isms real headers use unconditionally; semantically no-ops */
     define_macro(&boot, "__extension__");
@@ -1077,6 +1094,6 @@ char *cpp_process(const char *path, const char *src,
     define_macro(&boot, "__STDC_HOSTED__ 1");
 
     struct tbuf out = { 0, 0, 0 };
-    process_file(&cpp, path, src, &out);
+    process_file(&cpp, path, src, &out, -1);
     return out.p ? out.p : xstrndup("", 0);
 }
