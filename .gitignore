@@ -4,6 +4,8 @@
 *.a
 *.elf
 embcc
+embread
+embld
 embcc-stage1
 embcc-stage2
 
@@ -17,3 +19,4 @@ compile_commands.json
 .cache/
 *.swp
 .DS_Store
+ref/

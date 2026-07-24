@@ -56,9 +56,13 @@ turns out to be painful in C and obvious in the other language.
 
 ---
 
-## D-003 — Emit **ELF**. A native format, if ever, is an ELF *superset*
+## D-003 — Emit **EMBX** (native, capability-carrying) + keep ELF for porting
 
-**Decided:** 2026-07-19 (design). **Status:** firm.
+**Decided:** 2026-07-19 (design). **REVISED 2026-07-24 — the reopen condition
+at the bottom triggered.** The original decision (emit ELF, native format only
+as an ELF superset) and its reasoning are kept below because the reasoning is
+still correct; what changed is the conclusion, and honestly so — see the
+revision block.
 
 EmbCC emits ELF in the exact shape EmbLinkOS's in-kernel loader accepts
 (see TARGET_ABI.md). It does **not** invent a container format.
@@ -88,8 +92,39 @@ then consider format work.
 container before deciding what it declares inverts the discipline the OS's own
 docs insist on (derive the on-disk shape *last*, from the invariants).
 
-**Reopens if:** a capability model lands and genuinely cannot be expressed in
-ELF notes.
+### Revision — 2026-07-24
+
+This decision **predicted its own supersession** and got the ordering right: it
+said a declared capability manifest was the one thing that could justify a
+native format, and to **build the model first**. That is exactly what happened.
+
+1. **The capability model landed** in EmbLinkOS: a per-process capability set,
+   seeded at init and attenuated at spawn, with a spawn-syscall path and a
+   first handle-install gate (kernel `capabilities.h`, `sys_getcaps`,
+   `SPAWN_ACTION_SET_CAPS`). The model came first, from invariants — the
+   discipline this decision insisted on.
+2. **Then the format**, EMBX (`myos/docs/EMBX_Specification_v2.md`), byte-exact,
+   with a **working in-kernel loader** that enforces the capability check at
+   load (§6 step 9). The declaration flows: binary table → step-9 check → the
+   process's cap set → a gated handle.
+
+**Honest note on the reopen basis.** This decision's stated reopen was "if the
+model *cannot be expressed in ELF notes*." Strictly, it could have been — a
+`.note.embx.caps` section would have worked. The reopen is therefore on a
+*different* basis than anticipated: a deliberate **ownership** choice, made by
+the OS's author, consistent with how EmbLinkOS already runs a dual-format world
+for filesystems (EMBKFS native for its own data, FAT32 to read foreign disks).
+Executables now mirror that: **EMBX for programs built for EmbLink, ELF kept as
+the porting substrate** (foreign source recompiled — the git/CPython/C++ path).
+It is a dual *loader*, not a converter. So EmbCC's eventual output is EMBX; ELF
+stays for as long as porting does.
+
+**Reopens if:** never for "ELF-only" again. The open question is now the
+inverse — when EmbCC gains a relocation model, whether EMBX's `.embdll` linkage
+contract (spec §4.2, still deferred) is the right shape.
+
+**Original reopen (kept for the record):** a capability model lands and
+genuinely cannot be expressed in ELF notes.
 
 ---
 
@@ -160,3 +195,132 @@ prevent.
 
 **Reopens if:** EmbCC ever becomes a serious optimizing compiler with proven
 freestanding support — a decision for a much later year.
+
+---
+
+## D-008 — Target languages: **C, then C++.** No language of our own is planned
+
+**Decided:** 2026-07-20. **Status:** current intent; C++ is unscheduled.
+
+EmbCC's languages are **C** (the M1–M4 path) and, in the long term, **C++**.
+The novel-language direction that VISION.md §4.2 called "the most interesting
+long-term direction" — EmbLink's typed values (records, tables, SQL-nulls) as
+first-class types — is **not planned**. It is demoted from "interesting future"
+to "possible if it ever earns itself"; D-002's ten-lines gate remains the only
+door back in, and nobody is expected to walk through it.
+
+**Why.**
+1. What the OS actually needs is the ability to build the software that exists,
+   and that software is C and C++. The ports story already proved the demand:
+   C++/libstdc++ was ported *before* any native compiler work began, and C++
+   is the wall TCC will never clear — making it the clearest D-006-legitimate
+   capability EmbCC could ever deliver.
+2. A novel language multiplies every cost in this repo — testability against
+   existing compilers disappears, self-hosting gains a second bootstrap
+   problem, and adoption requires rewriting working programs. The payoff was
+   always speculative; stating "not planned" is more honest than leaving it
+   glowing in the vision docs as an implied someday.
+
+**Order still holds:** C++ comes after the C compiler closes the M4 loop, not
+alongside it. It is a frontend-and-sema project of a different size (name
+mangling, overloading, templates, EH/unwinding, a C++ runtime against newlib's
+C-only world) and it gets its own decision record when it becomes concrete.
+
+**Reopens if:** the ten-lines test (D-002) passes convincingly for the typed
+values language — the gate is unchanged, only the expectation is.
+
+
+---
+
+## D-009 — Own libc: **emlibc**, non-POSIX, EmbLink-shaped
+
+**Decided:** 2026-07-23. **Status:** current intent, deferred; requirements
+written (`myos/docs/EMLIBC_Requirements.md`), no implementation.
+
+EmbCC's eventual link target is **emlibc**, EmbLinkOS's own C library, not
+newlib (nor musl/glibc). The requirements doc is the OS-side artifact; EmbCC
+consumes its contract, the same relationship it has with the EMBX format spec.
+
+**Why.** The ownership loop D-003 and D-008 point at closes only if the *library*
+is owned too: language + compiler + libc + format + loader + OS, one system.
+musl/glibc were weighed and declined — both are written against the Linux
+syscall ABI and would drag the system toward host-the-world, the pole
+EmbLinkOS deliberately sits opposite. The OS's author is "only half okay" with
+depending on a ported POSIX libc forever.
+
+**What keeps it tractable** (and why it is not "rewrite a libc"): most of a libc
+is OS-agnostic (string/math/malloc/printf number-formatting) and may be **lifted**
+from a permissive source — D-006 applied to ourselves, a from-scratch `cosf` is
+authorship without capability. POSIX lives only in the thin OS-facing rim
+(I/O, process, time, entropy), and EmbLinkOS **already owns that rim**
+(`crt0.c`, `syscalls.c`, the errno map). So emlibc is incremental: own the rim,
+grow the agnostic bulk header by header, expose the capability-aware surface
+newlib cannot (`getcaps`, spawn+file-actions instead of `fork`), and eventually
+be **compiled by EmbCC itself** (the closed loop) and shipped as **EMBX**.
+
+**Rejected:** a POSIX-compatible libc (musl/glibc port), because POSIX
+compatibility is exactly the thing the OS's non-POSIX model refuses. picolibc
+remains a legitimate *interim* upgrade over newlib if raw completeness is wanted
+before emlibc exists — but as a stopgap, never the destination.
+
+**Order:** after the C compiler is real (M1–M3) and alongside/after C++ (D-008);
+emlibc is not the opening move. It gets its own milestones when it becomes
+concrete.
+
+**Reopens if:** the interim (picolibc) proves good enough that owning the libc
+never earns itself under D-006 — the same earn-by-capability gate everything
+here answers to.
+
+---
+
+## D-010 — Debug info: **DWARF as the bridge, native `.embdbg` derived last**
+
+**Decided:** 2026-07-24. **Status:** current intent, deferred; requirements
+written (`docs/EMBDBG_Requirements.md`), no byte layout on this side, no
+implementation. **Update (same day):** the OS side now carries the byte-exact
+format AND the kernel debugging contract (`myos/docs/EMBDBG_Specification.md`) —
+which supplies the consumer and invariants this decision said `.embdbg` must be
+derived from. It does not revise D-010: DWARF stays the host bridge, and the
+producer finding is that the LINKER (EmbLD), not the compiler, emits the
+absolute-addressed `.embdbg` — EmbCC's ET_REL objects carry only *relocatable*
+line info (the EMBX finding, one channel over; see EMBDBG_Requirements.md).
+
+EmbCC's first debug output will be **minimal DWARF line info**, because it is
+debuggable by tools that already exist (gdb/lldb) on the host, the day it lands
+— no EmbDBG required. A **native `.embdbg`** sidecar is the eventual owned form,
+but its byte layout is derived **later**, from what EmbDBG (a debugger that does
+not exist yet) actually needs.
+
+**Why.** This is the DECISIONS D-003 fork again — own-the-stack vs
+meet-the-world — and it resolves the same way, for the same reason. A byte-exact
+`.embdbg` today would be designed against a producer that emits nothing (EmbCC
+puts no line/local/type info in its objects) and a consumer that does not exist.
+That is the exact inversion D-003 was reopened *with eyes open about*: derive the
+on-disk shape last, from invariants. DWARF line info sidesteps it entirely — its
+consumer (gdb) is real, so "prove it on the host first" (D-005) applies to
+debugging exactly as it did to codegen. And EmbCC is unusually well-placed to
+emit it: it already knows `file:line` at every node (diagnostics use it), every
+local lives in a fixed stack slot (one `DW_OP_fbreg`, DWARF's trivial case), and
+`rbp` is kept as a frame pointer, so unwinding is a pointer walk with no CFI.
+
+**The dual-form stance, stated so it is not re-litigated:** DWARF is the bridge
+for host debugging and stays for as long as that is useful; `.embdbg` is the
+native form EmbDBG consumes, mirroring EMBX's ELF-for-porting /
+native-for-the-owned-world split (D-003) and EMBKFS's FAT32 / native split. The
+EMBX spec already reserved the slot — `EMBX_COMPAT_DEBUG_SIDECAR`, a *compat* bit
+(a loader that does not understand debug info ignores it), and `EMBX_F_STRIPPED`
+for its absence.
+
+**Rejected:** a byte-exact `.embdbg` format now. Designing the container before
+there is a producer or a consumer is D-003's mistake at a smaller scale, and
+`EMBDBG_Requirements.md` §6 refuses it explicitly.
+
+**Order:** after M3 (ARCHITECTURE §8 lists DWARF among the deliberate early
+non-goals; VISION_LONGTERM gates debug info on a debugger existing to consume
+it). The one honest exception is DWARF line info, cheap enough and useful enough
+— it would help debug the self-hosting compiler *through* M3 — that it is the
+one step plausibly worth pulling earlier.
+
+**Reopens if:** EmbDBG's real needs turn out not to fit a DWARF-derived model,
+or the kernel debugging contract (the open question that gates a native
+debugger, D-007) lands and dictates a shape.

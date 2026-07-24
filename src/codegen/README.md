@@ -1,4 +1,7 @@
 # src/codegen
 
-See ../../docs/ARCHITECTURE.md §2 for this phase's responsibility.
-Empty until ROADMAP M0/M1.
+IR → x86-64, System V AMD64 — ../../docs/ARCHITECTURE.md §4.
+
+M1 state: deliberately naive — every vreg in a stack slot, every op
+through eax, args in the six SysV registers, 16-byte call alignment.
+Intra-unit calls patched here; no relocations exist yet.

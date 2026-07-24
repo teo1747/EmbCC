@@ -1,8 +1,13 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
-**Status: DESIGN. No code yet.** This repository currently holds the decision
-record for a project we will build later. Nothing here is running, and nothing
-in EmbLinkOS depends on it.
+**Status: M2 complete — EmbLinkOS ran the real sval SDK compiled by EmbCC
+(2026-07-24).** The decision record below still governs. `embcc -c` compiles a
+substantial C subset — the integer types, pointers (incl. function pointers),
+arrays, structs/unions/enums, globals, the full operator set, and a
+preprocessor that digests **real newlib headers**, so `#include <stdio.h>`
+compiles, links and runs — to genuine x86_64-elf relocatable objects,
+cross-checked against gcc on every test. `embread` dumps and verifies EMBX
+images. No linker yet (M3); nothing in EmbLinkOS depends on this.
 
 EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
 for, and eventually *by*, the OS itself. It is the next ring of ownership after
@@ -43,11 +48,17 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 - **A C compiler first, not a new language.** Compiling a subset of C to the
   EmbLink ABI makes every increment testable *on the OS* the day it can emit a
   valid object. A language of its own is a possible future, not the opening move.
-- **Emit ELF, EmbLink-ABI.** The format stays ELF — specifically the exact shape
-  EmbLinkOS's in-kernel loader already binds (there is no `ld.so`; **the kernel
-  is the linker**). A native format, if it ever comes, is an **ELF superset**
-  (ELF-plus-notes, derived from a real need such as a capability manifest),
-  never a from-scratch container that forces converters forever.
+- **Emit ELF today; grow into EMBX + emlibc.** The *current* target is ELF
+  linked against newlib — the shape the in-kernel loader binds (there is no
+  `ld.so`; **the kernel is the linker**), and the substrate for porting foreign
+  source. The *native* target EmbCC grows into (DECISIONS D-003/D-009) is
+  **EMBX**, EmbLinkOS's own capability-carrying format
+  (`myos/docs/EMBX_Specification_v2.md`, byte-exact, working loader), linked
+  against **emlibc**, the OS's own non-POSIX libc
+  (`myos/docs/EMLIBC_Requirements.md`). ELF stays as the porting lane — a dual
+  *loader*, not a converter, mirroring EMBKFS-native-plus-FAT32 for disks. The
+  earlier "ELF superset only" plan was **revised** once the capability model
+  landed and the OS's author chose to own the format; D-003 records why.
 - **The milestones are loops.** EmbCC compiles a program the OS runs (exit 42);
   then EmbCC compiles *itself*; then EmbBuild builds EmbCC from `/data/src` on
   the OS. Each is the self-hosting loop, one ring deeper.
@@ -57,10 +68,14 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 | Doc | What it is |
 |---|---|
 | [docs/VISION.md](docs/VISION.md) | Why a native compiler; the ownership thesis; the own-the-stack vs host-the-world tension |
+| [docs/VISION_LONGTERM.md](docs/VISION_LONGTERM.md) | The post-M4 horizon: compiler infrastructure, tooling, optimization, analysis — each gated by D-006, none scheduled |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions already made, each with its rationale (ADR-style) |
 | [docs/TARGET_ABI.md](docs/TARGET_ABI.md) | **The grounding doc.** The exact EmbLinkOS contract EmbCC must emit — syscalls, crt0, and the precise ELF the in-kernel loader accepts |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M0–M4, each with a concrete acceptance test |
+| [docs/WORKPLAN.md](docs/WORKPLAN.md) | The team's three parallel streams (core, linker, proving ground) and the process that keeps them off each other's critical path |
+| [docs/EMBDBG_Requirements.md](docs/EMBDBG_Requirements.md) | Producer-side debug-info requirements + the DWARF-bridge decision (D-010); the byte format & kernel contract live OS-side in `myos/docs/EMBDBG_Specification.md` |
+| [src/embx/embx.h](src/embx/embx.h) | The EMBX container, byte-exact — mirrors the kernel's loader header; read by `embread`, to be written by the linker |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The discipline inherited from EmbLinkOS (prove on the host, selftest the invariant, THE RULE) |
 
 ## When work starts
