@@ -110,13 +110,15 @@ check array-scalar-init \
 check too-many-initializers \
     'int main(void) { int a[2] = {1,2,3}; return a[0]; }' \
     "3 initializers for an array of 2"
-check designated-init \
-    'struct P { int x; int y; };
-int main(void) { struct P p = { .x = 1 }; return p.x; }' \
-    "designated initializers"
 check non-char-array-from-string \
     'int main(void) { int a[4] = "abc"; return a[0]; }' \
     "only a char array"
+check array-index-designator \
+    'int main(void) { int a[3] = { [1] = 5 }; return a[1]; }' \
+    "\[index\] designators are not supported"
+check field-designator-in-array \
+    'int main(void) { int a[2] = { .x = 1 }; return a[0]; }' \
+    "field designator '.x' in an array"
 check varargs-definition \
     'int f(int a, ...) { return a; }
 int main(void) { return f(1); }' \

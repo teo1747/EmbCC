@@ -67,6 +67,8 @@ struct expr {
                            * for a call through a function pointer */
     struct expr **elems;  /* EXPR_INITLIST */
     int nelems;
+    const char *desig_field; /* an initlist element's .field designator,
+                              * NULL when it is positional */
 };
 
 /* An aggregate initializer, flattened by sema into (offset, type,

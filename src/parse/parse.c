@@ -966,15 +966,29 @@ static struct expr *parse_initializer(struct parser *ps)
         if (cur(ps)->kind == TOK_EOF)
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "unterminated initializer");
-        if (cur(ps)->kind == TOK_DOT || cur(ps)->kind == TOK_LBRACKET)
+        /* A struct field designator `.name =`; array `[i] =` is a future
+         * seam (EmbCC's own source needs only the field form). */
+        const char *field = NULL;
+        if (cur(ps)->kind == TOK_LBRACKET)
             diag_fatal(ps->lx.file, cur(ps)->line,
-                       "designated initializers are not supported yet");
+                       "array [index] designators are not supported yet");
+        if (cur(ps)->kind == TOK_DOT) {
+            advance(ps);
+            if (cur(ps)->kind != TOK_IDENT)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a field name after '.'");
+            field = cur(ps)->text;
+            advance(ps);
+            expect(ps, TOK_ASSIGN, "'=' after a field designator");
+        }
         if (e->nelems == cap) {
             cap = cap ? cap * 2 : 8;
             e->elems = xrealloc(e->elems,
                                 (size_t)cap * sizeof *e->elems);
         }
-        e->elems[e->nelems++] = parse_initializer(ps);
+        struct expr *el = parse_initializer(ps);
+        el->desig_field = field;
+        e->elems[e->nelems++] = el;
         if (cur(ps)->kind != TOK_COMMA)
             break;
         advance(ps); /* a trailing comma before '}' is legal C */

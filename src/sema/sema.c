@@ -847,19 +847,38 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, init->line,
                        "%d initializers for an array of %d",
                        init->nelems, ty->count);
-        for (int i = 0; i < init->nelems; i++)
+        for (int i = 0; i < init->nelems; i++) {
+            if (init->elems[i]->desig_field)
+                diag_fatal(u->file, init->elems[i]->line,
+                           "field designator '.%s' in an array initializer",
+                           init->elems[i]->desig_field);
             flatten_init(u, f, sc, init->elems[i], ty->pointee,
                          off + i * esz, out);
+        }
         return;
     }
     if (ty->kind == TY_STRUCT) {
-        if (init->nelems > ty->nmembers)
-            diag_fatal(u->file, init->line,
-                       "%d initializers for %s, which has %d members",
-                       init->nelems, ty_name(ty), ty->nmembers);
-        for (int i = 0; i < init->nelems; i++)
-            flatten_init(u, f, sc, init->elems[i], ty->members[i].ty,
-                         off + ty->members[i].off, out);
+        /* Positional by default; a `.field =` designator jumps to that
+         * member and initialization continues positionally after it. */
+        int mi = 0;
+        for (int i = 0; i < init->nelems; i++) {
+            struct expr *el = init->elems[i];
+            if (el->desig_field) {
+                struct member *m = ty_find_member(ty, el->desig_field);
+                if (!m)
+                    diag_fatal(u->file, el->line,
+                               "%s has no member '%s'", ty_name(ty),
+                               el->desig_field);
+                mi = (int)(m - ty->members);
+            }
+            if (mi >= ty->nmembers)
+                diag_fatal(u->file, init->line,
+                           "too many initializers for %s, which has %d "
+                           "members", ty_name(ty), ty->nmembers);
+            flatten_init(u, f, sc, el, ty->members[mi].ty,
+                         off + ty->members[mi].off, out);
+            mi++;
+        }
         return;
     }
     /* a braced scalar: { x } */
