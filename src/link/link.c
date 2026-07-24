@@ -69,6 +69,23 @@ struct symbol {
     Elf64_Xword align;         /* for COMMON */
 };
 
+/* A static archive (.a) is a pool of member objects; a member is pulled
+ * into the link only if it defines a symbol something still needs
+ * (classic archive semantics, TARGET_ABI §4b). */
+struct member {
+    const char *name;         /* "libc.a(malloc.o)" for diagnostics */
+    unsigned char *buf;
+    long len;
+    int pulled;
+    struct object *obj;       /* parsed lazily on first inspection */
+};
+
+struct archive {
+    const char *name;
+    struct member *members;
+    int nmembers;
+};
+
 struct linker {
     struct object **objs;
     int nobj, capobj;
@@ -76,6 +93,8 @@ struct linker {
     int nsec, capsec;
     struct symbol *syms;
     int nsym, capsym;
+    struct archive **archives;
+    int narch, caparch;
     Elf64_Addr base;
     const char *entry;
 };
@@ -193,6 +212,171 @@ static void collect_sections(struct linker *l, struct object *o)
         s->seg = (sh->sh_flags & SHF_WRITE) ? SEG_DATA : SEG_TEXT;
         o->sec_out[i] = l->nsec;
         l->nsec++;
+    }
+}
+
+static void add_symbols(struct linker *l, struct object *o);
+
+/* Bring a parsed object fully into the link: register it, lay out its
+ * allocated sections, and merge its symbols. */
+static void add_object(struct linker *l, struct object *o)
+{
+    if (l->nobj == l->capobj) {
+        l->capobj = l->capobj ? l->capobj * 2 : 8;
+        l->objs = xrealloc(l->objs, (size_t)l->capobj * sizeof *l->objs);
+    }
+    l->objs[l->nobj++] = o;
+    collect_sections(l, o);
+    add_symbols(l, o);
+}
+
+/* ---- static archives (ar format) ---- */
+
+/* The System V / GNU ar header before each member — 60 bytes, ASCII
+ * decimal fields. The member name is what makes it fiddly: a short name
+ * is "name/" (trailing slash); a long name is "/offset" into the "//"
+ * string-table member. The "/" and "//" members are the symbol index
+ * and the string table — skipped, because members are scanned directly. */
+struct ar_hdr {
+    char name[16];
+    char mtime[12];
+    char uid[6];
+    char gid[6];
+    char mode[8];
+    char size[10];
+    char end[2];              /* "`\n" */
+};
+
+static long ar_num(const char *p, int n)
+{
+    long v = 0;
+    for (int i = 0; i < n && p[i] >= '0' && p[i] <= '9'; i++)
+        v = v * 10 + (p[i] - '0');
+    return v;
+}
+
+static int is_archive(const unsigned char *buf, long len)
+{
+    return len >= 8 && memcmp(buf, "!<arch>\n", 8) == 0;
+}
+
+/* Parses an archive into its member list. Long names resolve through the
+ * "//" string table; the "/"/"" symbol-index member is skipped (members
+ * are inspected directly at pull time). */
+static void parse_archive(struct linker *l, const char *name,
+                          unsigned char *buf, long len)
+{
+    struct archive *ar = xcalloc(1, sizeof *ar);
+    ar->name = name;
+    const char *longnames = NULL;
+
+    long off = 8; /* past "!<arch>\n" */
+    while (off + (long)sizeof(struct ar_hdr) <= len) {
+        struct ar_hdr *h = (struct ar_hdr *)(buf + off);
+        if (h->end[0] != '`' || h->end[1] != '\n')
+            die("%s: corrupt archive header at offset %ld", name, off);
+        long msize = ar_num(h->size, 10);
+        long data = off + sizeof(struct ar_hdr);
+
+        /* member name */
+        char mname[256];
+        if (h->name[0] == '/' && h->name[1] == '/') {
+            /* the long-name string table */
+            longnames = (const char *)(buf + data);
+            mname[0] = 0;
+        } else if (h->name[0] == '/' &&
+                   (h->name[1] == ' ' || h->name[1] == 0)) {
+            mname[0] = 0; /* the symbol index — skipped */
+        } else if (h->name[0] == '/') {
+            long noff = ar_num(h->name + 1, 15);
+            const char *s = longnames ? longnames + noff : "?";
+            int k = 0;
+            while (s[k] && s[k] != '/' && s[k] != '\n' && k < 255) {
+                mname[k] = s[k];
+                k++;
+            }
+            mname[k] = 0;
+        } else {
+            int k = 0;
+            while (k < 16 && h->name[k] && h->name[k] != '/' &&
+                   h->name[k] != ' ') {
+                mname[k] = h->name[k];
+                k++;
+            }
+            mname[k] = 0;
+        }
+
+        if (mname[0]) { /* a real object member */
+            if (ar->nmembers % 64 == 0)
+                ar->members = xrealloc(ar->members,
+                    (size_t)(ar->nmembers + 64) * sizeof *ar->members);
+            struct member *m = &ar->members[ar->nmembers++];
+            memset(m, 0, sizeof *m);
+            size_t nlen = strlen(name) + strlen(mname) + 4;
+            char *full = xmalloc(nlen);
+            snprintf(full, nlen, "%s(%s)", name, mname);
+            m->name = full;
+            m->buf = buf + data;
+            m->len = msize;
+        }
+        off = data + msize;
+        if (off & 1)
+            off++; /* members are 2-byte aligned */
+    }
+
+    if (l->narch == l->caparch) {
+        l->caparch = l->caparch ? l->caparch * 2 : 8;
+        l->archives = xrealloc(l->archives,
+                               (size_t)l->caparch * sizeof *l->archives);
+    }
+    l->archives[l->narch++] = ar;
+}
+
+/* Does this parsed object define a symbol that is currently referenced
+ * but undefined? That is exactly the condition to pull an archive
+ * member. */
+static int defines_needed(struct linker *l, struct object *o)
+{
+    for (int i = o->local_syms; i < o->nsym; i++) {
+        Elf64_Sym *sy = &o->syms[i];
+        if (sy->st_shndx == SHN_UNDEF)
+            continue;
+        const char *nm = o->symstr + sy->st_name;
+        if (!*nm)
+            continue;
+        struct symbol *g = sym_find(l, nm);
+        if (g && !g->defined)
+            return 1;
+    }
+    return 0;
+}
+
+/* Pull members to a fixed point: repeatedly, any not-yet-pulled member
+ * that satisfies a still-undefined symbol is linked in — which may
+ * create new undefined symbols an earlier member then satisfies, so the
+ * scan repeats until a whole pass pulls nothing. This handles libc.a's
+ * two-way dependencies (malloc↔sbrk, printf→malloc) without caring about
+ * member order. */
+static void pull_archives(struct linker *l)
+{
+    int progress = 1;
+    while (progress) {
+        progress = 0;
+        for (int a = 0; a < l->narch; a++) {
+            struct archive *ar = l->archives[a];
+            for (int m = 0; m < ar->nmembers; m++) {
+                struct member *mem = &ar->members[m];
+                if (mem->pulled)
+                    continue;
+                if (!mem->obj)
+                    mem->obj = parse_object(mem->name, mem->buf, mem->len);
+                if (!defines_needed(l, mem->obj))
+                    continue;
+                mem->pulled = 1;
+                add_object(l, mem->obj);
+                progress = 1;
+            }
+        }
     }
 }
 
@@ -521,18 +705,23 @@ int embld_link(const char **inputs, int ninputs, const char *out,
     l.base = (opts && opts->base) ? opts->base : DEFAULT_BASE;
     l.entry = (opts && opts->entry) ? opts->entry : "_start";
 
+    /* Explicit objects are always linked; archives are stashed and their
+     * members pulled on demand (left-to-right, as a linker does — so an
+     * archive satisfies references that appear before it on the line). */
     for (int i = 0; i < ninputs; i++) {
         long len;
         unsigned char *buf = read_file(inputs[i], &len);
-        struct object *o = parse_object(inputs[i], buf, len);
-        if (l.nobj == l.capobj) {
-            l.capobj = l.capobj ? l.capobj * 2 : 8;
-            l.objs = xrealloc(l.objs, (size_t)l.capobj * sizeof *l.objs);
+        if (is_archive(buf, len)) {
+            parse_archive(&l, inputs[i], buf, len);
+            pull_archives(&l); /* satisfy what is undefined so far */
+        } else {
+            add_object(&l, parse_object(inputs[i], buf, len));
         }
-        l.objs[l.nobj++] = o;
-        collect_sections(&l, o);
-        add_symbols(&l, o);
     }
+    /* A final fixed-point pass, so a later object's references can still
+     * reach back into an earlier archive (the --start-group behaviour,
+     * always on: correct over order-sensitive). */
+    pull_archives(&l);
 
     Elf64_Addr text_start, data_start;
     Elf64_Xword text_size, data_filesz, data_memsz;

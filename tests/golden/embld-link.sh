@@ -78,7 +78,46 @@ if [ -x "$EMBCC" ]; then
     echo "emb: EmbCC-compiled, EmbLD-linked, exit $got"
 fi
 
-# 4. the ET_EXEC is well-formed: readelf accepts it, it is EXEC not DYN
+# 4. static archives: pull members to satisfy references, to a fixed
+#    point (back-references within the archive), and DEAD members stay
+#    out. Needs the cross ar; skipped cleanly without it.
+AR=/usr/local/cross/bin/x86_64-elf-ar
+if [ -x "$AR" ]; then
+    cat > "$out/lb.c" << 'EOF'
+int used_b(int x){ return x + 1; }
+EOF
+    cat > "$out/la.c" << 'EOF'
+int used_b(int);                       /* satisfied by ANOTHER member */
+int used_a(int x){ return used_b(x) * 2; }
+EOF
+    cat > "$out/lu.c" << 'EOF'
+int unused(int x){ return x - 999; }   /* referenced by nothing */
+EOF
+    for f in lb la lu; do
+        gcc -c -ffreestanding -fno-pie -O0 "$out/$f.c" -o "$out/$f.o"
+    done
+    "$AR" rcs "$out/libtest.a" "$out/la.o" "$out/lb.o" "$out/lu.o"
+    cat > "$out/amain.c" << 'EOF'
+extern int used_a(int);
+static long do_exit(long c){long r;
+  __asm__ volatile("syscall":"=a"(r):"a"(60),"D"(c):"rcx","r11","memory");return r;}
+void _start(void){ do_exit(used_a(20)); }   /* used_b(20)*2 = 42 */
+EOF
+    gcc -c -ffreestanding -fno-pie -O0 "$out/amain.c" -o "$out/amain.o"
+    "$EMBLD" -o "$out/aprog" "$out/amain.o" "$out/libtest.a" || {
+        echo "archive link failed"; exit 1; }
+    chmod +x "$out/aprog"; "$out/aprog"; got=$?
+    [ "$got" -eq 42 ] || { echo "archive link: exit $got, expected 42"; exit 1; }
+    # dead-member proof: linking the archive must equal linking exactly
+    # the two live members explicitly — byte for byte.
+    "$EMBLD" -o "$out/aprog2" "$out/amain.o" "$out/la.o" "$out/lb.o"
+    cmp -s "$out/aprog" "$out/aprog2" || {
+        echo "archive pulled a dead member (image differs from la+lb only)"
+        exit 1; }
+    echo "archive: fixed-point pull + back-ref, dead member excluded, exit 42"
+fi
+
+# 5. the ET_EXEC is well-formed: readelf accepts it, it is EXEC not DYN
 #    (TARGET_ABI §4b: never PIE), entry lands in the executable segment.
 readelf -h "$out/one" | grep -q "EXEC (Executable file)" || {
     echo "output is not ET_EXEC"; exit 1; }

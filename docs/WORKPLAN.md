@@ -96,22 +96,35 @@ objects produced by *gcc and TCC* long before EmbCC's own objects need it.
 Its spec is TARGET_ABI §4, and every expensive fact there is a ready-made
 test case:
 
-- [ ] `R_X86_64_PLT32` resolved as plain `PC32` in a static link
+- [x] `R_X86_64_PLT32` resolved as plain `PC32` in a static link
       (TCC patch 0001 — 407 wild jumps say hello)
 - [ ] the GOT is built AND filled at link time when GOTPCREL appears
-      (TCC patch 0003 — newlib's `_impure_ptr`, `CR2=0` on first stdio)
-- [ ] weak undefined symbols bind to 0, no relocation emitted
-- [ ] archive semantics: members pulled to satisfy undefined symbols,
-      iterated to a fixed point; later a shared object's imports must be
-      satisfiable from archives and re-exported (TARGET_ABI §4b)
-- [ ] output: ET_EXEC (never PIE), correct e_entry via `_start`,
-      PT_LOAD segments the in-kernel loader maps
+      (TCC patch 0003 — newlib's `_impure_ptr`, `CR2=0` on first stdio).
+      Not yet exercised: the M1 program pulls no GOTPCREL member — the
+      next increment, needed for a stdio program
+- [x] weak undefined symbols bind to 0, no relocation emitted
+      (crt0's `__init_array_start`/`__tls_*` bracket symbols — how B1
+      linked with no linker-script-defined symbols)
+- [x] archive semantics: members pulled to satisfy undefined symbols,
+      iterated to a fixed point (libc.a's two-way deps); dead members
+      excluded, proven byte-identical to linking the live members alone
+- [x] output: ET_EXEC (never PIE), correct e_entry via `_start`,
+      two PT_LOAD segments (W^X) the in-kernel loader maps
 
-**Definition of done for the first milestone (B1):** link
-`crt0.o + syscalls.o + embcc-object + libc.a` into an ET_EXEC that runs on
-EmbLinkOS — the M1 program, but linked by ours instead of cross-ld. Every
-step proven on the host first with readelf/objdump diffs against what
-cross-ld produces from identical inputs (DECISIONS D-005).
+**B1 — DONE (2026-07-24).** EmbLD linked the M1 program
+(`crt0.o + syscalls.o + EmbCC-object + libc.a`) into an ET_EXEC, and the
+EmbLinkOS kernel ran it: `[syscall] exit code=0x2A` — exit 42, no
+cross-ld anywhere. Proven on the host first (structure vs cross-ld from
+identical inputs — the data segment byte-for-byte the same; D-005), then
+on the OS. `tests/golden/embld-b1.sh` keeps the host half green;
+`embld-link.sh` covers the linker's mechanics.
+
+**Next (B2), toward self-hosting (M3):** the GOT (GOTPCREL, built AND
+filled — the first stdio program needs it, TCC patch 0003); real
+`__init_array` bracket symbols (B1's weak-→0 is correct only because the
+array is empty — a program with constructors needs the true bounds);
+COMMON placed into a synthetic `.bss`; then link EmbCC's OWN sources and
+close the stage1/stage2 fixed point.
 
 **Contract B also consumes:** `src/embx/embx.h` — the EMBX container,
 byte-exact, mirroring the kernel's `embx.h` (which is the authority).
