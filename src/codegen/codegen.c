@@ -180,10 +180,21 @@ static void gen_func(struct ir_func *fn, struct code *text,
             enum arg_class cls[2];
             int n = ty_classify(pt, cls);
             if (pt->kind != TY_STRUCT) {
-                if (ty_is_float(pt))
+                /* Register file exhausted -> the argument arrived on the
+                 * caller's stack at [rbp+incoming] (mirrors the caller's
+                 * on_stack decision in irgen). Copy the eightbyte into the
+                 * local; without this the 7th+ integer parameter read a
+                 * nonexistent register (argregs[6]). */
+                int in_reg = ty_is_float(pt) ? (freg < 8) : (ireg < 6);
+                if (!in_reg) {
+                    x86_load_reg_mem(text, REG_RAX, REG_RBP, incoming, 8);
+                    x86_store_slot(text, sd[i], 8);
+                    incoming += 8;
+                } else if (ty_is_float(pt)) {
                     x86_movs_store(text, freg++, sd[i], ty_size(pt));
-                else
+                } else {
                     x86_store_arg(text, ireg++, sd[i]);
+                }
                 continue;
             }
             if (n == 0) {
