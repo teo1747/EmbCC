@@ -5,8 +5,21 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position: M2 COMPLETE; M3 self-hosting — host acceptance DONE
-2026-07-24; the byte-identical fixed point is the remaining on-OS step.**
+**Current position: M2 COMPLETE; M3 self-hosting — the self-built compiler
+RUNS ON THE OS and compiles correctly (2026-07-24); the stage1==stage2
+byte-identical fixed point is the last step.** The decisive on-OS proof:
+`embcc.elf` — itself compiled by EmbCC and linked by EmbLD — was staged to
+the OS and ran under the kernel `test embcc` oracle. It compiled the M1
+program (source → object) on EmbLinkOS, tcc linked the EmbCC-produced
+object against crt0/syscalls/libc, and the kernel ran the result to
+**exit 0x2A = 42**. The self-hosted compiler is a working compiler on the
+OS. That run also earned D-005: it caught a codegen bug all 54 host tests
+missed — the 7th+ scalar parameter was read from a phantom register
+instead of the incoming stack slot, so EmbCC's own ten-argument
+`codegen_unit` page-faulted writing a NULL `*next`. Fixed
+(tests/exec/many-params.c), and the self-built compiler then ran clean.
+
+**Host acceptance (also 2026-07-24):**
 EmbCC now compiles **all twelve of its own source files**, and EmbLD
 links them against the real crt0/syscalls/newlib into a well-formed
 EmbLinkOS `ET_EXEC` (`embcc-stage1.elf`, ~704 KB) with every symbol
