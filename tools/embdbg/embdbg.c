@@ -891,6 +891,151 @@ static void cmd_info(struct img *m, int argc, char **argv)
 }
 
 /* ===================================================================== *
+ * Crash analyzer (EmbDBG spec §5). Turns a kernel fault dump into a
+ * diagnosis, fully offline: exception + faulting address, a register dump, a
+ * SYMBOLIZED stack trace (walking the rbp chain through the dumped stack
+ * words), the locals in scope at the crash, and the instructions around RIP.
+ *
+ * Input: a simple, deterministic text crash report a fault handler can print.
+ *   exception <NAME>
+ *   fault <hexaddr>            faulting address (cr2 for a page fault); optional
+ *   reg <name> <hexval>        rip/rsp/rbp/rax/... — one per line
+ *   mem <hexaddr> <hexu64>     a stack word (LE u64 at addr), enough of the
+ *                              rbp chain to unwind; the handler dumps the words
+ *                              it walks, or a region as these lines
+ * Code addresses (rip, return addresses) share the binary's address space;
+ * stack addresses (rsp/rbp/mem) are their own. FILE supplies symbols/locals
+ * (and .text for the disassembly window).
+ * ===================================================================== */
+struct crash {
+    char exc[64]; int have_fault; unsigned long fault;
+    char rname[40][8]; unsigned long rval[40]; int nreg;
+    unsigned long maddr[256], mval[256]; int nmem;
+};
+static unsigned long crash_reg(struct crash *c, const char *n, int *ok)
+{
+    for (int i = 0; i < c->nreg; i++)
+        if (strcmp(c->rname[i], n) == 0) { if (ok) *ok = 1; return c->rval[i]; }
+    if (ok) *ok = 0;
+    return 0;
+}
+static unsigned long crash_mem(struct crash *c, unsigned long a, int *ok)
+{
+    for (int i = 0; i < c->nmem; i++)
+        if (c->maddr[i] == a) { if (ok) *ok = 1; return c->mval[i]; }
+    if (ok) *ok = 0;
+    return 0;
+}
+static void parse_crash(const char *path, struct crash *c)
+{
+    memset(c, 0, sizeof *c);
+    FILE *f = fopen(path, "r");
+    if (!f) die("cannot open crash report");
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char k[32], a[64], b[64];
+        int nf = sscanf(line, "%31s %63s %63s", k, a, b);
+        if (nf < 1 || k[0] == '#') continue;
+        if (strcmp(k, "exception") == 0 && nf >= 2) {
+            strncpy(c->exc, a, sizeof c->exc - 1);
+        } else if (strcmp(k, "fault") == 0 && nf >= 2) {
+            c->have_fault = 1; c->fault = strtoul(a, NULL, 0);
+        } else if (strcmp(k, "reg") == 0 && nf >= 3 && c->nreg < 40) {
+            strncpy(c->rname[c->nreg], a, 7);
+            c->rval[c->nreg++] = strtoul(b, NULL, 0);
+        } else if (strcmp(k, "mem") == 0 && nf >= 3 && c->nmem < 256) {
+            c->maddr[c->nmem] = strtoul(a, NULL, 0);
+            c->mval[c->nmem++] = strtoul(b, NULL, 0);
+        }
+    }
+    fclose(f);
+}
+
+/* Symbolize a code address inline: "func+off  file:line". */
+static void print_loc(struct img *m, unsigned long a)
+{
+    const struct func *f = func_at(m, a);
+    const struct row *r = line_at(m, a);
+    if (f) printf("%s+0x%lx", f->name, a - f->addr); else printf("??");
+    if (r) printf("  %s:%d", file_name(m, r->file), r->line);
+}
+
+static void cmd_crash(struct img *m, int argc, char **argv)
+{
+    if (argc < 1) die("crash needs a report file");
+    struct crash c; parse_crash(argv[0], &c);
+    int ok;
+    unsigned long rip = crash_reg(&c, "rip", &ok);
+    unsigned long rbp = crash_reg(&c, "rbp", &ok);
+
+    printf("=== EmbDBG Crash Analysis ===\n");
+    printf("Exception: %s", c.exc[0] ? c.exc : "(unknown)");
+    if (c.have_fault) printf("    faulting address 0x%lx", c.fault);
+    printf("\n");
+    printf("RIP: 0x%lx  ", rip); print_loc(m, rip); printf("\n\n");
+
+    printf("Registers:\n");
+    for (int i = 0; i < c.nreg; i++) {
+        printf("  %-4s 0x%016lx", c.rname[i], c.rval[i]);
+        if ((i % 3) == 2) printf("\n");
+    }
+    if (c.nreg % 3) printf("\n");
+    printf("\n");
+
+    /* Stack trace: frame 0 is RIP; walk the rbp chain through the dumped
+     * words. return addr at *(rbp+8), caller rbp at *(rbp). Stop when a word
+     * is missing, rbp doesn't advance, or a return address is in no function. */
+    printf("Backtrace:\n");
+    printf("  #0  0x%lx  ", rip); print_loc(m, rip); printf("\n");
+    unsigned long fp = rbp;
+    for (int depth = 1; depth < 64; depth++) {
+        int okr, okf;
+        unsigned long ret = crash_mem(&c, fp + 8, &okr);
+        unsigned long caller = crash_mem(&c, fp, &okf);
+        if (!okr || !ret) break;
+        if (!func_at(m, ret)) { printf("  #%-2d 0x%lx  ??\n", depth, ret); break; }
+        printf("  #%-2d 0x%lx  ", depth, ret); print_loc(m, ret); printf("\n");
+        if (!okf || caller <= fp) break;      /* chain must climb */
+        fp = caller;
+    }
+    printf("\n");
+
+    /* Locals in scope at the crash frame. */
+    const struct dfunc *d = dfunc_at(m, rip);
+    if (d) {
+        printf("Locals at #0 (%s):\n", d->name);
+        list_vars(m, d);
+        printf("\n");
+    }
+
+    /* Instructions around RIP (a window in the faulting function). */
+    unsigned long tsize = 0;
+    const unsigned char *text = text_bytes(m, &tsize);
+    const struct func *f = func_at(m, rip);
+    if (text && f) {
+        printf("Near RIP:\n");
+        unsigned long addrs[4096]; char texts[4096][80]; int lens[4096], nins = 0;
+        for (unsigned long a = f->addr; a < f->addr + f->size && nins < 4096; ) {
+            char t[128];
+            int len = decode_one(text + a, (int)(f->addr + f->size - a), a, t);
+            addrs[nins] = a; lens[nins] = len;
+            snprintf(texts[nins], sizeof texts[nins], "%.79s", t);
+            nins++; a += (unsigned long)len;
+        }
+        int at = -1;
+        for (int i = 0; i < nins; i++) if (addrs[i] == rip) { at = i; break; }
+        int lo = at < 0 ? 0 : (at - 4 < 0 ? 0 : at - 4);
+        int hi = at < 0 ? (nins < 9 ? nins : 9) : (at + 5 > nins ? nins : at + 5);
+        for (int i = lo; i < hi; i++) {
+            printf("  %s %6lx:\t", addrs[i] == rip ? "->" : "  ", addrs[i]);
+            for (int b = 0; b < lens[i]; b++) printf("%02x ", text[addrs[i] + b]);
+            for (int b = lens[i]; b < 8; b++) printf("   ");
+            printf("\t%s\n", texts[i]);
+        }
+    }
+}
+
+/* ===================================================================== *
  * Native .embdbg — myos/docs/EMBDBG_Specification.md v1.
  *
  * The owned debug format (D-010: DWARF is the bridge, .embdbg the destination).
@@ -1559,6 +1704,7 @@ int main(int argc, char **argv)
             "       embdbg FILE list ADDR           source lines around addr\n"
             "       embdbg FILE info FUNC           a function's params/locals\n"
             "       embdbg FILE disassemble FUNC    x86-64 disassembly + mixed source\n"
+            "       embdbg FILE crash REPORT        analyze a kernel fault dump\n"
             "       embdbg FILE tui                 interactive browser (plain dump if piped)\n"
             "       embdbg FILE.o emit OUT.embdbg   convert DWARF -> native .embdbg\n"
             "   FILE may be an ELF (reads DWARF) or a .embdbg (reads it natively).\n");
@@ -1596,6 +1742,7 @@ int main(int argc, char **argv)
     else if (strcmp(cmd, "list") == 0)      cmd_list(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "info") == 0)      cmd_info(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "disassemble") == 0) cmd_disassemble(&m, argc - 3, argv + 3);
+    else if (strcmp(cmd, "crash") == 0)     cmd_crash(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "tui") == 0)       cmd_tui(&m);
     else { fprintf(stderr, "embdbg: unknown command '%s'\n", cmd); return 1; }
     return 0;
