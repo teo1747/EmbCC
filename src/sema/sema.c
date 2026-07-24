@@ -1133,11 +1133,33 @@ static int has_own_break(struct stmt *s)
     return 0;
 }
 
+/* Functions that never return, so a call to one terminates control flow
+ * as surely as `return`. The noreturn attribute newlib puts on exit/abort
+ * is stripped before EmbCC sees it (EmbCC does not parse __attribute__,
+ * and _ATTRIBUTE expands empty for a non-GNU compiler), so the set is
+ * recognized by name — sound because these genuinely never return, and
+ * the worst case of a same-named user function is a missed diagnostic,
+ * never a miscompile. diag_fatal is EmbCC's own, used at many tails. */
+static int is_noreturn_call(const struct expr *e)
+{
+    if (e->kind != EXPR_CALL || !e->name)
+        return 0;
+    static const char *const nr[] = {
+        "exit", "abort", "_Exit", "diag_fatal",
+    };
+    for (unsigned i = 0; i < sizeof nr / sizeof *nr; i++)
+        if (strcmp(e->name, nr[i]) == 0)
+            return 1;
+    return 0;
+}
+
 static int stmt_returns(struct stmt *s)
 {
     switch (s->kind) {
     case STMT_RETURN:
         return 1;
+    case STMT_EXPR:
+        return s->expr && is_noreturn_call(s->expr);
     case STMT_BLOCK:
         return list_returns(s->body);
     case STMT_IF:

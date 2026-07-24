@@ -102,6 +102,14 @@ static int cc_for(enum binop pred, int sign)
     }
 }
 
+/* A pending branch: where its rel32 displacement must be patched, and the
+ * label it targets. File scope because EmbCC's own subset (which compiles
+ * this file) does not permit block-scope struct definitions. */
+struct brsite {
+    int patch_off;
+    int label;
+};
+
 static void gen_func(struct ir_func *fn, struct code *text,
                      struct sites *st)
 {
@@ -117,10 +125,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
                              * sizeof *label_off);
     for (int i = 0; i < fn->nlabels; i++)
         label_off[i] = -1;
-    struct brsite {
-        int patch_off;
-        int label;
-    } *brs = NULL;
+    struct brsite *brs = NULL;
     int nbrs = 0, capbrs = 0;
 
     code_align(text, 16, 0x90);
