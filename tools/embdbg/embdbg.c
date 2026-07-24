@@ -1151,22 +1151,85 @@ static void cmd_tui(struct img *m)
     else tui_plain(m);            /* piped/non-tty: a scriptable full dump */
 }
 
-/* Link-time entry point (used by EmbLD): parse one relocatable object's DWARF
- * with `addr_bias` = its final .text vaddr so addresses come out absolute,
- * and write a .embdbg whose build_id is the SHA-256 of the linked `image`. */
-int embdbg_emit_object(const unsigned char *obj, long objlen, long addr_bias,
-                       const unsigned char *image, long imagelen,
-                       const char *out)
+/* Parse one relocatable object's DWARF into a fresh model, biasing every code
+ * address by `bias` (its final .text vaddr) so a .o's .text-relative addresses
+ * come out absolute. */
+static void img_parse(struct img *t, const unsigned char *obj, long len, long bias)
 {
-    struct img m; memset(&m, 0, sizeof m);
-    m.b = (unsigned char *)obj; m.len = objlen;
-    g_addr_bias = addr_bias;
-    load_sections(&m);
-    load_funcs(&m);
-    decode_lines(&m);
-    decode_info(&m);
-    write_embdbg(&m, out, image, imagelen);
+    memset(t, 0, sizeof *t);
+    t->b = (unsigned char *)obj; t->len = len;
+    g_addr_bias = bias;
+    load_sections(t);
+    load_funcs(t);
+    decode_lines(t);
+    decode_info(t);
     g_addr_bias = 0;
+}
+
+/* Intern a source file into the accumulator's 1-based file list (dedup by
+ * path, so the same source shared by two objects is one FILES row). */
+static int acc_file(struct img *acc, const char *path)
+{
+    for (int i = 1; i < acc->nfiles; i++)
+        if (acc->files[i] && strcmp(acc->files[i], path) == 0) return i;
+    acc->files = realloc(acc->files, (size_t)(acc->nfiles + 1) * sizeof(char *));
+    acc->files[acc->nfiles] = (char *)path;
+    return acc->nfiles++;
+}
+
+/* Link-time entry point (used by EmbLD): merge the DWARF of one OR MORE debug
+ * objects — each biased by its own final .text vaddr — into a single model and
+ * write a .embdbg whose build_id is SHA-256 of the linked `image`. Merging
+ * needs two rebases so nothing collides: each object's type-offset keys are
+ * shifted into their own 2^32 band (the keys are opaque — write_embdbg assigns
+ * the real TYPES-blob offsets), and its file indices are remapped through the
+ * deduped accumulator list. Addresses are already absolute via the bias, so
+ * funcs and line rows just concatenate. */
+int embdbg_emit_objects(const unsigned char **objs, const long *lens,
+                        const long *biases, int n,
+                        const unsigned char *image, long imagelen,
+                        const char *out)
+{
+    struct img acc; memset(&acc, 0, sizeof acc);
+    acc.nfiles = 1;
+    acc.files = calloc(1, sizeof(char *));      /* index 0 unused */
+
+    for (int i = 0; i < n; i++) {
+        struct img t;
+        img_parse(&t, objs[i], lens[i], biases[i]);
+        unsigned long tb = (unsigned long)(i + 1) << 32;   /* type-key band */
+
+        int *fmap = calloc((size_t)(t.nfiles > 0 ? t.nfiles : 1), sizeof(int));
+        for (int f = 1; f < t.nfiles; f++) fmap[f] = acc_file(&acc, t.files[f]);
+
+        for (int r = 0; r < t.nrows; r++) {
+            int fi = 0;
+            if (!t.rows[r].end && t.rows[r].file >= 1 && t.rows[r].file < t.nfiles)
+                fi = fmap[t.rows[r].file];
+            add_row(&acc, t.rows[r].addr, fi, t.rows[r].line, t.rows[r].end);
+        }
+        for (int k = 0; k < t.ntypes; k++) {
+            acc.types = realloc(acc.types, (size_t)(acc.ntypes + 1) * sizeof *acc.types);
+            struct dtype dt = t.types[k];
+            dt.off += tb;
+            if (dt.is_ptr && dt.pointee) dt.pointee += tb;
+            acc.types[acc.ntypes++] = dt;
+        }
+        for (int d = 0; d < t.ndfn; d++) {
+            struct dfunc df = t.dfn[d];             /* transfers the vars array */
+            for (int v = 0; v < df.nvars; v++)
+                if (df.vars[v].type_off) df.vars[v].type_off += tb;
+            acc.dfn = realloc(acc.dfn, (size_t)(acc.ndfn + 1) * sizeof *acc.dfn);
+            acc.dfn[acc.ndfn++] = df;
+        }
+        for (int fi = 0; fi < t.nfn; fi++) {
+            acc.fn = realloc(acc.fn, (size_t)(acc.nfn + 1) * sizeof *acc.fn);
+            acc.fn[acc.nfn++] = t.fn[fi];
+        }
+        free(fmap);
+    }
+
+    write_embdbg(&acc, out, image, imagelen);
     return 0;
 }
 

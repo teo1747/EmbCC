@@ -787,47 +787,47 @@ static unsigned char *read_file(const char *path, long *len);
  * emits ET_REL objects with .text-relative debug addresses; the link is what
  * makes them absolute, so this belongs HERE, not in the compiler.
  *
- * v1 scope: the FIRST directly-listed input object that carries .debug_line.
- * Archive members are skipped — newlib's libc.a ships with debug info, but the
- * intent of a -g link is to debug YOUR object, not an incidentally-pulled libc
- * member. One debug object is the common case (you compile your program with
- * -g; crt0/syscalls/libc do not). Merging several objects' debug info into one
- * .embdbg is a stated next step (it needs multi-CU handling), announced rather
- * than silently partial. */
+ * Every directly-listed input object that carries .debug_line is merged into
+ * one .embdbg, each biased by its own final .text vaddr. Archive members are
+ * skipped — newlib's libc.a ships with debug info, but the intent of a -g link
+ * is to debug YOUR objects, not incidentally-pulled libc members (this also
+ * keeps a link with no -g object, like self-host, from emitting a sidecar). */
 static void emit_embdbg(struct linker *l, const char *out)
 {
+    const unsigned char **objs = xmalloc((size_t)(l->nobj ? l->nobj : 1) * sizeof *objs);
+    long *lens = xmalloc((size_t)(l->nobj ? l->nobj : 1) * sizeof *lens);
+    long *biases = xmalloc((size_t)(l->nobj ? l->nobj : 1) * sizeof *biases);
+    int n = 0;
+
     for (int i = 0; i < l->nobj; i++) {
         struct object *o = l->objs[i];
         if (strchr(o->name, '('))       /* "libc.a(member.o)" — an archive member */
             continue;
-        int has_dbg = 0, text_idx = -1, other_dbg = 0;
+        int has_dbg = 0, text_idx = -1;
         for (int s = 0; s < o->nsh; s++) {
             const char *nm = o->shstr + o->shdrs[s].sh_name;
             if (strcmp(nm, ".debug_line") == 0) has_dbg = 1;
             if (strcmp(nm, ".text") == 0) text_idx = s;
         }
         if (!has_dbg) continue;
-        /* note (do not merge) any further directly-listed debug objects */
-        for (int k = i + 1; k < l->nobj; k++) {
-            struct object *o2 = l->objs[k];
-            if (strchr(o2->name, '(')) continue;
-            for (int s = 0; s < o2->nsh; s++)
-                if (strcmp(o2->shstr + o2->shdrs[s].sh_name, ".debug_line") == 0)
-                    { other_dbg = 1; break; }
-        }
         Elf64_Addr tv = 0;
         if (text_idx >= 0 && o->sec_out[text_idx] >= 0)
             tv = l->insecs[o->sec_out[text_idx]].vaddr;
+        objs[n] = o->buf; lens[n] = o->len; biases[n] = (long)tv;
+        n++;
+    }
+
+    if (n) {
         long ilen;
         unsigned char *img = read_file(out, &ilen);
         char emb[4096];
         snprintf(emb, sizeof emb, "%s.embdbg", out);
-        embdbg_emit_object(o->buf, o->len, (long)tv, img, ilen, emb);
+        embdbg_emit_objects(objs, lens, biases, n, img, ilen, emb);
         free(img);
-        fprintf(stderr, "embld: wrote %s (debug info for %s%s)\n",
-                emb, o->name, other_dbg ? "; other debug objects not yet merged" : "");
-        return;
+        fprintf(stderr, "embld: wrote %s (debug info from %d object%s)\n",
+                emb, n, n == 1 ? "" : "s");
     }
+    free(objs); free(lens); free(biases);
 }
 
 /* ---- driver ---- */
