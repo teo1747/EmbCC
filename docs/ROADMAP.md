@@ -5,19 +5,24 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position: M2 COMPLETE; M3 self-hosting — the self-built compiler
-RUNS ON THE OS and compiles correctly (2026-07-24); the stage1==stage2
-byte-identical fixed point is the last step.** The decisive on-OS proof:
-`embcc.elf` — itself compiled by EmbCC and linked by EmbLD — was staged to
-the OS and ran under the kernel `test embcc` oracle. It compiled the M1
-program (source → object) on EmbLinkOS, tcc linked the EmbCC-produced
-object against crt0/syscalls/libc, and the kernel ran the result to
-**exit 0x2A = 42**. The self-hosted compiler is a working compiler on the
-OS. That run also earned D-005: it caught a codegen bug all 54 host tests
-missed — the 7th+ scalar parameter was read from a phantom register
-instead of the incoming stack slot, so EmbCC's own ten-argument
-`codegen_unit` page-faulted writing a NULL `*next`. Fixed
-(tests/exec/many-params.c), and the self-built compiler then ran clean.
+**Current position: M3 COMPLETE — EmbCC self-hosts, and the fixed point is
+closed ON THE OS (2026-07-24).** The self-built compiler (`embcc.elf`,
+itself compiled by EmbCC and linked by EmbLD) was staged to EmbLinkOS and,
+under the kernel `test embcc self` oracle, **recompiled all twelve of its
+own source files on the OS — every object byte-for-byte identical to the
+reference the host's gcc-built embcc produced** (`12/12 objects
+byte-identical`). A compiler and the compiler it produces agree exactly:
+the classic bootstrap fixed point, closed on the target OS itself. STT_FILE
+uses the source basename, so an object depends on content, not on the build
+path, which is what lets host and OS objects match bit-for-bit.
+
+Getting there, the on-OS runs earned D-005 twice over: the first `test
+embcc` run (the M1 program compiled on the OS, tcc-linked, **exit 0x2A =
+42**) page-faulted until a codegen bug all 54 host tests missed was fixed —
+the 7th+ scalar parameter was read from a phantom register instead of the
+incoming stack slot, so EmbCC's own ten-argument `codegen_unit` wrote a
+NULL `*next` (tests/exec/many-params.c). With that fixed the compiler ran
+clean, and then reproduced itself exactly.
 
 **Host acceptance (also 2026-07-24):**
 EmbCC now compiles **all twelve of its own source files**, and EmbLD
@@ -177,6 +182,20 @@ cross-check EmbBuild and TCC were each held to.
 3. **`embcc-stage2` is byte-identical to `embcc-stage1`** (the classic
    fixed-point check — it catches whole classes of codegen bugs nothing else
    will), and `embcc-stage2` still passes M1 and M2's tests
+
+**DONE — 2026-07-24, all three stages, the fixed point closed on the OS:**
+1. The gcc-built `embcc` compiles all twelve sources; EmbLD links them into
+   a resolved EmbLinkOS `ET_EXEC` (tests/golden/self-host.sh). Codegen is
+   deterministic — objects byte-identical across runs.
+2 & 3. That `embcc.elf`, staged to EmbLinkOS, ran under the kernel `test
+   embcc self` oracle and recompiled all twelve sources ON THE OS: **12/12
+   objects byte-identical** to stage1's own reference objects — a compiler
+   reproducing itself exactly (stage1 ≡ stage2 at the object level). And
+   `test embcc` had already shown stage1 compiles the M1 program on the OS
+   to a running, tcc-linked **exit 42**. The basename-only STT_FILE (an
+   object depends on content, not build path) is what makes host and OS
+   objects match. The on-OS bringup earned D-005 by catching the
+   stack-parameter codegen bug the whole host suite missed.
 
 ---
 
