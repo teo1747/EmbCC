@@ -92,6 +92,17 @@ static const char *default_output(const char *in)
     return out;
 }
 
+/* The final path component. The STT_FILE symbol uses this rather than the
+ * path as given, so an object depends only on the source's CONTENT, not on
+ * where the build ran — build-path independence, which is what lets the
+ * self-hosting fixed point hold when the host compiles src/x.c and the OS
+ * compiles /data/src/embcc/x.c and the two objects must be byte-identical. */
+static const char *path_basename(const char *p)
+{
+    const char *slash = strrchr(p, '/');
+    return slash ? slash + 1 : p;
+}
+
 #define MAX_INCDIRS 16
 static const char *incdirs[MAX_INCDIRS];
 static int nincdirs;
@@ -191,7 +202,7 @@ static int compile(const char *in, const char *out, int pp_only)
         bss_ndx = elfw_add_section(w, ".bss", SHT_NOBITS,
                                    SHF_ALLOC | SHF_WRITE, NULL,
                                    (Elf64_Xword)bss_len, 8);
-    elfw_add_symbol(w, in, 0, 0,
+    elfw_add_symbol(w, path_basename(in), 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_FILE), SHN_ABS);
     elfw_add_symbol(w, "", 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_SECTION),
