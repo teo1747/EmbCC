@@ -153,6 +153,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
     struct brsite *brs = NULL;
     int nbrs = 0, capbrs = 0;
 
+    /* -g: expose each source variable's frame slot (rbp-relative) so the
+     * DWARF emitter can write DW_OP_fbreg. sd is indexed by vreg; params and
+     * locals are vregs [0, nvars), which is what dbgvars reference. */
+    if (g_want_debug) {
+        int nv = fn->src->nvars ? fn->src->nvars : 1;
+        fn->var_off = xmalloc((size_t)nv * sizeof *fn->var_off);
+        for (int v = 0; v < fn->src->nvars; v++)
+            fn->var_off[v] = sd[v];
+    }
+
     code_align(text, 16, 0x90);
     f->code_off = text->len;
 

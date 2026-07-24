@@ -128,6 +128,13 @@ struct ir_ins {
  * using the function's code_off/code_len (on struct func). */
 struct ir_line { int off; int line; };
 
+/* -g: a source-level variable (parameter or local). Its storage is the frame
+ * slot of vreg `vreg`; irgen records name/vreg/type, codegen fills the slot's
+ * rbp-relative offset into ir_func.var_off[vreg], and the DWARF emitter turns
+ * the pair into DW_AT_location = DW_OP_fbreg(offset). Statics are excluded —
+ * they are globals, not frame storage. */
+struct ir_dbgvar { const char *name; int vreg; int is_param; struct type *ty; };
+
 struct ir_func {
     struct func *src;        /* name, linkage, code_off/len live here */
     int nvregs;
@@ -138,6 +145,9 @@ struct ir_func {
     int nins, cap;
     struct ir_line *lines;   /* -g: (offset, line) rows in .text order */
     int nlines, linecap;
+    struct ir_dbgvar *dbgvars; /* -g: params + locals (irgen) */
+    int ndbgvars, dbgvarcap;
+    int *var_off;            /* -g: rbp-relative slot offset per vreg (codegen) */
 };
 
 /* One .rodata string; offsets are assigned sequentially at collection

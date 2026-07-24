@@ -6,21 +6,62 @@
 #include "../driver/util.h"
 
 /* --- DWARF constants (only the handful this emitter uses) --- */
-#define DW_TAG_compile_unit   0x11
+#define DW_TAG_compile_unit     0x11
+#define DW_TAG_subprogram       0x2e
+#define DW_TAG_formal_parameter 0x05
+#define DW_TAG_variable         0x34
+#define DW_TAG_base_type        0x24
+#define DW_TAG_pointer_type     0x0f
 #define DW_CHILDREN_no        0x00
+#define DW_CHILDREN_yes       0x01
 #define DW_AT_name            0x03
+#define DW_AT_byte_size       0x0b
 #define DW_AT_stmt_list       0x10
 #define DW_AT_low_pc          0x11
 #define DW_AT_high_pc         0x12
 #define DW_AT_language        0x13
-#define DW_AT_producer        0x25
 #define DW_AT_comp_dir        0x1b
+#define DW_AT_producer        0x25
+#define DW_AT_encoding        0x3e
+#define DW_AT_frame_base      0x40
+#define DW_AT_type            0x49
+#define DW_AT_location        0x02
 #define DW_FORM_addr          0x01
+#define DW_FORM_block1        0x0a
+#define DW_FORM_data1         0x0b
 #define DW_FORM_data2         0x05
 #define DW_FORM_data4         0x06
 #define DW_FORM_string        0x08
+#define DW_FORM_ref4          0x13
 #define DW_FORM_sec_offset    0x17
+#define DW_FORM_exprloc       0x18
 #define DW_LANG_C99           0x000c
+/* DW_ATE base-type encodings */
+#define DW_ATE_boolean        0x02
+#define DW_ATE_float          0x04
+#define DW_ATE_signed         0x05
+#define DW_ATE_signed_char    0x06
+#define DW_ATE_unsigned       0x07
+#define DW_ATE_unsigned_char  0x08
+/* location/frame-base operations */
+#define DW_OP_fbreg           0x91
+#define DW_OP_reg6            0x56   /* rbp — EmbCC's frame pointer */
+
+/* Abbreviation codes, shared by emit_abbrev and emit_info. Two each for
+ * parameter/variable and pointer: the "with type" form carries DW_AT_type,
+ * the plain form omits it (an abbrev's attribute list is fixed, so a type we
+ * cannot yet describe — an aggregate, step 3 — needs its own abbrev rather
+ * than a stale DW_AT_type; THE RULE: no confidently-wrong type). */
+#define AB_CU            1
+#define AB_SUBPROGRAM    2
+#define AB_PARAM_T       3   /* formal_parameter, with type */
+#define AB_PARAM         4   /* formal_parameter, no type */
+#define AB_VAR_T         5   /* variable, with type */
+#define AB_VAR           6   /* variable, no type */
+#define AB_BASE          7   /* base_type */
+#define AB_PTR_T         8   /* pointer_type, with type */
+#define AB_PTR           9   /* pointer_type, no type (void *) */
+#define AB_SUBPROGRAM_T 10   /* subprogram, with a return type */
 
 /* Line-program standard opcodes */
 #define DW_LNS_copy           0x01
@@ -114,26 +155,146 @@ static void reloc(struct dwarf_out *out, int in_sec, int at_off, int width,
     r->addend = addend;
 }
 
-/* --- .debug_abbrev: a single compile_unit abbreviation (code 1) --- */
+/* One abbreviation: code, tag, has-children, then (attr, form) pairs ended by
+ * (0,0). The variadic-free spelling — a small (attr,form) array — keeps this
+ * inside EmbCC's own subset (which compiles this file for self-hosting). */
+static void one_abbrev(struct dbuf *b, int code, int tag, int children,
+                       const unsigned char *pairs, int npairs)
+{
+    db_uleb(b, code);
+    db_uleb(b, tag);
+    db_u8(b, children);
+    for (int i = 0; i < npairs; i++) {
+        db_uleb(b, pairs[2 * i]);
+        db_uleb(b, pairs[2 * i + 1]);
+    }
+    db_uleb(b, 0); db_uleb(b, 0);
+}
+
+/* --- .debug_abbrev: compile_unit + subprogram/param/var + base/pointer. --- */
 static void emit_abbrev(struct dbuf *b)
 {
-    db_uleb(b, 1);                       /* abbrev code */
-    db_uleb(b, DW_TAG_compile_unit);
-    db_u8(b, DW_CHILDREN_no);
-    db_uleb(b, DW_AT_producer);  db_uleb(b, DW_FORM_string);
-    db_uleb(b, DW_AT_language);  db_uleb(b, DW_FORM_data2);
-    db_uleb(b, DW_AT_name);      db_uleb(b, DW_FORM_string);
-    db_uleb(b, DW_AT_comp_dir);  db_uleb(b, DW_FORM_string);
-    db_uleb(b, DW_AT_low_pc);    db_uleb(b, DW_FORM_addr);
-    db_uleb(b, DW_AT_high_pc);   db_uleb(b, DW_FORM_addr);
-    db_uleb(b, DW_AT_stmt_list); db_uleb(b, DW_FORM_sec_offset);
-    db_uleb(b, 0); db_uleb(b, 0);        /* end of this abbrev's attrs */
+    static const unsigned char cu[] = {
+        DW_AT_producer,  DW_FORM_string, DW_AT_language, DW_FORM_data2,
+        DW_AT_name,      DW_FORM_string, DW_AT_comp_dir, DW_FORM_string,
+        DW_AT_low_pc,    DW_FORM_addr,   DW_AT_high_pc,  DW_FORM_addr,
+        DW_AT_stmt_list, DW_FORM_sec_offset };
+    static const unsigned char sub[] = {
+        DW_AT_name,       DW_FORM_string, DW_AT_low_pc,     DW_FORM_addr,
+        DW_AT_high_pc,    DW_FORM_addr,   DW_AT_frame_base, DW_FORM_exprloc };
+    static const unsigned char sub_t[] = {
+        DW_AT_name,       DW_FORM_string, DW_AT_type,       DW_FORM_ref4,
+        DW_AT_low_pc,     DW_FORM_addr,   DW_AT_high_pc,    DW_FORM_addr,
+        DW_AT_frame_base, DW_FORM_exprloc };
+    static const unsigned char param_t[] = {
+        DW_AT_name, DW_FORM_string, DW_AT_type, DW_FORM_ref4,
+        DW_AT_location, DW_FORM_exprloc };
+    static const unsigned char param[] = {
+        DW_AT_name, DW_FORM_string, DW_AT_location, DW_FORM_exprloc };
+    static const unsigned char base[] = {
+        DW_AT_name, DW_FORM_string, DW_AT_encoding, DW_FORM_data1,
+        DW_AT_byte_size, DW_FORM_data1 };
+    static const unsigned char ptr_t[] = {
+        DW_AT_type, DW_FORM_ref4, DW_AT_byte_size, DW_FORM_data1 };
+    static const unsigned char ptr[] = {
+        DW_AT_byte_size, DW_FORM_data1 };
+
+    one_abbrev(b, AB_CU,         DW_TAG_compile_unit,     DW_CHILDREN_yes, cu, 7);
+    one_abbrev(b, AB_SUBPROGRAM, DW_TAG_subprogram,       DW_CHILDREN_yes, sub, 4);
+    one_abbrev(b, AB_PARAM_T,    DW_TAG_formal_parameter, DW_CHILDREN_no, param_t, 3);
+    one_abbrev(b, AB_PARAM,      DW_TAG_formal_parameter, DW_CHILDREN_no, param, 2);
+    one_abbrev(b, AB_VAR_T,      DW_TAG_variable,         DW_CHILDREN_no, param_t, 3);
+    one_abbrev(b, AB_VAR,        DW_TAG_variable,         DW_CHILDREN_no, param, 2);
+    one_abbrev(b, AB_BASE,       DW_TAG_base_type,        DW_CHILDREN_no, base, 3);
+    one_abbrev(b, AB_PTR_T,      DW_TAG_pointer_type,     DW_CHILDREN_no, ptr_t, 2);
+    one_abbrev(b, AB_PTR,        DW_TAG_pointer_type,     DW_CHILDREN_no, ptr, 1);
+    one_abbrev(b, AB_SUBPROGRAM_T, DW_TAG_subprogram,     DW_CHILDREN_yes, sub_t, 5);
     db_uleb(b, 0);                       /* end of the abbrev table */
 }
 
-/* --- .debug_info: one CU DIE. low_pc/high_pc bound the whole code range. --- */
+/* Type DIEs are emitted once and referenced by their .debug_info offset (a
+ * DW_FORM_ref4 — CU-relative, and our single CU starts at section offset 0,
+ * so the section offset IS the reference). This maps each already-emitted
+ * type to that offset. */
+struct typemap { struct type **k; int *off; int n, cap; };
+
+static int type_lookup(struct typemap *m, struct type *t)
+{
+    for (int i = 0; i < m->n; i++)
+        if (m->k[i] == t) return m->off[i];
+    return -1;
+}
+static void type_record(struct typemap *m, struct type *t, int off)
+{
+    if (m->n == m->cap) {
+        m->cap = m->cap ? m->cap * 2 : 8;
+        m->k = xrealloc(m->k, (size_t)m->cap * sizeof *m->k);
+        m->off = xrealloc(m->off, (size_t)m->cap * sizeof *m->off);
+    }
+    m->k[m->n] = t;
+    m->off[m->n] = off;
+    m->n++;
+}
+
+static int base_encoding(struct type *t)
+{
+    if (ty_is_float(t)) return DW_ATE_float;
+    if (t->kind == TY_CHAR)
+        return t->is_unsigned ? DW_ATE_unsigned_char : DW_ATE_signed_char;
+    return t->is_unsigned ? DW_ATE_unsigned : DW_ATE_signed;
+}
+
+/* Emit (once) the DIE for t and return its offset, or -1 if EmbCC has no DIE
+ * for it yet (aggregates/functions/void — step 3). A pointer's pointee is
+ * emitted first so the ref4 points backward at an existing DIE. */
+static int ensure_type(struct dbuf *b, struct typemap *m, struct type *t)
+{
+    if (!t) return -1;
+    int e = type_lookup(m, t);
+    if (e >= 0) return e;
+
+    if (ty_is_integer(t) || ty_is_float(t)) {
+        int off = b->len;
+        db_uleb(b, AB_BASE);
+        db_str(b, ty_name(t));           /* "int", "unsigned char", ... */
+        db_u8(b, base_encoding(t));
+        db_u8(b, ty_size(t));
+        type_record(m, t, off);
+        return off;
+    }
+    if (t->kind == TY_PTR) {
+        int pe = ensure_type(b, m, t->pointee);
+        int off = b->len;
+        if (pe >= 0) {
+            db_uleb(b, AB_PTR_T);
+            db_u32(b, (unsigned long)pe);
+            db_u8(b, 8);
+        } else {
+            db_uleb(b, AB_PTR);          /* pointer to a type we can't name yet */
+            db_u8(b, 8);
+        }
+        type_record(m, t, off);
+        return off;
+    }
+    return -1;
+}
+
+/* DW_AT_location = DW_OP_fbreg(off): the slot at frame_base(=rbp) + off. */
+static void loc_fbreg(struct dbuf *b, long off)
+{
+    struct dbuf e = { 0, 0, 0 };
+    db_u8(&e, DW_OP_fbreg);
+    db_sleb(&e, off);
+    db_uleb(b, (unsigned long)e.len);
+    for (int i = 0; i < e.len; i++) db_u8(b, e.p[i]);
+    free(e.p);
+}
+
+/* --- .debug_info: a compile_unit with children — the type DIEs, then one
+ * subprogram DIE per function carrying its parameters and locals. --- */
 static void emit_info(struct dwarf_out *out, struct dbuf *b,
-                      const char *filename, long text_lo, long text_hi)
+                      struct ir_unit *iu, const char *filename,
+                      long text_lo, long text_hi)
 {
     int len_at = b->len;
     db_u32(b, 0);                        /* unit_length — backpatched */
@@ -143,7 +304,7 @@ static void emit_info(struct dwarf_out *out, struct dbuf *b,
     db_u32(b, 0);                        /* debug_abbrev_offset (reloc) */
     db_u8(b, 8);                         /* address_size */
 
-    db_uleb(b, 1);                       /* abbrev code -> compile_unit */
+    db_uleb(b, AB_CU);
     db_str(b, "EmbCC");                  /* DW_AT_producer */
     db_u16(b, DW_LANG_C99);              /* DW_AT_language */
     db_str(b, filename);                 /* DW_AT_name */
@@ -154,6 +315,47 @@ static void emit_info(struct dwarf_out *out, struct dbuf *b,
     db_u64(b, 0);                        /* DW_AT_high_pc (reloc) */
     reloc(out, DWSEC_INFO, b->len, 4, DWTGT_LINE, 0);
     db_u32(b, 0);                        /* DW_AT_stmt_list (reloc) */
+
+    /* Every variable's type, emitted up front as CU children so the
+     * subprogram DIEs below can reference them (a DIE can't be emitted in the
+     * middle of another DIE's child list). */
+    struct typemap tm = { 0, 0, 0, 0 };
+    for (int n = 0; n < iu->nfuncs; n++) {
+        (void)ensure_type(b, &tm, iu->funcs[n].src->ret_ty);
+        for (int v = 0; v < iu->funcs[n].ndbgvars; v++)
+            (void)ensure_type(b, &tm, iu->funcs[n].dbgvars[v].ty);
+    }
+
+    for (int n = 0; n < iu->nfuncs; n++) {
+        struct ir_func *fn = &iu->funcs[n];
+        if (fn->src->code_len <= 0) continue;
+        long lo = fn->src->code_off, hi = lo + fn->src->code_len;
+
+        int rtoff = type_lookup(&tm, fn->src->ret_ty);
+        db_uleb(b, rtoff >= 0 ? AB_SUBPROGRAM_T : AB_SUBPROGRAM);
+        db_str(b, fn->src->name);
+        if (rtoff >= 0) db_u32(b, (unsigned long)rtoff);  /* return type */
+        reloc(out, DWSEC_INFO, b->len, 8, DWTGT_TEXT, lo);
+        db_u64(b, 0);                    /* low_pc */
+        reloc(out, DWSEC_INFO, b->len, 8, DWTGT_TEXT, hi);
+        db_u64(b, 0);                    /* high_pc */
+        db_uleb(b, 1); db_u8(b, DW_OP_reg6);  /* frame_base = rbp */
+
+        for (int v = 0; v < fn->ndbgvars; v++) {
+            struct ir_dbgvar *dv = &fn->dbgvars[v];
+            int toff = type_lookup(&tm, dv->ty);
+            int code = dv->is_param ? (toff >= 0 ? AB_PARAM_T : AB_PARAM)
+                                    : (toff >= 0 ? AB_VAR_T : AB_VAR);
+            db_uleb(b, code);
+            db_str(b, dv->name);
+            if (toff >= 0) db_u32(b, (unsigned long)toff);
+            loc_fbreg(b, fn->var_off[dv->vreg]);
+        }
+        db_u8(b, 0);                     /* end of this subprogram's children */
+    }
+    db_u8(b, 0);                         /* end of the CU's children */
+
+    free(tm.k); free(tm.off);
 
     unsigned long ulen = (unsigned long)(b->len - after_len);
     b->p[len_at + 0] = (unsigned char)ulen;
@@ -265,7 +467,7 @@ void dwarf_emit(struct ir_unit *iu, const char *filename,
 
     struct dbuf ab = { 0, 0, 0 }, in = { 0, 0, 0 }, ln = { 0, 0, 0 };
     emit_abbrev(&ab);
-    emit_info(out, &in, filename, lo, hi);
+    emit_info(out, &in, iu, filename, lo, hi);
     emit_line(out, &ln, iu, filename);
 
     out->sec[DWSEC_ABBREV] = ab.p; out->seclen[DWSEC_ABBREV] = ab.len;

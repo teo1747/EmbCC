@@ -1238,11 +1238,69 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
     }
 }
 
+/* -g: record one source variable. Skips the unnamed (prototype params never
+ * reach a definition, but be defensive) so the DWARF DIE always has a name. */
+static void add_dbgvar(struct ir_func *fn, const char *name, int vreg,
+                       int is_param, struct type *ty)
+{
+    if (!name) return;
+    if (fn->ndbgvars == fn->dbgvarcap) {
+        fn->dbgvarcap = fn->dbgvarcap ? fn->dbgvarcap * 2 : 8;
+        fn->dbgvars = xrealloc(fn->dbgvars,
+                               (size_t)fn->dbgvarcap * sizeof *fn->dbgvars);
+    }
+    struct ir_dbgvar *v = &fn->dbgvars[fn->ndbgvars++];
+    v->name = name;
+    v->vreg = vreg;
+    v->is_param = is_param;
+    v->ty = ty;
+}
+
+/* -g: walk the body for block-scope locals. Each STMT_DECL owns a var slot
+ * (var_index); a static local became a global (sglob) and has no frame slot,
+ * so it is skipped. Flattened into the subprogram — lexical-block scoping is a
+ * later refinement, not needed to print a local by name. */
+static void collect_locals(struct ir_func *fn, struct stmt *s)
+{
+    for (; s; s = s->next) {
+        switch (s->kind) {
+        case STMT_DECL:
+            if (!s->sglob)
+                add_dbgvar(fn, s->name, s->var_index, 0,
+                           fn->src->var_tys[s->var_index]);
+            break;
+        case STMT_IF:
+            collect_locals(fn, s->thn);
+            collect_locals(fn, s->els);
+            break;
+        case STMT_WHILE:
+        case STMT_DO:
+            collect_locals(fn, s->body);
+            break;
+        case STMT_FOR:
+            collect_locals(fn, s->initdecl);
+            collect_locals(fn, s->body);
+            break;
+        case STMT_BLOCK:
+        case STMT_SWITCH:
+            collect_locals(fn, s->body);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static void gen_func(struct ir_func *fn, struct func *f)
 {
     fn->src = f;
     fn->nvregs = f->nvars; /* params + locals occupy [0, nvars) */
     g_cur_line = f->line;  /* prologue rows attribute to the definition */
+    /* -g bookkeeping (harmless when -g is off — only the DWARF pass reads it):
+     * parameters are vregs [0, nparams); locals come from the body. */
+    for (int i = 0; i < f->nparams; i++)
+        add_dbgvar(fn, f->params[i], i, 1, f->param_tys[i]);
+    collect_locals(fn, f->body);
     gen_stmt(fn, f->body, NULL);
 }
 
