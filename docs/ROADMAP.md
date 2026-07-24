@@ -5,18 +5,33 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position: M2 COMPLETE; M3 underway — EmbLD B1 done on the OS
-2026-07-24.** The integrated linker links: EmbLD linked the M1 program
+**Current position: M2 COMPLETE; M3 self-hosting — host acceptance DONE
+2026-07-24; the byte-identical fixed point is the remaining on-OS step.**
+EmbCC now compiles **all twelve of its own source files**, and EmbLD
+links them against the real crt0/syscalls/newlib into a well-formed
+EmbLinkOS `ET_EXEC` (`embcc-stage1.elf`, ~704 KB) with every symbol
+resolved — the compiler and the linker are both ours, end to end, for
+EmbCC itself (tests/golden/self-host.sh). Codegen is deterministic (every
+object byte-identical across runs — the property the fixed point rests
+on). Closing the language for self-hosting took, in test-covered
+increments: adjacent string concatenation, a variable in scope within its
+own initializer, noreturn-tail control flow, relocatable aggregate
+initializers for globals and static locals (the predef/keyword string
+tables), struct field designators, and SysV variadic function definitions
+with a register save area (diag_fatal). A latent uninitialized-read in the
+IR builder — a garbage struct-return count that crashed ~half the time —
+was found and fixed while bootstrapping. **The stage1==stage2
+byte-identical fixed point is on-OS**: stage1 links against newlib for the
+EmbLinkOS syscall ABI, so it runs on the OS, not the host — the OS is the
+final judge (D-005), as M1 and M2 were.
+
+Earlier M3 milestones (2026-07-24): EmbLD B1 linked the M1 program
 (crt0 + syscalls + an EmbCC object + newlib's libc.a) into an ET_EXEC and
-the kernel ran it to exit 42, no cross-ld involved — the compiler and the
-linker are now both ours end to end for a real program. EmbLD B2 followed
-the same day: output-section grouping gives correct __init_array/ctors
-bracket symbols (a constructor program runs its ctor) and COMMON
-placement, and an EmbCC-compiled + EmbLD-linked printf program prints
-correctly on the OS. The GOT was verified unneeded for this newlib (zero
-GOTPCREL). What remains for M3's self-hosting acceptance: compile EmbCC's
-own sources with EmbCC, link with EmbLD, and close the stage2-byte-
-identical fixed point (WORKPLAN stream B).
+the kernel ran it to exit 42, no cross-ld involved. EmbLD B2 followed:
+output-section grouping gives correct __init_array/ctors bracket symbols
+(a constructor program runs its ctor) and COMMON placement, and an
+EmbCC-compiled + EmbLD-linked printf program prints correctly on the OS.
+The GOT was verified unneeded for this newlib (zero GOTPCREL).
 
 **M2 COMPLETE — confirmed on the OS 2026-07-24.** The
 acceptance test passed on EmbLinkOS itself: value.c, wire.c, sval.c and
