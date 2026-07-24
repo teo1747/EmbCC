@@ -147,6 +147,16 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
             int nad = 0;
             while (cur(ps)->kind == TOK_LBRACKET) {
                 advance(ps);
+                if (nad >= 4)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "more than 4 array dimensions");
+                if (cur(ps)->kind == TOK_RBRACKET) {
+                    /* an omitted size: `(*arr[])(void)` — an incomplete
+                     * array, valid for an extern like crt0's brackets. */
+                    adims[nad++] = 0;
+                    advance(ps);
+                    continue;
+                }
                 int dline = cur(ps)->line;
                 struct expr *de = parse_cond(ps);
                 long dv;
@@ -154,9 +164,6 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
                     diag_fatal(ps->lx.file, dline,
                                "array size must be a positive constant "
                                "expression");
-                if (nad >= 4)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
-                               "more than 4 array dimensions");
                 adims[nad++] = (int)dv;
                 expect(ps, TOK_RBRACKET, "']'");
             }
