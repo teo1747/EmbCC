@@ -12,12 +12,17 @@
 
 #include "../sema/type.h"
 
-#define MAX_PARAMS 6
+/* Prototypes in real headers declare more parameters than fit in
+ * registers (newlib's _dtoa_r takes seven), so the DECLARATION limit is
+ * generous; what is actually refused is a CALL needing more registers
+ * than SysV provides — checked in sema, where the classes are known. */
+#define MAX_PARAMS 12
 
 enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
-                 EXPR_MEMBER, EXPR_COND, EXPR_COMMA };
+                 EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
+                 EXPR_COMPOUND };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -71,10 +76,13 @@ struct stmt {
     int line;
     const char *name;     /* STMT_DECL */
     struct type *dty;     /* STMT_DECL: declared type */
+    int is_static;        /* STMT_DECL: a static local -> its own global */
+    struct global *sglob; /* STMT_DECL: the global a static local became */
     int var_index;        /* STMT_DECL: set by sema */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
     struct expr *cond;    /* IF/WHILE/FOR */
     struct expr *init, *step; /* FOR: either may be NULL */
+    struct stmt *initdecl;    /* FOR: `for (int i = 0; ...)` */
     struct stmt *thn, *els;   /* IF: els may be NULL */
     struct stmt *body;    /* WHILE/FOR: the controlled statement;
                            * BLOCK: the child list */
@@ -100,6 +108,8 @@ struct global {
     int is_extern;        /* THIS declaration was 'extern' */
     int has_init;
     long init;            /* constant initializer value */
+    const char *init_bytes; /* string initializer (char arrays) */
+    int init_len;
     struct global *next;
 
     int defined;          /* sema, canonical: some declaration defines it */

@@ -631,6 +631,45 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     case EXPR_COMMA:
         gen_expr(fn, e->lhs); /* for side effects */
         return gen_expr(fn, e->rhs);
+    case EXPR_COMPOUND: {
+        /* the address is computed ONCE — the whole reason this is not
+         * desugared to `x = x op y` */
+        struct type *lt = e->lhs->ty;
+        int local = e->lhs->kind == EXPR_VAR && !e->lhs->gref;
+        int addr = local ? -1 : gen_addr(fn, e->lhs);
+        int cur = local ? emit_ldvar(fn, e->lhs->var_index, lt)
+                        : emit_load(fn, addr, lt);
+        int rv = gen_expr(fn, e->rhs);
+        int res;
+        if (lt->kind == TY_PTR) {
+            int esz = ty_size(lt->pointee);
+            if (esz > 1) {
+                int k = emit_const(fn, esz, 8);
+                rv = emit_bin(fn, IR_MUL, rv, k, 8, 1);
+            }
+            res = emit_bin(fn, e->op == B_ADD ? IR_ADD : IR_SUB, cur, rv,
+                           8, 1);
+        } else {
+            struct type *ct = e->cast_ty;
+            int cv = gen_convert(fn, cur, lt, ct);
+            static const enum ir_op map[] = {
+                IR_ADD, IR_SUB, IR_MUL, IR_DIV, IR_MOD,
+                IR_AND, IR_OR, IR_XOR, IR_SHL, IR_SHR,
+            };
+            enum ir_op o = map[e->op - B_ADD];
+            if (ty_is_float(ct))
+                res = emit_fbin(fn, o, cv, rv, ty_size(ct));
+            else
+                res = emit_bin(fn, o, cv, rv, ty_w(ct),
+                               ty_signed_int(ct));
+            res = gen_convert(fn, res, ct, lt);
+        }
+        if (local)
+            emit_stvar(fn, e->lhs->var_index, res, lt);
+        else
+            emit_store(fn, addr, res, lt);
+        return res;
+    }
     case EXPR_COND: {
         int dst = new_temp(fn);
         int l_else = new_label(fn);
@@ -723,6 +762,8 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             emit_jmp(fn, loop->cont);
             break;
         case STMT_DECL:
+            if (s->sglob)
+                break; /* a static local IS its global; no code here */
             if (s->expr) {
                 int v = gen_expr(fn, s->expr);
                 if (s->dty->kind == TY_STRUCT) {
@@ -856,6 +897,8 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             struct loopctx lc;
             lc.cont = new_label(fn);
             lc.brk = new_label(fn);
+            if (s->initdecl)
+                gen_stmt(fn, s->initdecl, &lc);
             if (s->init)
                 gen_expr(fn, s->init);
             emit_label(fn, l_cond);

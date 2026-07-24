@@ -75,9 +75,16 @@ check ptr-int-compare \
 check incompatible-ptr-assign \
     'int main(void) { int x; char *p = &x; return !p; }' \
     "without a cast"
-check compound-through-pointer \
-    'int main(void) { int x = 1; int *p = &x; *p += 1; return x; }' \
-    "compound assignment through a pointer"
+check compound-on-rvalue \
+    'int main(void) { int x = 1; (x + 1) += 2; return x; }' \
+    "must be a variable, \*pointer, or member"
+check compound-ptr-mul \
+    'int main(void) { int a[4]; int *p = a; p *= 2; return !p; }' \
+    "only += and -= apply to a pointer"
+check too-many-reg-args \
+    'int f(int a, int b, int c, int d, int e, int g, int h);
+int main(void) { return f(1,2,3,4,5,6,7); }' \
+    "SysV has 6 and 8"
 check addr-of-rvalue \
     'int main(void) { int x = 1; return !&(x + 1); }' \
     "needs a variable"
@@ -103,7 +110,10 @@ check addr-of-array \
     "already the address"
 check array-initializer \
     'int main(void) { int a[3] = 0; return 0; }' \
-    "array initializers are not supported"
+    "only string literals may initialize an array"
+check non-char-array-from-string \
+    'int main(void) { int a[4] = "abc"; return a[0]; }' \
+    "only a char array"
 check adjacent-strings \
     'int puts(char *);
 int main(void) { puts("a" "b"); return 0; }' \

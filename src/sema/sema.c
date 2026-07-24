@@ -5,6 +5,7 @@
  */
 #include "sema.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,6 +15,8 @@
 struct vardef {
     const char *name;
     struct type *ty;
+    struct global *g;   /* non-NULL for a static local: it lives in
+                         * static storage, not the frame */
 };
 
 struct scope {
@@ -29,7 +32,8 @@ static int scope_find(struct scope *sc, const char *name)
     return -1;
 }
 
-static int scope_add(struct scope *sc, const char *name, struct type *ty)
+static int scope_add(struct scope *sc, const char *name, struct type *ty,
+                     struct global *g)
 {
     if (sc->n == sc->cap) {
         sc->cap = sc->cap ? sc->cap * 2 : 8;
@@ -37,6 +41,7 @@ static int scope_add(struct scope *sc, const char *name, struct type *ty)
     }
     sc->vars[sc->n].name = name;
     sc->vars[sc->n].ty = ty;
+    sc->vars[sc->n].g = g;
     return sc->n++;
 }
 
@@ -215,6 +220,8 @@ static int is_lvalue(const struct expr *e)
            e->kind == EXPR_MEMBER;
 }
 
+static int const_fold(const struct expr *e, long *out);
+
 /* ---- expression checking ---- */
 
 static void check_expr(struct unit *u, struct func *f, struct scope *sc,
@@ -236,6 +243,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (i >= 0) {
             e->var_index = i;
             e->ty = sc->vars[i].ty;
+            e->gref = sc->vars[i].g; /* set for a static local */
         } else {
             /* enumerators fold to their constant right here */
             struct econst *ec = u->econsts;
@@ -425,6 +433,47 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        "'?:' branches have incompatible types "
                        "(%s vs %s)", ty_name(a), ty_name(b));
         }
+        break;
+    }
+    case EXPR_COMPOUND: {
+        /* x op= y. The lvalue is evaluated once (irgen keeps its
+         * address); the operation happens in the usual common type and
+         * the result converts back to the target's type, as C says. */
+        check_expr(u, f, sc, e->lhs);
+        check_expr(u, f, sc, e->rhs);
+        if (!is_lvalue(e->lhs) || e->lhs->undecayed || e->lhs->fref)
+            diag_fatal(u->file, e->line,
+                       "compound assignment needs an lvalue");
+        if (e->lhs->ty->kind == TY_PTR) {
+            if (e->op != B_ADD && e->op != B_SUB)
+                diag_fatal(u->file, e->line,
+                           "only += and -= apply to a pointer");
+            need_integer(u, e->rhs, "pointer arithmetic");
+            e->rhs = mk_cast(e->rhs, ty_base(TY_LONG, 0));
+            e->cast_ty = e->lhs->ty;
+            e->ty = e->lhs->ty;
+            break;
+        }
+        if (e->op == B_SHL || e->op == B_SHR) {
+            need_integer(u, e->lhs, "a shift");
+            need_integer(u, e->rhs, "a shift");
+            e->cast_ty = promote(e->lhs->ty);
+            e->rhs = mk_cast(e->rhs, ty_base(TY_INT, 0));
+            e->ty = e->lhs->ty;
+            break;
+        }
+        if (e->op == B_ADD || e->op == B_SUB || e->op == B_MUL ||
+            e->op == B_DIV) {
+            need_arith(u, e->lhs, "compound assignment");
+            need_arith(u, e->rhs, "compound assignment");
+        } else {
+            need_integer(u, e->lhs, "this operator");
+            need_integer(u, e->rhs, "this operator");
+        }
+        e->cast_ty = arith_common(e->lhs->ty, e->rhs->ty);
+        check_u64_float(u, e->line, e->cast_ty, e->rhs->ty);
+        e->rhs = mk_cast(e->rhs, e->cast_ty);
+        e->ty = e->lhs->ty;
         break;
     }
     case EXPR_MEMBER: {
@@ -638,6 +687,32 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 e->args[i] = mk_cast(e->args[i],
                                      default_arg_promote(e->args[i]->ty));
         }
+        /* SysV provides six integer and eight vector argument
+         * registers. Stack passing exists for MEMORY-class aggregates
+         * only, so a call needing more REGISTERS than that is refused
+         * rather than quietly mis-placed. */
+        {
+            enum arg_class cls[2];
+            int ireg = 0, freg = 0;
+            if (ft->ret->kind == TY_STRUCT &&
+                ty_classify(ft->ret, cls) == 0)
+                ireg++; /* the hidden return pointer */
+            for (int i = 0; i < e->nargs; i++) {
+                int n = ty_classify(e->args[i]->ty, cls);
+                for (int q = 0; q < n; q++) {
+                    if (cls[q] == CLASS_SSE)
+                        freg++;
+                    else
+                        ireg++;
+                }
+            }
+            if (ireg > 6 || freg > 8)
+                diag_fatal(u->file, e->line,
+                           "this call needs %d integer and %d vector "
+                           "argument registers; SysV has 6 and 8, and "
+                           "stack passing of scalars is not implemented "
+                           "yet", ireg, freg);
+        }
         e->ty = ft->ret;
         break;
     }
@@ -768,19 +843,76 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             need_scalar(u, s->cond, "'do'/'while'");
             break;
         case STMT_DECL:
-            if (s->expr) {
+            if (s->expr && s->dty->kind == TY_ARRAY &&
+                s->expr->kind == EXPR_STR) {
+                /* char a[] = "..." : the literal's bytes ARE the
+                 * object, and an omitted size is the literal's. */
+                if (s->dty->pointee->kind != TY_CHAR)
+                    diag_fatal(u->file, s->line,
+                               "only a char array can be initialized "
+                               "from a string");
+                int len = (int)s->expr->num;
+                if (s->dty->count == 0)
+                    s->dty = ty_array(s->dty->pointee, len);
+                else if (s->dty->count < len - 1)
+                    diag_fatal(u->file, s->line,
+                               "initializer is longer than '%s'",
+                               s->name);
+            } else if (s->expr) {
                 check_expr(u, f, sc, s->expr);
                 if (s->dty->kind != TY_STRUCT)
                     need_scalar(u, s->expr, "an initializer");
                 s->expr = convert_assign(u, s->expr, s->dty,
                                          "initialization");
             }
+            if (s->is_static) {
+                /* A static local has static STORAGE and internal
+                 * linkage: it becomes a global of its own, named so it
+                 * cannot collide with a file-scope name. */
+                long sval = 0;
+                if (s->expr && s->expr->kind != EXPR_STR &&
+                    !const_fold(s->expr, &sval))
+                    diag_fatal(u->file, s->line,
+                               "a static local needs a constant "
+                               "initializer");
+                struct global *g = xcalloc(1, sizeof *g);
+                size_t n = strlen(f->name) + strlen(s->name) + 8;
+                char *nm = xmalloc(n);
+                snprintf(nm, n, "%s.%s", f->name, s->name);
+                g->name = nm;
+                g->line = s->line;
+                g->seq = -1;      /* visible from its own function only */
+                g->ty = s->dty;
+                g->is_static = 1;
+                g->defined = 1;
+                g->used = 1;
+                if (s->expr && s->expr->kind == EXPR_STR) {
+                    g->init_bytes = s->expr->name;
+                    g->init_len = (int)s->expr->num;
+                    g->has_init = 1;
+                } else if (s->expr) {
+                    g->init = sval;
+                    g->has_init = sval != 0;
+                }
+                struct global **gt = &u->globals;
+                while (*gt)
+                    gt = &(*gt)->next;
+                *gt = g;
+                s->sglob = g;
+                s->expr = NULL;   /* the data, not code, carries it */
+                if (scope_find(sc, s->name) >= 0)
+                    diag_fatal(u->file, s->line,
+                               "'%s' is already declared in '%s'",
+                               s->name, f->name);
+                s->var_index = scope_add(sc, s->name, s->dty, g);
+                break;
+            }
             if (scope_find(sc, s->name) >= 0)
                 diag_fatal(u->file, s->line,
                            "'%s' is already declared in '%s' (one flat "
                            "scope per function for now — rename it)",
                            s->name, f->name);
-            s->var_index = scope_add(sc, s->name, s->dty);
+            s->var_index = scope_add(sc, s->name, s->dty, NULL);
             break;
         case STMT_RETURN:
             if (f->ret_ty->kind == TY_VOID) {
@@ -815,6 +947,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             check_stmt(u, f, sc, s->body, 1, in_switch, 0);
             break;
         case STMT_FOR:
+            if (s->initdecl)
+                check_stmt(u, f, sc, s->initdecl, in_loop, in_switch, 0);
             if (s->init)
                 check_expr(u, f, sc, s->init);
             if (s->cond) { /* NULL = forever, left by 'break' */
@@ -869,7 +1003,7 @@ static void check_func(struct unit *u, struct func *f)
             diag_fatal(u->file, f->line,
                        "duplicate parameter '%s' in '%s'",
                        f->params[i], f->name);
-        scope_add(&sc, f->params[i], f->param_tys[i]);
+        scope_add(&sc, f->params[i], f->param_tys[i], NULL);
     }
 
     check_stmt(u, f, &sc, f->body, 0, 0, 0);
@@ -882,7 +1016,10 @@ static void check_func(struct unit *u, struct func *f)
     f->nvars = sc.n;
     f->var_tys = xmalloc((size_t)(sc.n ? sc.n : 1) * sizeof *f->var_tys);
     for (int i = 0; i < sc.n; i++)
-        f->var_tys[i] = sc.vars[i].ty;
+        /* a static local keeps its scope index but needs no frame
+         * storage — give it a pointer's worth and never address it */
+        f->var_tys[i] = sc.vars[i].g ? ty_base(TY_LONG, 0)
+                                     : sc.vars[i].ty;
     free(sc.vars);
 }
 

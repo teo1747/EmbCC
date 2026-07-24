@@ -18,7 +18,7 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.8.0-m2.funcptrs"
+#define EMBCC_VERSION "0.9.0-m2.structval"
 
 static void print_version(void)
 {
@@ -28,8 +28,9 @@ static void print_version(void)
     printf("C subset: the integer types, pointers incl. function "
            "pointers, arrays, structs/unions/enums, typedef, ?:, the "
            "comma operator, string literals, globals, sizeof, casts, "
-           "full control flow and operators; compile with -c — "
-           "#include <stdio.h> works against real newlib headers.\n");
+           "full control flow and operators, floating point, structs "
+           "by value (SysV); compile with -c — #include <stdio.h> works "
+           "against real newlib headers.\n");
     printf("Preprocessor: #include (-I), #define incl. variadic/#/##, "
            "conditionals, the x86_64-elf predefined set; -E to see it. "
            "No linker yet (M3) — link with the existing toolchain.\n");
@@ -135,6 +136,13 @@ static int compile(const char *in, const char *out, int pp_only)
         for (struct global *g = u->globals; g; g = g->next) {
             if (g->absorbed || !g->defined || g->in_bss)
                 continue;
+            if (g->init_bytes) {
+                int n = g->init_len;
+                if (n > ty_size(g->ty))
+                    n = ty_size(g->ty);
+                memcpy(data + g->off, g->init_bytes, (size_t)n);
+                continue;
+            }
             unsigned long v = (unsigned long)g->init;
             for (int b = 0; b < ty_size(g->ty); b++)
                 data[g->off + b] = (char)((v >> (8 * b)) & 0xff);

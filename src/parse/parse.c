@@ -114,6 +114,8 @@ static int at_type_start(struct parser *ps)
 
 static struct type *parse_fn_params(struct parser *ps, struct type *ret);
 static struct type *parse_stars(struct parser *ps, struct type *t);
+static struct expr *parse_cond(struct parser *ps);
+static int size_fold(const struct expr *e, long *out);
 static struct type *parse_array_dims(struct parser *ps, struct type *t);
 static struct type *parse_type_spec(struct parser *ps, int allow_body);
 
@@ -145,15 +147,17 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
             int nad = 0;
             while (cur(ps)->kind == TOK_LBRACKET) {
                 advance(ps);
-                if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
-                               "array size must be a positive integer "
-                               "literal");
+                int dline = cur(ps)->line;
+                struct expr *de = parse_cond(ps);
+                long dv;
+                if (!size_fold(de, &dv) || dv <= 0)
+                    diag_fatal(ps->lx.file, dline,
+                               "array size must be a positive constant "
+                               "expression");
                 if (nad >= 4)
                     diag_fatal(ps->lx.file, cur(ps)->line,
                                "more than 4 array dimensions");
-                adims[nad++] = (int)cur(ps)->num;
-                advance(ps);
+                adims[nad++] = (int)dv;
                 expect(ps, TOK_RBRACKET, "']'");
             }
             expect(ps, TOK_RPAREN, "')'");
@@ -177,7 +181,7 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
 static struct type *parse_fn_params(struct parser *ps, struct type *ret)
 {
     expect(ps, TOK_LPAREN, "'('");
-    struct type *pt[8];
+    struct type *pt[MAX_PARAMS];
     int n = 0, varargs = 0;
 
     if (cur(ps)->kind == TOK_KW_VOID) {
@@ -207,7 +211,7 @@ static struct type *parse_fn_params(struct parser *ps, struct type *ret)
             if (t->kind == TY_VOID)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "a parameter cannot have type void");
-            if (n >= 8)
+            if (n >= MAX_PARAMS)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "too many parameters in a function type");
             pt[n++] = t;
@@ -376,8 +380,68 @@ static struct type *parse_stars(struct parser *ps, struct type *t)
     }
 }
 
+/* Folds an array-size expression at PARSE time. It can evaluate
+ * sizeof(type) because the parser owns the typedef and tag tables —
+ * which is what real headers need: newlib's fd_set is
+ * `__fds_bits[_howmany(FD_SETSIZE, _NFDBITS)]`, and _NFDBITS expands to
+ * ((int)sizeof(__fd_mask) * 8). Anything it cannot evaluate (an
+ * identifier, sizeof of an expression) is refused by name. */
+static int size_fold(const struct expr *e, long *out)
+{
+    long a, b;
+
+    switch (e->kind) {
+    case EXPR_NUM:
+        *out = e->num;
+        return 1;
+    case EXPR_SIZEOF:
+        if (!e->cast_ty)
+            return 0; /* sizeof(expr) needs types this pass lacks */
+        *out = ty_size(e->cast_ty);
+        return 1;
+    case EXPR_CAST:
+        return size_fold(e->rhs, out);
+    case EXPR_NEG:
+        if (!size_fold(e->rhs, &a)) return 0;
+        *out = -a;
+        return 1;
+    case EXPR_BNOT:
+        if (!size_fold(e->rhs, &a)) return 0;
+        *out = ~a;
+        return 1;
+    case EXPR_NOT:
+        if (!size_fold(e->rhs, &a)) return 0;
+        *out = !a;
+        return 1;
+    case EXPR_BINOP:
+        if (!size_fold(e->lhs, &a) || !size_fold(e->rhs, &b))
+            return 0;
+        switch (e->op) {
+        case B_ADD: *out = a + b; return 1;
+        case B_SUB: *out = a - b; return 1;
+        case B_MUL: *out = a * b; return 1;
+        case B_DIV: if (!b) return 0; *out = a / b; return 1;
+        case B_MOD: if (!b) return 0; *out = a % b; return 1;
+        case B_AND: *out = a & b; return 1;
+        case B_OR:  *out = a | b; return 1;
+        case B_XOR: *out = a ^ b; return 1;
+        case B_SHL: *out = a << b; return 1;
+        case B_SHR: *out = a >> b; return 1;
+        case B_LT:  *out = a < b; return 1;
+        case B_GT:  *out = a > b; return 1;
+        case B_LE:  *out = a <= b; return 1;
+        case B_GE:  *out = a >= b; return 1;
+        case B_EQ:  *out = a == b; return 1;
+        case B_NE:  *out = a != b; return 1;
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
 /* Shared by locals, globals, and members: trailing [N]([M]...) turns t
- * into (nested) array types. Sizes are positive integer literals. */
+ * into (nested) array types. Sizes are constant expressions. */
 static struct type *parse_array_dims(struct parser *ps, struct type *t)
 {
     int dims[4];
@@ -387,12 +451,16 @@ static struct type *parse_array_dims(struct parser *ps, struct type *t)
         int dim = 0; /* [] : legal for params (adjusts to a pointer);
                         elsewhere caught as an incomplete type */
         if (cur(ps)->kind != TOK_RBRACKET) {
-            if (cur(ps)->kind != TOK_NUM || cur(ps)->num <= 0)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "array size must be a positive integer "
-                           "literal");
-            dim = (int)cur(ps)->num;
-            advance(ps);
+            int dline = cur(ps)->line;
+            struct expr *de = parse_cond(ps);
+            long dv;
+            if (!size_fold(de, &dv))
+                diag_fatal(ps->lx.file, dline,
+                           "array size must be a constant expression");
+            if (dv < 0)
+                diag_fatal(ps->lx.file, dline,
+                           "array size cannot be negative");
+            dim = (int)dv; /* 0 is the extern/flexible form */
         }
         if (ndims >= 4)
             diag_fatal(ps->lx.file, cur(ps)->line,
@@ -599,8 +667,7 @@ static struct expr *parse_postfix(struct parser *ps)
                 for (;;) {
                     if (call->nargs >= MAX_PARAMS)
                         diag_fatal(ps->lx.file, cur(ps)->line,
-                                   "more than %d call arguments "
-                                   "(register args only for now)",
+                                   "more than %d call arguments",
                                    MAX_PARAMS);
                     call->args[call->nargs++] = parse_expr(ps);
                     if (cur(ps)->kind != TOK_COMMA)
@@ -842,21 +909,21 @@ static struct expr *parse_expr(struct parser *ps)
         diag_fatal(ps->lx.file, line,
                    "assignment target must be a variable, *pointer, or "
                    "member");
-    if (comp >= 0 && e->kind != EXPR_VAR)
-        diag_fatal(ps->lx.file, line,
-                   "compound assignment through a pointer is not "
-                   "supported yet; write it out as *p = *p op x");
     advance(ps);
 
-    struct expr *a = new_expr(EXPR_ASSIGN, line);
-    a->lhs = e;
     if (comp < 0) {
+        struct expr *a = new_expr(EXPR_ASSIGN, line);
+        a->lhs = e;
         a->rhs = parse_expr(ps);
-    } else {
-        struct expr *lhs_copy = new_expr(EXPR_VAR, line);
-        lhs_copy->name = e->name;
-        a->rhs = binop(compound_assign[comp].op, lhs_copy, parse_expr(ps));
+        return a;
     }
+    /* `x op= y` keeps its own node rather than desugaring to
+     * `x = x op y`: through a pointer or a member the address must be
+     * evaluated ONCE, and the desugared form evaluates it twice. */
+    struct expr *a = new_expr(EXPR_COMPOUND, line);
+    a->op = compound_assign[comp].op;
+    a->lhs = e;
+    a->rhs = parse_expr(ps);
     return a;
 }
 
@@ -901,7 +968,15 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     struct token *t = cur(ps);
     struct stmt *s;
 
-    if (at_type_start(ps)) {
+    if (t->kind == TOK_KW_STATIC || at_type_start(ps)) {
+        int local_static = 0;
+        if (t->kind == TOK_KW_STATIC) {
+            local_static = 1;
+            advance(ps);
+            if (!at_type_start(ps))
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a type after 'static'");
+        }
         if (!allow_decl)
             diag_fatal(ps->lx.file, t->line,
                        "a declaration cannot be the body of if/while/for "
@@ -921,18 +996,29 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                            "expected a variable name before %s",
                            tok_describe(cur(ps)));
             s->name = dname;
+            s->is_static = local_static;
             int was_array = s->dty->kind == TY_ARRAY;
-            if (ty_size(s->dty) == 0)
-                diag_fatal(ps->lx.file, s->line,
-                           "'%s' has incomplete type %s", s->name,
-                           ty_name(s->dty));
-            if (was_array && cur(ps)->kind == TOK_ASSIGN)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "array initializers are not supported yet");
+            if (was_array && cur(ps)->kind == TOK_ASSIGN) {
+                /* the one array initializer that matters here:
+                 * char buf[] = "..." (and char buf[N] = "...") */
+                advance(ps);
+                if (cur(ps)->kind != TOK_STR)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "only string literals may initialize an "
+                               "array");
+                s->expr = parse_primary(ps);
+            }
             if (cur(ps)->kind == TOK_ASSIGN) {
                 advance(ps);
                 s->expr = parse_expr(ps);
             }
+            /* checked AFTER the initializer, because `char a[] = "..."`
+             * takes its size from the literal */
+            if (ty_size(s->dty) == 0 &&
+                !(s->expr && s->expr->kind == EXPR_STR))
+                diag_fatal(ps->lx.file, s->line,
+                           "'%s' has incomplete type %s", s->name,
+                           ty_name(s->dty));
             *dtail = s;
             dtail = &s->next;
             if (cur(ps)->kind == TOK_COMMA) {
@@ -979,13 +1065,17 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         s = new_stmt(STMT_FOR, t->line);
         advance(ps);
         expect(ps, TOK_LPAREN, "'('");
-        if (at_type_start(ps))
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "declarations in for-init are not supported yet; "
-                       "declare the variable before the loop");
-        if (cur(ps)->kind != TOK_SEMI)
-            s->init = parse_comma(ps);
-        expect(ps, TOK_SEMI, "';'");
+        if (at_type_start(ps)) {
+            /* `for (int i = 0; ...)`. One flat scope per function means
+             * the variable simply outlives the loop — which ACCEPTS
+             * fewer programs than C (a second loop reusing the name is
+             * refused), never more. */
+            s->initdecl = parse_stmt(ps, 1); /* consumes its own ';' */
+        } else {
+            if (cur(ps)->kind != TOK_SEMI)
+                s->init = parse_comma(ps);
+            expect(ps, TOK_SEMI, "';'");
+        }
         if (cur(ps)->kind != TOK_SEMI) /* NULL cond = forever; break exits */
             s->cond = parse_expr(ps);
         expect(ps, TOK_SEMI, "';'");
@@ -1081,7 +1171,9 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
     if (g->ty->kind == TY_VOID)
         diag_fatal(ps->lx.file, line, "a variable cannot have type void");
     g->ty = parse_array_dims(ps, g->ty);
-    if (ty_size(g->ty) == 0)
+    /* `extern T x[];` is legal: the definition, and the size, live in
+     * another translation unit. Nothing is emitted for it here. */
+    if (ty_size(g->ty) == 0 && !is_extern)
         diag_fatal(ps->lx.file, line,
                    "'%s' has incomplete type %s", name, ty_name(g->ty));
     if (cur(ps)->kind == TOK_ASSIGN) {
@@ -1257,8 +1349,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                            "a parameter cannot have type void");
             if (f->nparams >= MAX_PARAMS)
                 diag_fatal(ps->lx.file, cur(ps)->line,
-                           "more than %d parameters "
-                           "(register args only for now)", MAX_PARAMS);
+                           "more than %d parameters", MAX_PARAMS);
             f->param_tys[f->nparams] = pt;
             f->params[f->nparams] = pname; /* NULL fine in prototypes */
             f->nparams++;

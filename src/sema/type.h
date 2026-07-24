@@ -39,7 +39,7 @@ struct type {
     int size, align;        /* SysV layout, computed when completed */
     /* TY_FUNC (always behind a pointer in this subset): */
     struct type *ret;
-    struct type *ptypes[8];
+    struct type *ptypes[12];
     int nptypes;
     int is_varargs;
 };
