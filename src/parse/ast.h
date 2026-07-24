@@ -221,11 +221,41 @@ struct econst {
     struct econst *next;
 };
 
+/* A label a file-scope asm block defines, and a relocation it needs. */
+struct asmsym {
+    const char *name;
+    int off;             /* offset within .text (filled at emission) */
+    int is_global;       /* named by .global/.globl */
+};
+struct asmrel {
+    int off;             /* offset within .text of the rel32 field */
+    const char *target;  /* symbol the call/jmp resolves to */
+    long addend;
+};
+
+/* A file-scope `__asm__("...")` block (crt0's _start stub, and its kind).
+ * Assembled by a tiny fixed vocabulary — .global/.globl, labels, and
+ * $imm/call/jmp/ret — into .text bytes with symbols and relocations. */
+struct topasm {
+    const char *tmpl;
+    const char *file;
+    int line;
+    unsigned char *code;
+    int codelen;
+    struct asmsym *syms;
+    int nsyms;
+    struct asmrel *rels;
+    int nrels;
+    int text_off;        /* where the bytes landed in .text (driver) */
+    struct topasm *next;
+};
+
 struct unit {
     const char *file;
     struct func *funcs;
     struct global *globals;
     struct econst *econsts;
+    struct topasm *topasm;
 };
 
 #endif

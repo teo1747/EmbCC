@@ -21,6 +21,7 @@ SRCS := \
 	src/ir/irgen.c \
 	src/codegen/codegen.c \
 	src/asm/emit.c \
+	src/asm/topasm.c \
 	src/cpp/predef.c \
 	src/cpp/cpp.c \
 	src/elf/write.c

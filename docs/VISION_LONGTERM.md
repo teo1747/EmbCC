@@ -54,7 +54,15 @@ EmbCC is designed specifically for EmbLinkOS and understands its architecture.
   on the OS: EmbCC-compiled `int $0x80` stubs made real write(1,…) and
   exit(42) syscalls (kernel `test embcc asm`). Scope is the userland rim
   only (the kernel's asm stays the cross gcc's — DECISIONS); the template
-  vocabulary is `int $imm` today, a deliberate seam.
+  vocabulary is `int $imm` today, a deliberate seam. **File-scope asm
+  followed:** a two-pass mini-assembler (src/asm/topasm.c) handles crt0's
+  `_start` stub vocabulary — `.global`/`.globl`, labels (named + numeric-
+  local), `and $imm,%reg`, `call sym` (PLT32), `jmp local-label`, `ret` —
+  emitting a global `_start` symbol and a relocation to the C entry it
+  calls. Toward emlibc's rim: syscalls.c still needs `va_arg`, and crt0.c
+  needs more still (complex declarators like `void (*arr[])(void)`,
+  `__attribute__((weak))`, and a `&global` initializer) — named, not yet
+  built.
 
 ## Advanced diagnostics
 

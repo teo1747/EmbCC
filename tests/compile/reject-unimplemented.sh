@@ -313,3 +313,16 @@ check asm-r-needs-regvar \
 check asm-out-not-lvalue \
     'int main(void) { __asm__("int $0x80" : "=a"(1 + 2)); return 0; }' \
     "must be an lvalue"
+check topasm-bad-insn \
+    'extern void f(void);
+__asm__(".global g\ng:\n  frobnicate %rax\n");
+int main(void) { return 0; }' \
+    "not supported"
+check topasm-bad-jmp \
+    '__asm__("jmp nowhere\n");
+int main(void) { return 0; }' \
+    "not a local label"
+check topasm-global-no-label \
+    '__asm__(".global ghost\n  ret\n");
+int main(void) { return 0; }' \
+    "has no label"

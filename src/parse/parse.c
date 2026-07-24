@@ -1379,6 +1379,25 @@ static void parse_top(struct parser *ps, struct unit *u,
     int is_static = 0, is_extern = 0;
     ps->seq = seq;
 
+    /* A file-scope `__asm__("...")` block (crt0's _start stub). Basic asm
+     * only — a template, no operands — assembled later by topasm.c. */
+    if (cur(ps)->kind == TOK_KW_ASM) {
+        int line = cur(ps)->line;
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after a file-scope asm");
+        struct topasm *ta = xcalloc(1, sizeof *ta);
+        ta->tmpl = parse_str_literal(ps, "an asm template string");
+        ta->file = ps->lx.file;
+        ta->line = line;
+        expect(ps, TOK_RPAREN, "')' to close the asm block");
+        expect(ps, TOK_SEMI, "';'");
+        struct topasm **t = &u->topasm;
+        while (*t)
+            t = &(*t)->next;
+        *t = ta;
+        return;
+    }
+
     /* Storage/function specifiers in any order; `inline` is accepted and
      * ignored — EmbCC emits an inline function as an ordinary one. */
     for (;;) {
@@ -1577,7 +1596,7 @@ struct unit *parse_unit(const char *file, const char *src)
     /* A translation unit of only data (a table of globals, no functions)
      * is valid C — EmbCC's own predef macro table is exactly that. Refuse
      * only a unit with nothing at all to emit. */
-    if (!u->funcs && !u->globals)
+    if (!u->funcs && !u->globals && !u->topasm)
         diag_fatal(file, 0, "no functions or globals in file");
     return u;
 }

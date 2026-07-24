@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../asm/emit.h"
+#include "../asm/topasm.h"
 #include "../codegen/codegen.h"
 #include "../cpp/cpp.h"
 #include "../cpp/predef.h"
@@ -184,6 +186,23 @@ static int compile(const char *in, const char *out, int pp_only)
                    (size_t)iu->strs[i].len);
     }
 
+    /* File-scope asm blocks (crt0's _start): assemble each, place its bytes
+     * in .text after the functions (16-aligned), and record where so its
+     * labels and relocations land at the right offset. Mark any function a
+     * call targets as used so it gets a symbol to relocate against. */
+    for (struct topasm *ta = u->topasm; ta; ta = ta->next) {
+        topasm_assemble(ta);
+        code_align(&text, 16, 0x90);
+        ta->text_off = text.len;
+        for (int k = 0; k < ta->codelen; k++)
+            code_byte(&text, ta->code[k]);
+        for (int r = 0; r < ta->nrels; r++)
+            for (struct func *f = u->funcs; f; f = f->next)
+                if (!f->absorbed &&
+                    strcmp(f->name, ta->rels[r].target) == 0)
+                    f->used = 1;
+    }
+
     struct elfw *w = elfw_new();
     int text_ndx = elfw_add_section(w, ".text", SHT_PROGBITS,
                                     SHF_ALLOC | SHF_EXECINSTR,
@@ -243,6 +262,18 @@ static int compile(const char *in, const char *out, int pp_only)
                 (Elf64_Xword)ty_size(g->ty),
                 ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT),
                 (Elf64_Half)(g->in_bss ? bss_ndx : data_ndx));
+    /* File-scope asm's .global labels (_start): global functions at their
+     * .text offset. Local labels stay internal — the assembler already
+     * resolved jumps to them into rel32s. */
+    for (struct topasm *ta = u->topasm; ta; ta = ta->next)
+        for (int k = 0; k < ta->nsyms; k++)
+            if (ta->syms[k].is_global)
+                elfw_add_symbol(
+                    w, ta->syms[k].name,
+                    (Elf64_Addr)(ta->text_off + ta->syms[k].off), 0,
+                    ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
+                    (Elf64_Half)text_ndx);
+
     /* extern-declared, used, never defined: the linker's problem */
     for (struct global *g = u->globals; g; g = g->next)
         if (!g->absorbed && !g->defined && g->used)
@@ -264,6 +295,27 @@ static int compile(const char *in, const char *out, int pp_only)
                       callee->sym_ndx, R_X86_64_PLT32, -4);
     }
     free(ext);
+
+    /* File-scope asm relocations (call start_c): PLT32 against the target,
+     * a function of this unit (already symboled and forced used above) or,
+     * failing that, a fresh UNDEF the linker resolves. */
+    for (struct topasm *ta = u->topasm; ta; ta = ta->next)
+        for (int r = 0; r < ta->nrels; r++) {
+            int sym = 0;
+            for (struct func *f = u->funcs; f; f = f->next)
+                if (!f->absorbed && f->sym_ndx &&
+                    strcmp(f->name, ta->rels[r].target) == 0) {
+                    sym = f->sym_ndx;
+                    break;
+                }
+            if (!sym)
+                sym = elfw_add_symbol(
+                    w, ta->rels[r].target, 0, 0,
+                    ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE), SHN_UNDEF);
+            elfw_add_rela(w, text_ndx,
+                          (Elf64_Addr)(ta->text_off + ta->rels[r].off),
+                          sym, R_X86_64_PLT32, ta->rels[r].addend);
+        }
 
     /* String addresses: PC32 against the .rodata section symbol.
      * addend = target offset - 4, because rel32 is measured from the

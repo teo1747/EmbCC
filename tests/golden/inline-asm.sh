@@ -36,3 +36,27 @@ check 'mov +-0x[0-9a-f]+\(%rbp\),%rsi' "a2 -> rsi (S)"
 check 'mov +%rax,0x0\(%rcx\)'          "the =a result stored through the lvalue"
 [ "$fail" -eq 0 ] && echo "inline-asm: syscall codegen correct" || exit 1
 echo "inline-asm golden passed (running proof: on the OS)"
+
+# File-scope asm: crt0's _start stub — a .global label, and/call/jmp, and a
+# PLT32 relocation to the C entry it calls.
+cat > "$out/start.c" <<'CEOF'
+extern void start_c(void);
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "    and $-16, %rsp\n"
+    "    call start_c\n"
+    "1:  jmp 1b\n"
+);
+void start_c(void) {}
+CEOF
+"$EMBCC" -c "$out/start.c" -o "$out/start.o" || { echo "embcc failed on _start"; exit 1; }
+sd=$(objdump -d "$out/start.o" 2>/dev/null); st=$(objdump -t "$out/start.o" 2>/dev/null)
+sr=$(objdump -r "$out/start.o" 2>/dev/null)
+f2=0
+echo "$st" | grep -qE 'g +F .text.*_start'  || { echo "MISSING: _start global func symbol"; f2=1; }
+echo "$sd" | grep -q '48 83 e4 f0'          || { echo "MISSING: and \$-16,%rsp (48 83 e4 f0)"; f2=1; }
+echo "$sd" | grep -q 'e8 00 00 00 00'       || { echo "MISSING: call rel32 (e8 00000000)"; f2=1; }
+echo "$sr" | grep -qE 'R_X86_64_PLT32 +start_c' || { echo "MISSING: PLT32 to start_c"; f2=1; }
+echo "$sd" | grep -q 'e9 fb ff ff ff'       || { echo "MISSING: jmp 1b (e9 fb ff ff ff)"; f2=1; }
+[ "$f2" -eq 0 ] && echo "file-scope asm: _start stub correct" || exit 1
