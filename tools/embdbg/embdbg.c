@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 #include "../../src/elf/elf.h"
 
@@ -982,6 +985,172 @@ static void cmd_verify(struct img *m)
     printf("verify OK\n");
 }
 
+/* ===================================================================== *
+ * TUI — an interactive browser over the debug info. A function list on the
+ * left, a detail pane on the right (signature, source, typed locals). It is
+ * static inspection (no live process — that is the kernel-gated half), so it
+ * browses what .embdbg/DWARF hold. When stdout is not a terminal it prints a
+ * plain full dump instead, so it stays scriptable and testable.
+ * ===================================================================== */
+
+/* The source file and 1-based line span of a function, from its line rows. */
+static int func_span(struct img *m, const struct dfunc *d,
+                     const char **file, int *lo, int *hi)
+{
+    int found = 0; *lo = 1 << 30; *hi = 0; *file = NULL;
+    for (int i = 0; i < m->nrows; i++) {
+        if (m->rows[i].end) continue;
+        if (m->rows[i].addr >= d->lo && m->rows[i].addr < d->hi) {
+            found = 1;
+            if (m->rows[i].line < *lo) *lo = m->rows[i].line;
+            if (m->rows[i].line > *hi) *hi = m->rows[i].line;
+            if (!*file) *file = file_name(m, m->rows[i].file);
+        }
+    }
+    return found;
+}
+
+/* Build the right-pane detail for a function into `lines`, returning count. */
+static int build_detail(struct img *m, const struct dfunc *d,
+                        char lines[][256], int maxlines)
+{
+    int n = 0;
+    if (n < maxlines)
+        snprintf(lines[n++], 256, "%s   [0x%lx, 0x%lx)", d->name, d->lo, d->hi);
+    const char *file; int lo, hi;
+    if (func_span(m, d, &file, &lo, &hi) && file) {
+        if (n < maxlines) snprintf(lines[n++], 256, "%s:%d", file, lo);
+        FILE *f = fopen(file, "r");
+        if (f) {
+            char buf[512]; int ln = 0;
+            while (fgets(buf, sizeof buf, f) && n < maxlines) {
+                ln++;
+                if (ln < lo || ln > hi) continue;
+                buf[strcspn(buf, "\n")] = 0;
+                snprintf(lines[n++], 256, "  %4d | %.240s", ln, buf);
+            }
+            fclose(f);
+        }
+    }
+    if (n < maxlines) lines[n++][0] = 0;
+    if (n < maxlines) snprintf(lines[n++], 256, "%d variable(s):", d->nvars);
+    for (int v = 0; v < d->nvars && n < maxlines; v++) {
+        struct dvar *dv = &d->vars[v];
+        snprintf(lines[n++], 256, "  %-5s %-12s %-8s @ rbp%+ld",
+                 dv->is_param ? "param" : "local",
+                 type_name(m, dv->type_off), dv->name, dv->fbreg);
+    }
+    return n;
+}
+
+static void tui_plain(struct img *m)
+{
+    printf("EmbDBG — %d function(s)\n", m->ndfn);
+    for (int i = 0; i < m->ndfn; i++) {
+        char lines[256][256];
+        int n = build_detail(m, &m->dfn[i], lines, 256);
+        printf("\n== %s ==\n", m->dfn[i].name);
+        for (int j = 1; j < n; j++) printf("%s\n", lines[j]);
+    }
+}
+
+static struct termios g_oldt;
+static int g_raw = 0;
+static void raw_off(void)
+{
+    if (g_raw) { tcsetattr(0, TCSANOW, &g_oldt); g_raw = 0;
+                 printf("\033[?25h\033[0m\033[2J\033[H"); fflush(stdout); }
+}
+static void raw_on(void)
+{
+    tcgetattr(0, &g_oldt);
+    struct termios t = g_oldt;
+    t.c_lflag &= ~(ICANON | ECHO);
+    t.c_cc[VMIN] = 1; t.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &t);
+    g_raw = 1; atexit(raw_off);
+    printf("\033[?25l");
+}
+
+static void tui_interactive(struct img *m)
+{
+    struct winsize ws; int W = 80, H = 24;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 4) { W = ws.ws_col; H = ws.ws_row; }
+    int LW = 24;                              /* left list width */
+    if (W < 50) { LW = W / 3; }
+    int sel = 0, top = 0;
+    char search[64] = {0}; int searching = 0;
+    int *vis = malloc((size_t)(m->ndfn ? m->ndfn : 1) * sizeof(int));
+
+    raw_on();
+    for (;;) {
+        /* visible = functions whose name contains the search string */
+        int nvis = 0;
+        for (int i = 0; i < m->ndfn; i++)
+            if (!search[0] || (m->dfn[i].name && strstr(m->dfn[i].name, search)))
+                vis[nvis++] = i;
+        if (sel >= nvis) sel = nvis ? nvis - 1 : 0;
+        if (sel < top) top = sel;
+        int rows = H - 3;
+        if (sel >= top + rows) top = sel - rows + 1;
+
+        char det[256][256]; int ndet = 0;
+        if (nvis) ndet = build_detail(m, &m->dfn[vis[sel]], det, 256);
+
+        printf("\033[2J\033[H");
+        printf("\033[1m EmbDBG \033[0m %.*s   %d fn%s   \033[2m[j/k] nav  [/] search  [q] quit\033[0m\n",
+               W - 40 > 0 ? W - 40 : 8,
+               "debug view", nvis, nvis == 1 ? "" : "s");
+        if (searching) printf(" /\033[1m%s\033[0m\n", search);
+        else printf(" \033[2m%s\033[0m\n", search[0] ? search : "");
+        for (int r = 0; r < rows; r++) {
+            /* left */
+            int li = top + r;
+            char left[128];
+            if (li < nvis) snprintf(left, sizeof left, "%-*.*s",
+                                    LW, LW, m->dfn[vis[li]].name);
+            else snprintf(left, sizeof left, "%*s", LW, "");
+            if (li == sel) printf(" \033[7m%s\033[0m \033[2m|\033[0m ", left);
+            else           printf(" %s \033[2m|\033[0m ", left);
+            /* right */
+            int rw = W - LW - 5;
+            if (r < ndet) printf("\033[2m%.*s\033[0m", rw > 0 ? rw : 0, det[r]);
+            printf("\n");
+        }
+
+        unsigned char c;
+        if (read(0, &c, 1) != 1) break;
+        if (searching) {
+            if (c == '\r' || c == '\n' || c == 27) { searching = 0; }
+            else if (c == 127 || c == 8) { int l = (int)strlen(search); if (l) search[l-1] = 0; }
+            else if (c >= 32 && c < 127) { int l = (int)strlen(search);
+                if (l < (int)sizeof search - 1) { search[l] = (char)c; search[l+1] = 0; } }
+            continue;
+        }
+        if (c == 'q') break;
+        else if (c == 'j') { if (sel + 1 < nvis) sel++; }
+        else if (c == 'k') { if (sel > 0) sel--; }
+        else if (c == 'g') sel = 0;
+        else if (c == 'G') sel = nvis ? nvis - 1 : 0;
+        else if (c == '/') { searching = 1; search[0] = 0; }
+        else if (c == 27) {                   /* arrow keys: ESC [ A/B */
+            unsigned char s1, s2;
+            if (read(0, &s1, 1) == 1 && s1 == '[' && read(0, &s2, 1) == 1) {
+                if (s2 == 'A' && sel > 0) sel--;
+                else if (s2 == 'B' && sel + 1 < nvis) sel++;
+            }
+        }
+    }
+    raw_off();
+    free(vis);
+}
+
+static void cmd_tui(struct img *m)
+{
+    if (isatty(0) && isatty(1)) tui_interactive(m);
+    else tui_plain(m);            /* piped/non-tty: a scriptable full dump */
+}
+
 /* Link-time entry point (used by EmbLD): parse one relocatable object's DWARF
  * with `addr_bias` = its final .text vaddr so addresses come out absolute,
  * and write a .embdbg whose build_id is the SHA-256 of the linked `image`. */
@@ -1014,6 +1183,7 @@ int main(int argc, char **argv)
             "       embdbg FILE where ADDR          source context + locals in scope\n"
             "       embdbg FILE list ADDR           source lines around addr\n"
             "       embdbg FILE info FUNC           a function's params/locals\n"
+            "       embdbg FILE tui                 interactive browser (plain dump if piped)\n"
             "       embdbg FILE.o emit OUT.embdbg   convert DWARF -> native .embdbg\n"
             "   FILE may be an ELF (reads DWARF) or a .embdbg (reads it natively).\n");
         return 1;
@@ -1049,6 +1219,7 @@ int main(int argc, char **argv)
     else if (strcmp(cmd, "where") == 0)     cmd_where(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "list") == 0)      cmd_list(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "info") == 0)      cmd_info(&m, argc - 3, argv + 3);
+    else if (strcmp(cmd, "tui") == 0)       cmd_tui(&m);
     else { fprintf(stderr, "embdbg: unknown command '%s'\n", cmd); return 1; }
     return 0;
 }
