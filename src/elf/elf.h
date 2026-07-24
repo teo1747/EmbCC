@@ -66,15 +66,41 @@ typedef struct {
     long long   r_addend;
 } Elf64_Rela;
 
+/* Program header — the linker (M3) writes these; the compiler's ET_REL
+ * output has none. */
+typedef struct {
+    Elf64_Word  p_type;
+    Elf64_Word  p_flags;
+    Elf64_Off   p_offset;
+    Elf64_Addr  p_vaddr;
+    Elf64_Addr  p_paddr;
+    Elf64_Xword p_filesz;
+    Elf64_Xword p_memsz;
+    Elf64_Xword p_align;
+} Elf64_Phdr;
+
 #define ELF64_R_INFO(sym, type) \
     (((Elf64_Xword)(sym) << 32) | ((Elf64_Xword)(type) & 0xffffffff))
+#define ELF64_R_SYM(info)  ((Elf64_Word)((info) >> 32))
+#define ELF64_R_TYPE(info) ((Elf64_Word)((info) & 0xffffffff))
+#define ELF64_ST_BIND(info) ((info) >> 4)
+#define ELF64_ST_TYPE(info) ((info) & 0xf)
 
-/* Relocation types EmbCC emits. R_X86_64_PLT32 is what gas/gcc emit
- * for a call to a global; TARGET_ABI §4a records the expensive fact
- * that a static link must treat it as a plain PC32 — the EmbLinkOS
- * linker (TCC patch 0001) and the cross ld both do. */
-#define R_X86_64_PC32  2
-#define R_X86_64_PLT32 4
+/* Relocation types. R_X86_64_PLT32 is what gas/gcc emit for a call to a
+ * global; TARGET_ABI §4a records the expensive fact that a static link
+ * must treat it as a plain PC32 — the EmbLinkOS linker (TCC patch 0001)
+ * and the cross ld both do. GOTPCREL/its relaxable forms reach data
+ * through the GOT (newlib's _impure_ptr — TCC patch 0003, the static
+ * GOT must be built AND filled). */
+#define R_X86_64_64            1
+#define R_X86_64_PC32          2
+#define R_X86_64_PLT32         4
+#define R_X86_64_GOTPCREL      9
+#define R_X86_64_32           10
+#define R_X86_64_32S          11
+#define R_X86_64_PC64         24
+#define R_X86_64_GOTPCRELX    41
+#define R_X86_64_REX_GOTPCRELX 42
 
 /* e_ident indices and values */
 #define EI_MAG0       0
@@ -100,6 +126,15 @@ typedef struct {
 
 #define EM_X86_64     62
 
+/* p_type */
+#define PT_NULL       0
+#define PT_LOAD       1
+
+/* p_flags */
+#define PF_X          0x1
+#define PF_W          0x2
+#define PF_R          0x4
+
 /* sh_type */
 #define SHT_NULL      0
 #define SHT_PROGBITS  1
@@ -117,6 +152,7 @@ typedef struct {
 /* special section indices */
 #define SHN_UNDEF     0
 #define SHN_ABS       0xfff1
+#define SHN_COMMON    0xfff2
 
 /* symbol binding/type, packed into st_info */
 #define STB_LOCAL     0

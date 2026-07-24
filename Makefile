@@ -27,10 +27,18 @@ SRCS := \
 
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 
-all: embcc embread
+all: embcc embread embld
 
 embcc: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS)
+
+# embld — the integrated linker (ARCHITECTURE §6, WORKPLAN stream B), as
+# a standalone tool for host development. The link library also gets
+# wired into embcc so `embcc prog.c -o prog` links in-process.
+embld: tools/embld/embld.c src/link/link.c src/driver/util.c \
+       src/link/link.h src/elf/elf.h
+	$(CC) $(CFLAGS) -o $@ tools/embld/embld.c src/link/link.c \
+	    src/driver/util.c
 
 # embread — the EMBX dumper/verifier (EMBX spec §9). A separate binary,
 # not part of embcc: it reads images, it does not compile. The EMBX
@@ -47,10 +55,10 @@ $(BUILD)/%.o: src/%.c
 # enough and cannot go stale (CONTRIBUTING lie #1).
 $(OBJS): $(wildcard src/*/*.h)
 
-test: embcc embread
+test: embcc embread embld
 	tests/run.sh
 
 clean:
-	rm -rf $(BUILD) embcc embread
+	rm -rf $(BUILD) embcc embread embld
 
 .PHONY: all test clean

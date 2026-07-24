@@ -1,0 +1,89 @@
+#!/bin/sh
+# EmbLD, the integrated linker (ARCHITECTURE §6, WORKPLAN stream B),
+# proven on the host — objects linked into ET_EXECs that RUN.
+#
+# The test programs are freestanding: their _start does the Linux
+# exit(N) syscall directly, so the host can run them with no libc and no
+# OS. That isolates the LINKER — layout, symbol resolution, relocation,
+# ET_EXEC emission — from the EmbLink syscall ABI, exactly the
+# "prove on the host first" split (DECISIONS D-005) that got the
+# compiler through its own milestones. The EmbLink acceptance (B1, the
+# M1 program with real crt0/newlib) is a separate on-OS step.
+set -u
+echo "TEST-MARKER embld-link"
+
+EMBLD=./embld
+EMBCC=${EMBCC:-./embcc}
+[ -x "$EMBLD" ] || { echo "embld not built"; exit 1; }
+out=tests/golden/out/embld
+rm -rf "$out"; mkdir -p "$out"
+
+# _start that exits with the value a compute() returns — the freestanding
+# harness every case links against.
+cat > "$out/start.c" << 'EOF'
+extern int compute(void);
+static long do_exit(long c){long r;
+  __asm__ volatile("syscall":"=a"(r):"a"(60),"D"(c):"rcx","r11","memory");
+  return r;}
+void _start(void){ do_exit(compute()); }
+EOF
+gcc -c -ffreestanding -fno-pie -O0 "$out/start.c" -o "$out/start.o" || {
+    echo "could not build the freestanding harness"; exit 1; }
+
+run() { # name expected -- links $out/$name.o + start.o, runs, checks exit
+    "$EMBLD" -o "$out/$1" "$out/start.o" "$out/$1.o" || {
+        echo "$1: embld failed"; exit 1; }
+    chmod +x "$out/$1"
+    "$out/$1"; got=$?
+    [ "$got" -eq "$2" ] || { echo "$1: exit $got, expected $2"; exit 1; }
+    echo "$1: linked and ran, exit $got"
+}
+
+# 1. a single object, intra-object call (PC32 relocation)
+cat > "$out/one.c" << 'EOF'
+static int twice(int x){ return x + x; }
+int compute(void){ return twice(21); }
+EOF
+gcc -c -ffreestanding -fno-pie -O0 "$out/one.c" -o "$out/one.o"
+run one 42
+
+# 2. cross-object symbol resolution + .data + .bss
+cat > "$out/two.c" << 'EOF'
+extern int helper(int);
+int shared_global = 100;      /* .data */
+int bss_global;               /* .bss, loader zero-fills */
+int compute(void){ bss_global = 5; return helper(shared_global) + bss_global; }
+EOF
+cat > "$out/twohelp.c" << 'EOF'
+int helper(int x){ return x / 3 - 3; }   /* 100/3 - 3 = 30 */
+EOF
+gcc -c -ffreestanding -fno-pie -O0 "$out/two.c" -o "$out/two.o"
+gcc -c -ffreestanding -fno-pie -O0 "$out/twohelp.c" -o "$out/twohelp.o"
+"$EMBLD" -o "$out/two" "$out/start.o" "$out/two.o" "$out/twohelp.o" || {
+    echo "two: embld failed"; exit 1; }
+chmod +x "$out/two"; "$out/two"; got=$?
+[ "$got" -eq 35 ] || { echo "two: exit $got, expected 35 (30+5)"; exit 1; }
+echo "two: cross-object + .data + .bss, exit $got"
+
+# 3. THE INTEGRATION: an object compiled by EMBCC, linked by EMBLD.
+# No external toolchain touches the compute half — the self-hosting loop
+# in miniature.
+if [ -x "$EMBCC" ]; then
+    "$EMBCC" -c "$out/one.c" -o "$out/emb.o" || {
+        echo "embcc failed on the compute object"; exit 1; }
+    "$EMBLD" -o "$out/emb" "$out/start.o" "$out/emb.o" || {
+        echo "embld failed on the embcc object"; exit 1; }
+    chmod +x "$out/emb"; "$out/emb"; got=$?
+    [ "$got" -eq 42 ] || { echo "emb: exit $got, expected 42"; exit 1; }
+    echo "emb: EmbCC-compiled, EmbLD-linked, exit $got"
+fi
+
+# 4. the ET_EXEC is well-formed: readelf accepts it, it is EXEC not DYN
+#    (TARGET_ABI §4b: never PIE), entry lands in the executable segment.
+readelf -h "$out/one" | grep -q "EXEC (Executable file)" || {
+    echo "output is not ET_EXEC"; exit 1; }
+# readelf prints each segment's flags on the line AFTER the LOAD line
+flags=$(readelf -l "$out/one" | grep -A1 "LOAD" | grep -oE "R E|RW ")
+echo "$flags" | grep -q "R E" || { echo "no R+X load segment"; exit 1; }
+echo "$flags" | grep -q "RW"  || { echo "no R+W load segment"; exit 1; }
+echo "ET_EXEC well-formed: two PT_LOAD segments, W^X"
