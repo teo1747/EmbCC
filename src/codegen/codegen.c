@@ -123,6 +123,12 @@ struct brsite {
     int label;
 };
 
+/* -g: collect the (offset,line) line table into each ir_func. Off by default
+ * so ordinary output is untouched (the self-host fixed point depends on it).
+ * codegen runs one unit at a time, single threaded — a file-scope flag is
+ * sound; codegen_unit sets it from want_debug. */
+static int g_want_debug;
+
 static void gen_func(struct ir_func *fn, struct code *text,
                      struct sites *st)
 {
@@ -229,6 +235,26 @@ static void gen_func(struct ir_func *fn, struct code *text,
 
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
+        /* -g: a row where the source line changes. text->len is the .text
+         * offset this instruction's code begins at (the switch below emits
+         * it). Multiple IR ops from one statement share a line and collapse
+         * to a single row; ops with no line (0) inherit the last row. */
+        if (g_want_debug && i->line) {
+            struct ir_line *last = fn->nlines ? &fn->lines[fn->nlines - 1]
+                                              : (struct ir_line *)0;
+            if (last && last->off == text->len) {
+                last->line = i->line;   /* same PC: the latest line wins */
+            } else if (!last || last->line != i->line) {
+                if (fn->nlines == fn->linecap) {
+                    fn->linecap = fn->linecap ? fn->linecap * 2 : 8;
+                    fn->lines = xrealloc(fn->lines,
+                                         (size_t)fn->linecap * sizeof *fn->lines);
+                }
+                fn->lines[fn->nlines].off = text->len;
+                fn->lines[fn->nlines].line = i->line;
+                fn->nlines++;
+            }
+        }
         switch (i->op) {
         case IR_CONST:
             x86_mov_eax_imm(text, i->imm, i->w);
@@ -689,9 +715,10 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
                   struct strsite **strs, int *nstrs,
                   struct gsite **gs, int *ngs,
-                  struct fsite **fs, int *nfs)
+                  struct fsite **fs, int *nfs, int want_debug)
 {
     struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    g_want_debug = want_debug;
 
     for (int n = 0; n < iu->nfuncs; n++)
         gen_func(&iu->funcs[n], text, &st);

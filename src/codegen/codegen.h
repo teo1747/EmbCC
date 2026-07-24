@@ -39,10 +39,12 @@ struct fsite {
  * patched once all functions are placed); external call sites are
  * returned via ext and next for the driver to relocate. The array is
  * malloc'd; caller frees. */
+/* want_debug (from -g) turns on collection of each func's (offset,line)
+ * line table (ir_func.lines); off, output is byte-for-byte as before. */
 void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
                   struct strsite **strs, int *nstrs,
                   struct gsite **gs, int *ngs,
-                  struct fsite **fs, int *nfs);
+                  struct fsite **fs, int *nfs, int want_debug);
 
 #endif

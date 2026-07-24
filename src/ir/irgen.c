@@ -8,6 +8,14 @@
 #include "../sema/sema.h"
 #include "../sema/type.h"
 
+/* The source line currently being lowered. gen_stmt updates it as it walks
+ * the statement list, and gen_func resets it per function; emit() stamps it
+ * onto every instruction so the -g line table in codegen can map .text
+ * offsets back to source lines. irgen runs one function at a time, single
+ * threaded, so a file-scope cursor is sound. Off (-g absent) it is simply
+ * ignored — nothing reads ir_ins.line. */
+static int g_cur_line;
+
 static struct ir_ins *emit(struct ir_func *fn)
 {
     if (fn->nins == fn->cap) {
@@ -22,6 +30,7 @@ static struct ir_ins *emit(struct ir_func *fn)
      * garbage retnclass once walked retcls[] off the end and crashed. */
     memset(i, 0, sizeof *i);
     i->op = IR_CONST;
+    i->line = g_cur_line;
     i->dst = i->a = i->b = -1;
     i->w = 4;
     i->size = 4;
@@ -981,6 +990,8 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
                      const struct loopctx *loop)
 {
     for (; s; s = s->next) {
+        if (s->line)
+            g_cur_line = s->line;   /* -g: rows key off statement lines */
         switch (s->kind) {
         case STMT_BREAK:
             emit_jmp(fn, loop->brk);
@@ -1231,6 +1242,7 @@ static void gen_func(struct ir_func *fn, struct func *f)
 {
     fn->src = f;
     fn->nvregs = f->nvars; /* params + locals occupy [0, nvars) */
+    g_cur_line = f->line;  /* prologue rows attribute to the definition */
     gen_stmt(fn, f->body, NULL);
 }
 

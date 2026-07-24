@@ -128,6 +128,23 @@ look plausible."
    `gdb` on the host sets a breakpoint by line in an EmbCC-compiled program,
    stops there, and `bt` names the right lines; and a faulting EmbCC program
    reports the source line. The compiler already has every input.
+   **DONE — 2026-07-24.** `embcc -g` emits `.debug_line` + a one-DIE
+   `.debug_info` CU + `.debug_abbrev` (DWARF v4, 32-bit, addr_size 8), with
+   relocations against `.text`/`.debug_line`/`.debug_abbrev` so the ET_REL
+   addresses resolve at link. Proven on the host the honest way: `gdb -batch`
+   reads the table from an EmbCC object and resolves `info line dbg.c:3` to
+   `0x13 <add+19>` (post-prologue) and line 8 to `<main+…>` — the debugger
+   attributes each line to the correct function (`bt` names functions from the
+   ELF `.symtab`, no subprogram DIEs needed yet). Gate:
+   `tests/golden/debug-line.sh`. The line table is built from a per-function
+   `(offset,line)` table codegen collects (irgen stamps every `ir_ins` with
+   its statement line via a cursor); the DWARF bytes live in
+   `src/debug/dwarf.c`. `-g` is opt-in and deterministic — with it off, output
+   is byte-for-byte as before, so the M3 self-host fixed point still closes
+   (now 14 sources: `dwarf.c` self-compiles and `stage1≡stage2` holds).
+   Not yet: emission at LINK time of the absolute-addressed native form, and
+   proving it on a *linked* binary (EmbLD carrying/relocating `.debug_*`) —
+   see "the producer finding" above; the object-level host proof stands.
 2. **Frame + locals.** `.debug_info` DIEs for each function and its locals with
    `DW_AT_location` = a constant frame-base offset (EmbCC's uniform stack-slot
    model makes every location a single `DW_OP_fbreg`, the trivial case DWARF

@@ -26,7 +26,7 @@ for f in "$NEWLIB_INC/stdio.h" "$CRT0" "$SYSCALLS" "$LIBC"; do
 done
 
 SRCS="src/driver/main.c src/driver/util.c src/lex/lex.c src/parse/parse.c
-      src/sema/sema.c src/sema/type.c src/ir/irgen.c src/codegen/codegen.c
+      src/sema/sema.c src/sema/type.c src/ir/irgen.c src/codegen/codegen.c src/debug/dwarf.c
       src/asm/emit.c src/asm/topasm.c src/cpp/predef.c src/cpp/cpp.c src/elf/write.c"
 INCS="-I include -I $NEWLIB_INC"
 

@@ -82,6 +82,9 @@ struct ir_asm {
 
 struct ir_ins {
     enum ir_op op;
+    int line;                /* source line this instruction lowers from, 0
+                              * if none — stamped by irgen, read only by the
+                              * -g line-table pass in codegen */
     int dst, a, b;
     int w;                   /* 4 or 8: operation width class */
     int size;                /* 1/2/4/8: memory width for LD/ST/EXT */
@@ -119,6 +122,12 @@ struct ir_ins {
     struct ir_asm *asm_ir;   /* IR_ASM */
 };
 
+/* One line-table row: a .text offset (within this function) maps to a
+ * source line. Collected by codegen only under -g; consumed by the DWARF
+ * emitter, which brackets each function's rows with set_address/end_sequence
+ * using the function's code_off/code_len (on struct func). */
+struct ir_line { int off; int line; };
+
 struct ir_func {
     struct func *src;        /* name, linkage, code_off/len live here */
     int nvregs;
@@ -127,6 +136,8 @@ struct ir_func {
     int outgoing_bytes;      /* widest stack-argument area of any call */
     struct ir_ins *ins;
     int nins, cap;
+    struct ir_line *lines;   /* -g: (offset, line) rows in .text order */
+    int nlines, linecap;
 };
 
 /* One .rodata string; offsets are assigned sequentially at collection

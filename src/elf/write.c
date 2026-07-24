@@ -41,7 +41,7 @@ struct section {
 };
 
 #define ELFW_MAX_SECTIONS 32
-#define ELFW_MAX_RELA 4      /* distinct target sections: .text, .data, ... */
+#define ELFW_MAX_RELA 6      /* .text, .data, and -g's .debug_info/.debug_line */
 
 /* Relocations are grouped by the section they apply to; each group emits
  * its own .rela.<name> section. One group (.text) is the common case; a

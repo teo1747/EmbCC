@@ -20,6 +20,7 @@ SRCS := \
 	src/sema/type.c \
 	src/ir/irgen.c \
 	src/codegen/codegen.c \
+	src/debug/dwarf.c \
 	src/asm/emit.c \
 	src/asm/topasm.c \
 	src/cpp/predef.c \

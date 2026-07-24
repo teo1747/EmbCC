@@ -13,6 +13,7 @@
 #include "../asm/topasm.h"
 #include "../codegen/codegen.h"
 #include "../cpp/cpp.h"
+#include "../debug/dwarf.h"
 #include "../cpp/predef.h"
 #include "../elf/write.h"
 #include "../ir/ir.h"
@@ -109,6 +110,11 @@ static const char *path_basename(const char *p)
 static const char *incdirs[MAX_INCDIRS];
 static int nincdirs;
 
+/* -g: emit DWARF line info (D-010 step 1). Opt-in — with it off, output is
+ * byte-for-byte as before, which is what keeps the M3 self-host fixed point
+ * (self-host builds without -g). */
+static int want_debug;
+
 static int compile(const char *in, const char *out, int pp_only)
 {
     char *src = read_file(in);
@@ -147,7 +153,7 @@ static int compile(const char *in, const char *out, int pp_only)
     struct fsite *fs;
     int next, nstrs, ngs, nfs;
     codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
-                 &fs, &nfs);
+                 &fs, &nfs, want_debug);
 
     /* Lay out the defined globals: initialized -> .data, zero -> .bss,
      * each aligned to its (element) size. */
@@ -218,6 +224,12 @@ static int compile(const char *in, const char *out, int pp_only)
             code_byte(&text, ta->code[k]);
     }
 
+    /* -g: build the DWARF line sections now (needs each func's code_off/len,
+     * set by codegen). Off, dw stays empty and nothing below fires. */
+    struct dwarf_out dw = { { 0 }, { 0 }, 0, 0, 0 };
+    if (want_debug)
+        dwarf_emit(iu, in, &dw);
+
     struct elfw *w = elfw_new();
     int text_ndx = elfw_add_section(w, ".text", SHT_PROGBITS,
                                     SHF_ALLOC | SHF_EXECINSTR,
@@ -236,9 +248,20 @@ static int compile(const char *in, const char *out, int pp_only)
         bss_ndx = elfw_add_section(w, ".bss", SHT_NOBITS,
                                    SHF_ALLOC | SHF_WRITE, NULL,
                                    (Elf64_Xword)bss_len, 8);
+    /* -g: the three DWARF sections (non-alloc, so no load cost; stripped
+     * from a shipped image without touching the code). Their indices feed
+     * the relocation-target lookup below. */
+    static const char *const dwsec_name[DWARF_NSEC] =
+        { ".debug_abbrev", ".debug_info", ".debug_line" };
+    int dwsec_ndx[DWARF_NSEC] = { 0, 0, 0 };
+    if (want_debug)
+        for (int s = 0; s < DWARF_NSEC; s++)
+            dwsec_ndx[s] = elfw_add_section(w, dwsec_name[s], SHT_PROGBITS, 0,
+                                            dw.sec[s], (Elf64_Xword)dw.seclen[s],
+                                            1);
     elfw_add_symbol(w, path_basename(in), 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_FILE), SHN_ABS);
-    elfw_add_symbol(w, "", 0, 0,
+    int text_sym = elfw_add_symbol(w, "", 0, 0,
                     ELF64_ST_INFO(STB_LOCAL, STT_SECTION),
                     (Elf64_Half)text_ndx);
     int rodata_sym = 0;
@@ -247,6 +270,15 @@ static int compile(const char *in, const char *out, int pp_only)
                                      ELF64_ST_INFO(STB_LOCAL,
                                                    STT_SECTION),
                                      (Elf64_Half)rodata_ndx);
+    /* -g: STT_SECTION symbols for the debug sections, so the line/info
+     * fields can relocate against them (DWTGT_ABBREV/DWTGT_LINE). Added here
+     * in the local block — the writer refuses a local after any global. */
+    int dwsym[DWARF_NSEC] = { 0, 0, 0 };
+    if (want_debug)
+        for (int s = 0; s < DWARF_NSEC; s++)
+            dwsym[s] = elfw_add_symbol(w, "", 0, 0,
+                          ELF64_ST_INFO(STB_LOCAL, STT_SECTION),
+                          (Elf64_Half)dwsec_ndx[s]);
     /* Locals before globals — the writer enforces the gABI ordering.
      * Only canonical, defined functions own code. */
     for (struct func *f = u->funcs; f; f = f->next)
@@ -379,6 +411,22 @@ static int compile(const char *in, const char *out, int pp_only)
     }
     free(fs);
 
+    /* -g: the DWARF relocations. Each field the emitter left zero gets an
+     * absolute reloc — 8-byte .text addresses (R_X86_64_64) and 4-byte
+     * section offsets (R_X86_64_32) — against the right section symbol. */
+    if (want_debug) {
+        for (int i = 0; i < dw.nrelocs; i++) {
+            struct dwarf_reloc *r = &dw.relocs[i];
+            int sym = r->target == DWTGT_TEXT   ? text_sym
+                    : r->target == DWTGT_ABBREV ? dwsym[DWSEC_ABBREV]
+                    :                             dwsym[DWSEC_LINE];
+            elfw_add_rela(w, dwsec_ndx[r->in_sec], (Elf64_Addr)r->off, sym,
+                          r->width == 8 ? R_X86_64_64 : R_X86_64_32,
+                          r->addend);
+        }
+        dwarf_free(&dw);
+    }
+
     int rc = elfw_write(w, out);
     elfw_free(w);
     return rc == 0 ? 0 : 1;
@@ -420,6 +468,8 @@ int main(int argc, char **argv)
             compile_mode = 1;
         } else if (strcmp(argv[i], "-E") == 0) {
             pp_only = 1;
+        } else if (strcmp(argv[i], "-g") == 0) {
+            want_debug = 1;
         } else if (strncmp(argv[i], "-I", 2) == 0) {
             const char *dir = argv[i][2] ? argv[i] + 2
                                          : (i + 1 < argc ? argv[++i] : 0);
