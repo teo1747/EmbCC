@@ -1,7 +1,7 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
-**Status: M1 complete — EmbLinkOS ran EmbCC's output (exit 42, 2026-07-20).
-M2 near done.** The decision record below still governs. `embcc -c` compiles a
+**Status: M2 complete — EmbLinkOS ran the real sval SDK compiled by EmbCC
+(2026-07-24).** The decision record below still governs. `embcc -c` compiles a
 substantial C subset — the integer types, pointers (incl. function pointers),
 arrays, structs/unions/enums, globals, the full operator set, and a
 preprocessor that digests **real newlib headers**, so `#include <stdio.h>`

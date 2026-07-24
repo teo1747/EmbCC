@@ -5,7 +5,21 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position: M1 COMPLETE — confirmed on the OS 2026-07-20.** The
+**Current position: M2 COMPLETE — confirmed on the OS 2026-07-24.** The
+acceptance test passed on EmbLinkOS itself: value.c, wire.c, sval.c and
+tally.c (~1,030 lines of the real sval SDK, from the OS tree, UNMODIFIED)
+compiled by EmbCC, linked into tally.elf against crt0/syscalls/newlib, packed
+into the EMBKFS image, and run under the OS's own `test extern` oracle —
+`ls / | tally | get rows` returns OK, including the extern|extern chain that
+drives EmbCC's serialize AND deserialize paths. The installed binary was
+427,480 bytes (the EmbCC build) versus the stock gcc build's 365,240, so it
+was demonstrably EmbCC's code the kernel ran. That is the same
+cross-check EmbBuild and TCC were each held to (ROADMAP M2). On the host, a
+gcc-built harness drives the EmbCC-compiled SDK through a full
+serialize/deserialize round trip and its output matches gcc's exactly
+(tests/golden/emblinkos-sdk.sh).
+
+**M1 COMPLETE — confirmed on the OS 2026-07-20.** The
 exit-42 object compiled by `embcc -c`, linked against the real crt0/newlib,
 was loaded by the EmbLinkOS kernel and exited 0x2A
 (`/data/apps/embcc42/embcc42.elf`, pid 6, `[syscall] exit code=0x2A`). The

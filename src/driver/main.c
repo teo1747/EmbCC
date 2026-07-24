@@ -18,7 +18,7 @@
 #include "../sema/sema.h"
 #include "util.h"
 
-#define EMBCC_VERSION "0.9.0-m2.structval"
+#define EMBCC_VERSION "1.0.0-m2.complete"
 
 static void print_version(void)
 {
