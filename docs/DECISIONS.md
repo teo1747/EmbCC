@@ -276,7 +276,14 @@ here answers to.
 ## D-010 — Debug info: **DWARF as the bridge, native `.embdbg` derived last**
 
 **Decided:** 2026-07-24. **Status:** current intent, deferred; requirements
-written (`docs/EMBDBG_Requirements.md`), no byte layout, no implementation.
+written (`docs/EMBDBG_Requirements.md`), no byte layout on this side, no
+implementation. **Update (same day):** the OS side now carries the byte-exact
+format AND the kernel debugging contract (`myos/docs/EMBDBG_Specification.md`) —
+which supplies the consumer and invariants this decision said `.embdbg` must be
+derived from. It does not revise D-010: DWARF stays the host bridge, and the
+producer finding is that the LINKER (EmbLD), not the compiler, emits the
+absolute-addressed `.embdbg` — EmbCC's ET_REL objects carry only *relocatable*
+line info (the EMBX finding, one channel over; see EMBDBG_Requirements.md).
 
 EmbCC's first debug output will be **minimal DWARF line info**, because it is
 debuggable by tools that already exist (gdb/lldb) on the host, the day it lands

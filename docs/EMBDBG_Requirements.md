@@ -3,14 +3,46 @@
 *Status: **requirements and a format decision, no byte layout.** Written now, in
 the discipline this project insists on: the reasoning survives the gap between
 deciding and building, and the on-disk shape is derived **last**, from invariants
-that must exist first. This document deliberately does NOT specify the `.embdbg`
-byte format — see §6 for why that would be the DECISIONS D-003 mistake at a
-smaller scale.*
+that must exist first. This document governs the **producer** side (EmbCC) and
+still deliberately does NOT specify the `.embdbg` byte format — see §6.*
 
-**Consumes:** the EMBX spec's reservation — `EMBX_COMPAT_DEBUG_SIDECAR`
-(`myos/docs/EMBX_Specification_v2.md` §3.6) already names a `.embdbg` sidecar and
-records that a stripped image sets `EMBX_F_STRIPPED`. **Paired with:** EmbCC (the
-producer) and EmbDBG (the consumer, a debugger that does not exist yet).
+**The OS side now exists.** `myos/docs/EMBDBG_Specification.md` (2026-07-24)
+specifies the byte-exact `.embdbg` format **and** the kernel debugging contract
+(`CAP_DEBUG`, `SPAWN_ACTION_DEBUG`, syscalls 69–75, exception routing) — i.e. it
+supplies the consumer and the invariants D-010 §6/§8-Q1 said the format had to be
+derived from. Crucially, **that spec does not revise D-010**: it keeps DWARF as
+the host bridge and derives the native `.embdbg` from a real consumer, which is
+exactly this document's §3. Its own staging even lets its M3 consume "D-010's
+DWARF line info converted" through a bridge. So the two documents are the paired
+producer/consumer halves the project's docs always come in — this one owns what
+EmbCC emits and when; that one owns the bytes and the kernel mechanism.
+
+**Consumes:** the EMBX spec's reservation — `EMBX_COMPAT_DEBUG_SIDECAR` and
+`EMBX_SEG_DEBUG` (`myos/docs/EMBX_Specification_v2.md` §3.3/§3.6), the `build_id`
+the format binds to (§3.4). **Paired with:** the OS-side format+contract spec
+above, and EmbDBG (the debugger it specifies).
+
+## The producer finding: the LINKER owns the absolute-addressed `.embdbg`
+
+The OS spec's `.embdbg` addresses are **absolute vaddrs** (its §2, §5.3–5.5),
+which it can assume because an EMBX APP is fully linked with no load slide (EMBX
+§4.1). But **EmbCC emits `ET_REL` — relocatable objects** — where those absolute
+addresses do not exist yet. This is the EMBX finding again, one channel over:
+
+> Just as "EmbCC emits EMBX" means "EmbLD emits EMBX," **"EmbCC produces
+> `.embdbg`" means the linker (or a post-link step) does.** EmbCC's job is to
+> emit *relocatable* debug info — DWARF line info in the `.o`, carrying
+> relocations against section symbols exactly as DWARF always does in a
+> relocatable object (D-010 step 1). Resolving those to the absolute vaddrs the
+> `.embdbg` format wants is a **link-time** act, so it lands with or after EmbLD
+> (M3, WORKPLAN stream B), by one of two routes the OS spec already allows:
+> EmbLD emitting `.embdbg` directly from the linked image, or a
+> DWARF→`.embdbg` bridge over the linked binary.
+
+The upshot for EmbCC's own work is clean: **step 1 (emit relocatable DWARF line
+info) is unchanged and can proceed whenever**, because relocatable line info
+needs no linker. Only the *absolute-addressed `.embdbg` production* waits for
+link. This sharpens rather than delays the plan.
 
 ---
 
@@ -163,10 +195,14 @@ everything past it waits for EmbDBG.
 
 ## 8. Open questions (for when this becomes concrete)
 
-1. **The kernel debugging contract.** EmbDBG needs the OS to expose
-   breakpoint/step/register-inspect over some interface. That is a kernel design
-   question (D-007 keeps the kernel out of EmbCC's scope), and it gates
-   everything past step 3.
+1. **The kernel debugging contract.** ~~EmbDBG needs the OS to expose
+   breakpoint/step/register-inspect over some interface.~~ **Answered
+   (2026-07-24):** `myos/docs/EMBDBG_Specification.md` §6 designs exactly this —
+   `CAP_DEBUG` (a new capability class, so a debugger is attenuated not
+   omnipotent), `SPAWN_ACTION_DEBUG`, syscalls 69–75, and the `isr_handler`
+   exception-routing change. It is a kernel design (D-007 keeps it out of EmbCC),
+   reserved not yet built. This unblocks the path past step 3 on the OS side; the
+   EmbCC side is still gated on steps 1–3.
 2. **Stack unwinding.** Backtraces past the current frame need either frame
    pointers (EmbCC keeps `rbp` as a frame pointer today — a gift for this) or
    CFI. With rbp-based frames, unwinding is a pointer walk and needs no `.eh_frame`
