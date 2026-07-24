@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -588,7 +589,8 @@ static int decode_one(const unsigned char *code, int n, unsigned long addr, char
     if (op == 0x80 || op == 0x81 || op == 0x83) {              /* grp1 imm */
         int sz = (op == 0x80) ? 1 : opsz;
         int r = modrm(code, &i, rex, sz, 0, rm);
-        long imm; if (op == 0x81) { imm = rd_s32(code + i); i += 4; }
+        long imm; 
+        if (op == 0x81) { imm = rd_s32(code + i); i += 4; }
         else { imm = (signed char)code[i]; i += 1; }
         sprintf(out, "%s    $0x%lx,%s", GRP1[r & 7], imm & 0xffffffffUL, rm);
         return i;
@@ -605,7 +607,8 @@ static int decode_one(const unsigned char *code, int n, unsigned long addr, char
     if (op == 0xc6 || op == 0xc7) {                            /* mov imm */
         int sz = (op == 0xc6) ? 1 : opsz;
         int r = modrm(code, &i, rex, sz, 0, rm); (void)r;
-        long imm; if (op == 0xc6) { imm = code[i]; i += 1; }
+        long imm; 
+        if (op == 0xc6) { imm = code[i]; i += 1; }
         else { imm = rd_s32(code + i); i += 4; }
         sprintf(out, "mov    $0x%lx,%s", imm & 0xffffffffUL, rm);
         return i;
@@ -1530,82 +1533,287 @@ static void raw_on(void)
     printf("\033[?25l");
 }
 
-static void tui_interactive(struct img *m)
+/* ======================================================================
+ * Rich multi-panel TUI (VS/CLion-style): a Call-Stack / Functions list, a
+ * Source + Assembly center, and a Registers + Variables right column, over a
+ * loaded image (+ an optional crash dump for the live-ish register/stack/value
+ * data). Panel navigation, incremental search, and a ':' command palette.
+ * Falls back to tui_plain() when stdout is not a tty (scriptable).
+ * ==================================================================== */
+
+/* One rendered screen cell-line: text + an optional ANSI attribute for the
+ * whole line (selected row, current source line, faulting insn, rip reg). */
+struct cell { char t[256]; const char *a; };
+static void cell_set(struct cell *c, const char *attr, const char *fmt, ...)
 {
-    struct winsize ws; int W = 80, H = 24;
-    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 4) { W = ws.ws_col; H = ws.ws_row; }
-    int LW = 24;                              /* left list width */
-    if (W < 50) { LW = W / 3; }
-    int sel = 0, top = 0;
+    c->a = attr;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(c->t, sizeof c->t, fmt, ap);
+    va_end(ap);
+}
+static void put_cell(const struct cell *c, int w)
+{
+    if (c->a) fputs(c->a, stdout);
+    int n = 0;
+    for (const char *p = c->t; *p && n < w; p++, n++) putchar(*p);
+    for (; n < w; n++) putchar(' ');
+    if (c->a) fputs("\033[0m", stdout);
+}
+
+/* A one-file source-line cache (the panel only ever shows one file at a time). */
+static char  g_src_path[512];
+static char *g_src_lines[16384];
+static int   g_src_n;
+static void src_load(const char *path)
+{
+    if (path && g_src_path[0] && strcmp(path, g_src_path) == 0) return;   /* cached */
+    for (int i = 0; i < g_src_n; i++) free(g_src_lines[i]);
+    g_src_n = 0; g_src_path[0] = 0;
+    if (!path) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    strncpy(g_src_path, path, sizeof g_src_path - 1);
+    char buf[1024];
+    while (fgets(buf, sizeof buf, f) && g_src_n < 16384) {
+        buf[strcspn(buf, "\n")] = 0;
+        g_src_lines[g_src_n++] = strdup(buf);
+    }
+    fclose(f);
+}
+
+struct tframe { unsigned long addr, rbp; };
+
+static void tui_interactive(struct img *m, struct crash *cr, int crash_avail)
+{
+    struct winsize ws; int W = 100, H = 30;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 10 && ws.ws_col > 60) { W = ws.ws_col; H = ws.ws_row; }
+    if (W > 240) W = 240;
+    int stackW = (W < 110) ? 18 : 26;
+    int regW   = (W < 110) ? 30 : 42;
+    int centerW = W - stackW - regW - 2;
+    if (centerW < 24) { centerW = 24; regW = W - stackW - centerW - 2; if (regW < 10) regW = 10; }
+    int bh = H - 2;                         /* body rows (title + status take 2) */
+
+    /* Unwind the crash into frames {return addr, that frame's rbp} -- same walk
+     * cmd_crash does, but keeping each frame's rbp so Variables can read values
+     * for ANY selected frame, not just #0. */
+    struct tframe fr[80]; int nfr = 0;
+    if (crash_avail) {
+        int ok; unsigned long rip = crash_reg(cr, "rip", &ok), rbp = crash_reg(cr, "rbp", &ok);
+        fr[nfr].addr = rip; fr[nfr].rbp = rbp; nfr++;
+        unsigned long fp = rbp;
+        for (int d = 1; d < 80; d++) {
+            int okr, okf;
+            unsigned long ret = crash_mem(cr, fp + 8, &okr), cal = crash_mem(cr, fp, &okf);
+            if (!okr || !ret) break;
+            fr[nfr].addr = ret; fr[nfr].rbp = (okf ? cal : 0); nfr++;
+            if (!func_at(m, ret)) break;
+            if (!okf || cal <= fp) break;
+            fp = cal;
+        }
+    }
+
+    int mode_crash = crash_avail;           /* Tab toggles when a crash is loaded */
+    int sel = 0;
     char search[64] = {0}; int searching = 0;
+    char palette[128] = {0}; int in_palette = 0;
+    char status[160] = {0};
     int *vis = malloc((size_t)(m->ndfn ? m->ndfn : 1) * sizeof(int));
 
     raw_on();
     for (;;) {
-        /* visible = functions whose name contains the search string */
         int nvis = 0;
         for (int i = 0; i < m->ndfn; i++)
             if (!search[0] || (m->dfn[i].name && strstr(m->dfn[i].name, search)))
                 vis[nvis++] = i;
-        if (sel >= nvis) sel = nvis ? nvis - 1 : 0;
-        if (sel < top) top = sel;
-        int rows = H - 3;
-        if (sel >= top + rows) top = sel - rows + 1;
+        int nlist = mode_crash ? nfr : nvis;
+        if (sel >= nlist) sel = nlist ? nlist - 1 : 0;
+        if (sel < 0) sel = 0;
 
-        char det[256][256]; int ndet = 0;
-        if (nvis) ndet = build_detail(m, &m->dfn[vis[sel]], det, 256);
+        /* current address + this frame's rbp (for variable values). */
+        unsigned long cur = 0, cur_rbp = 0;
+        if (mode_crash) { if (nfr) { cur = fr[sel].addr; cur_rbp = fr[sel].rbp; } }
+        else if (nvis)  { cur = m->dfn[vis[sel]].lo; }
 
-        printf("\033[2J\033[H");
-        printf("\033[1m EmbDBG \033[0m %.*s   %d fn%s   \033[2m[j/k] nav  [/] search  [q] quit\033[0m\n",
-               W - 40 > 0 ? W - 40 : 8,
-               "debug view", nvis, nvis == 1 ? "" : "s");
-        if (searching) printf(" /\033[1m%s\033[0m\n", search);
-        else printf(" \033[2m%s\033[0m\n", search[0] ? search : "");
-        for (int r = 0; r < rows; r++) {
-            /* left */
-            int li = top + r;
-            char left[128];
-            if (li < nvis) snprintf(left, sizeof left, "%-*.*s",
-                                    LW, LW, m->dfn[vis[li]].name);
-            else snprintf(left, sizeof left, "%*s", LW, "");
-            if (li == sel) printf(" \033[7m%s\033[0m \033[2m|\033[0m ", left);
-            else           printf(" %s \033[2m|\033[0m ", left);
-            /* right */
-            int rw = W - LW - 5;
-            if (r < ndet) printf("\033[2m%.*s\033[0m", rw > 0 ? rw : 0, det[r]);
-            printf("\n");
+        const struct func  *cf = func_at(m, cur);
+        const struct row   *cl = line_at(m, cur);
+        const struct dfunc *cd = dfunc_at(m, cur);
+        const char *cfile = cl ? file_name(m, cl->file) : NULL;
+        int cline = cl ? cl->line : 0;
+
+        struct cell *L = calloc((size_t)bh, sizeof *L);
+        struct cell *C = calloc((size_t)bh, sizeof *C);
+        struct cell *R = calloc((size_t)bh, sizeof *R);
+
+        /* ---- LEFT: call stack (crash) or function list (browse) ---- */
+        cell_set(&L[0], "\033[7m", mode_crash ? " CALL STACK" : " FUNCTIONS");
+        int lrows = bh - 1, ltop = 0;
+        if (sel >= lrows) ltop = sel - lrows + 1;
+        for (int r = 1; r < bh; r++) {
+            int i = ltop + (r - 1);
+            const char *attr = (i == sel) ? "\033[7m" : NULL;
+            if (mode_crash) {
+                if (i < nfr) { const struct func *ff = func_at(m, fr[i].addr);
+                    cell_set(&L[r], attr, " #%d %s", i, ff ? ff->name : "??"); }
+            } else if (i < nvis) {
+                cell_set(&L[r], attr, " %s", m->dfn[vis[i]].name ? m->dfn[vis[i]].name : "?");
+            }
         }
 
-        unsigned char c;
-        if (read(0, &c, 1) != 1) break;
-        if (searching) {
-            if (c == '\r' || c == '\n' || c == 27) { searching = 0; }
-            else if (c == 127 || c == 8) { int l = (int)strlen(search); if (l) search[l-1] = 0; }
-            else if (c >= 32 && c < 127) { int l = (int)strlen(search);
-                if (l < (int)sizeof search - 1) { search[l] = (char)c; search[l+1] = 0; } }
+        /* ---- CENTER: SOURCE (top) + ASSEMBLY (bottom) ---- */
+        int srcH = bh / 2;
+        cell_set(&C[0], "\033[7m", " SOURCE  %s:%d", cfile ? cfile : "(no source)", cline);
+        src_load(cfile);
+        int swin = srcH - 1;
+        int sstart = cline > 0 ? cline - swin / 2 : 1; if (sstart < 1) sstart = 1;
+        for (int r = 1; r < srcH; r++) {
+            int ln = sstart + (r - 1);
+            if (ln >= 1 && ln <= g_src_n)
+                cell_set(&C[r], ln == cline ? "\033[1;7m" : "\033[2m",
+                         " %4d %s", ln, g_src_lines[ln - 1]);
+        }
+        cell_set(&C[srcH], "\033[7m", " ASSEMBLY  %s", cf ? cf->name : "(no func)");
+        unsigned long tsz = 0; const unsigned char *text = text_bytes(m, &tsz);
+        if (text && cf) {
+            static unsigned long ad[16384]; static char tx[16384][72]; int nins = 0;
+            for (unsigned long a = cf->addr; a < cf->addr + cf->size && nins < 16384; ) {
+                char t[128]; int l = decode_one(text + a, (int)(cf->addr + cf->size - a), a, t);
+                ad[nins] = a; snprintf(tx[nins], sizeof tx[0], "%.71s", t); nins++;
+                a += (unsigned long)l;
+            }
+            int at = -1; for (int i = 0; i < nins; i++) if (ad[i] == cur) { at = i; break; }
+            int awin = bh - srcH - 1;
+            int astart = at < 0 ? 0 : (at - awin / 2 < 0 ? 0 : at - awin / 2);
+            for (int r = srcH + 1; r < bh; r++) {
+                int i = astart + (r - srcH - 1);
+                if (i < nins)
+                    cell_set(&C[r], ad[i] == cur ? "\033[1;7m" : "\033[2m",
+                             " %6lx  %s", ad[i], tx[i]);
+            }
+        } else {
+            cell_set(&C[srcH + 1], "\033[2m", "  (.text unavailable -- pass the ELF/.o, not the .embdbg)");
+        }
+
+        /* ---- RIGHT: REGISTERS (top) + VARIABLES (bottom) ---- */
+        int regH = bh / 2;
+        cell_set(&R[0], "\033[7m", " REGISTERS");
+        if (mode_crash) {
+            for (int r = 1; r < regH; r++) { int i = r - 1;
+                if (i < cr->nreg)
+                    cell_set(&R[r], strcmp(cr->rname[i], "rip") == 0 ? "\033[1m" : NULL,
+                             " %-4s 0x%016lx", cr->rname[i], cr->rval[i]);
+            }
+        } else {
+            cell_set(&R[1], "\033[2m", " (no crash dump -- browse mode)");
+        }
+        cell_set(&R[regH], "\033[7m", " VARIABLES  %s", cd ? cd->name : "");
+        if (cd) {
+            for (int r = regH + 1; r < bh; r++) { int v = r - regH - 1;
+                if (v < cd->nvars) {
+                    struct dvar *dv = &cd->vars[v];
+                    char val[40] = "";
+                    if (mode_crash && cur_rbp) {
+                        int okv; unsigned long a = cur_rbp + (unsigned long)dv->fbreg;
+                        unsigned long x = crash_mem(cr, a, &okv);
+                        if (okv) snprintf(val, sizeof val, " = 0x%lx", x);
+                        else     snprintf(val, sizeof val, " = ?");
+                    }
+                    cell_set(&R[r], NULL, " %-5s %-8s %s%s",
+                             dv->is_param ? "param" : "local",
+                             type_name(m, dv->type_off), dv->name, val);
+                }
+            }
+        }
+
+        /* ---- paint ---- */
+        printf("\033[H");
+        const char *modestr = mode_crash ? (cr->exc[0] ? cr->exc : "crash") : "browse";
+        char right_sc[128];
+        snprintf(right_sc, sizeof right_sc,
+                 "[Tab] %s  [j/k] sel  [/] search  [:] cmd  [q] quit ",
+                 mode_crash ? "browse" : "crash");
+        char title[288];
+        int tl = snprintf(title, sizeof title, " EmbDBG \342\226\270 %s ", modestr);
+        printf("\033[7m%s", title);
+        for (int i = tl; i < W - (int)strlen(right_sc); i++) putchar(' ');
+        printf("%s\033[0m\n", right_sc);
+
+        for (int r = 0; r < bh; r++) {
+            put_cell(&L[r], stackW); printf("\033[2m\342\224\202\033[0m");
+            put_cell(&C[r], centerW); printf("\033[2m\342\224\202\033[0m");
+            put_cell(&R[r], regW); printf("\n");
+        }
+        if (in_palette)      printf("\033[7m :%s \033[0m", palette);
+        else if (searching)  printf("\033[7m /%s \033[0m", search);
+        else printf("\033[2m %s \033[0m",
+                    status[0] ? status
+                    : (mode_crash ? "stack frame view -- j/k selects a frame, values follow"
+                                  : "function browser -- j/k, / to search, : for commands"));
+        fflush(stdout);
+        free(L); free(C); free(R);
+
+        /* ---- input ---- */
+        unsigned char ch; if (read(0, &ch, 1) != 1) break;
+        if (in_palette) {
+            if (ch == '\r' || ch == '\n') {
+                in_palette = 0; status[0] = 0;
+                if (strcmp(palette, "q") == 0) break;
+                else if (palette[0] == '0' && palette[1] == 'x') {
+                    unsigned long a = strtoul(palette, NULL, 0);
+                    for (int i = 0; i < m->ndfn; i++)
+                        if (a >= m->dfn[i].lo && a < m->dfn[i].hi) {
+                            mode_crash = 0; search[0] = 0; sel = i;
+                            snprintf(status, sizeof status, "goto 0x%lx -> %s", a, m->dfn[i].name);
+                            break;
+                        }
+                } else if (palette[0]) {
+                    for (int i = 0; i < m->ndfn; i++)
+                        if (m->dfn[i].name && strcmp(m->dfn[i].name, palette) == 0) {
+                            mode_crash = 0; search[0] = 0; sel = i;
+                            snprintf(status, sizeof status, "jump to %s", palette); break;
+                        }
+                }
+                palette[0] = 0;
+            } else if (ch == 27) { in_palette = 0; palette[0] = 0; }
+            else if (ch == 127 || ch == 8) { int l = (int)strlen(palette); if (l) palette[l-1] = 0; }
+            else if (ch >= 32 && ch < 127) { int l = (int)strlen(palette);
+                if (l < (int)sizeof palette - 1) { palette[l] = (char)ch; palette[l+1] = 0; } }
             continue;
         }
-        if (c == 'q') break;
-        else if (c == 'j') { if (sel + 1 < nvis) sel++; }
-        else if (c == 'k') { if (sel > 0) sel--; }
-        else if (c == 'g') sel = 0;
-        else if (c == 'G') sel = nvis ? nvis - 1 : 0;
-        else if (c == '/') { searching = 1; search[0] = 0; }
-        else if (c == 27) {                   /* arrow keys: ESC [ A/B */
+        if (searching) {
+            if (ch == '\r' || ch == '\n' || ch == 27) searching = 0;
+            else if (ch == 127 || ch == 8) { int l = (int)strlen(search); if (l) search[l-1] = 0; }
+            else if (ch >= 32 && ch < 127) { int l = (int)strlen(search);
+                if (l < (int)sizeof search - 1) { search[l] = (char)ch; search[l+1] = 0; } }
+            continue;
+        }
+        if (ch == 'q') break;
+        else if (ch == 'j') { if (sel + 1 < nlist) sel++; }
+        else if (ch == 'k') { if (sel > 0) sel--; }
+        else if (ch == 'g') sel = 0;
+        else if (ch == 'G') sel = nlist ? nlist - 1 : 0;
+        else if (ch == '\t') { if (crash_avail) { mode_crash = !mode_crash; sel = 0; status[0] = 0; } }
+        else if (ch == '/') { searching = 1; search[0] = 0; }
+        else if (ch == ':') { in_palette = 1; palette[0] = 0; }
+        else if (ch == 27) {                   /* arrow keys */
             unsigned char s1, s2;
             if (read(0, &s1, 1) == 1 && s1 == '[' && read(0, &s2, 1) == 1) {
                 if (s2 == 'A' && sel > 0) sel--;
-                else if (s2 == 'B' && sel + 1 < nvis) sel++;
+                else if (s2 == 'B' && sel + 1 < nlist) sel++;
             }
         }
     }
     raw_off();
     free(vis);
+    for (int i = 0; i < g_src_n; i++) free(g_src_lines[i]);
+    g_src_n = 0; g_src_path[0] = 0;
 }
 
-static void cmd_tui(struct img *m)
+static void cmd_tui(struct img *m, int argc, char **argv)
 {
-    if (isatty(0) && isatty(1)) tui_interactive(m);
+    struct crash c; int have = 0;
+    if (argc >= 1) { parse_crash(argv[0], &c); have = 1; }   /* optional crash dump */
+    if (isatty(0) && isatty(1)) tui_interactive(m, have ? &c : NULL, have);
     else tui_plain(m);            /* piped/non-tty: a scriptable full dump */
 }
 
@@ -1766,7 +1974,8 @@ int main(int argc, char **argv)
             "       embdbg FILE info FUNC           a function's params/locals\n"
             "       embdbg FILE disassemble FUNC    x86-64 disassembly + mixed source\n"
             "       embdbg FILE crash REPORT        analyze a kernel fault dump\n"
-            "       embdbg FILE tui                 interactive browser (plain dump if piped)\n"
+            "       embdbg FILE tui [CRASH]         rich multi-panel TUI (source/asm/regs/vars/\n"
+            "                                       stack); pass a crash dump for live regs+stack\n"
             "       embdbg FILE.o emit OUT.embdbg   convert DWARF -> native .embdbg\n"
             "   FILE may be an ELF (reads DWARF) or a .embdbg (reads it natively).\n");
         return 1;
@@ -1810,7 +2019,7 @@ int main(int argc, char **argv)
     else if (strcmp(cmd, "info") == 0)      cmd_info(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "disassemble") == 0) cmd_disassemble(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "crash") == 0)     cmd_crash(&m, argc - 3, argv + 3);
-    else if (strcmp(cmd, "tui") == 0)       cmd_tui(&m);
+    else if (strcmp(cmd, "tui") == 0)       cmd_tui(&m, argc - 3, argv + 3);
     else { fprintf(stderr, "embdbg: unknown command '%s'\n", cmd); return 1; }
     return 0;
 }
