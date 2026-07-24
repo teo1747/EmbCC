@@ -49,6 +49,12 @@ embld: tools/embld/embld.c src/link/link.c src/driver/util.c \
 embread: tools/embread/embread.c src/embx/embx.c src/embx/embx.h
 	$(CC) $(CFLAGS) -o $@ tools/embread/embread.c src/embx/embx.c
 
+# embdbg — EmbDBG v0, the debug-info reader/symbolizer (EMBDBG step 1's
+# consumer). Standalone like embread: it reads the DWARF EmbCC emits, it does
+# not compile. The live-control half is gated on the kernel debug contract.
+embdbg: tools/embdbg/embdbg.c src/elf/elf.h
+	$(CC) $(CFLAGS) -o $@ tools/embdbg/embdbg.c
+
 $(BUILD)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -57,7 +63,7 @@ $(BUILD)/%.o: src/%.c
 # enough and cannot go stale (CONTRIBUTING lie #1).
 $(OBJS): $(wildcard src/*/*.h)
 
-test: embcc embread embld
+test: embcc embread embld embdbg
 	tests/run.sh
 
 clean:
