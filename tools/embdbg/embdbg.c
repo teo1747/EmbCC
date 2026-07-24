@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* EmbDBG — the EmbLinkOS debugger, v0: the debug-info reader and symbolizer.
  *
  * WHY THIS FIRST, AND WHY IT NEEDS NO KERNEL. A debugger answers three
@@ -1691,6 +1692,66 @@ int embdbg_emit_objects(const unsigned char **objs, const long *lens,
 }
 
 #ifndef EMBDBG_NO_MAIN
+/* --- emit-kernel: a func+line .embdbg for an ELF whose DWARF this tool can't
+ * fully parse (a DWARF-5 gcc kernel). Functions come from the ELF .symtab
+ * (reliable, complete); the line table comes from `readelf --debug-dump=
+ * decodedline`, letting binutils decode any DWARF version. No VARS/TYPES —
+ * the kernel panic symbolizer needs only address -> func + file:line + a
+ * backtrace (EMBDBG_Specification.md §7). --- */
+static int cmp_dfn_lo(const void *a, const void *b)
+{
+    unsigned long x = ((const struct dfunc *)a)->lo, y = ((const struct dfunc *)b)->lo;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+static int kfile_intern(struct img *m, const char *path)
+{
+    for (int i = 1; i < m->nfiles; i++)
+        if (m->files[i] && strcmp(m->files[i], path) == 0) return i;
+    m->files = realloc(m->files, (size_t)(m->nfiles + 1) * sizeof(char *));
+    m->files[m->nfiles] = strdup(path);        /* strtok buffer is reused */
+    return m->nfiles++;
+}
+static void emit_kernel(struct img *m, const char *elfpath, const char *out)
+{
+    /* FUNCS from the symtab (already in m->fn), as dfn sorted by low_pc. */
+    m->nfiles = 1; m->files = calloc(1, sizeof(char *));
+    m->dfn = calloc((size_t)(m->nfn ? m->nfn : 1), sizeof *m->dfn);
+    for (int i = 0; i < m->nfn; i++) {
+        struct dfunc *d = &m->dfn[m->ndfn++];
+        d->name = m->fn[i].name;
+        d->lo = m->fn[i].addr;
+        d->hi = m->fn[i].addr + m->fn[i].size;
+        d->vars = NULL; d->nvars = 0;
+    }
+    qsort(m->dfn, (size_t)m->ndfn, sizeof *m->dfn, cmp_dfn_lo);
+
+    /* LINE from readelf's decoded table (handles DWARF 5). */
+    char cmd[8192];
+    snprintf(cmd, sizeof cmd, "readelf --debug-dump=decodedline '%s' 2>/dev/null", elfpath);
+    FILE *f = popen(cmd, "r");
+    if (f) {
+        char line[2048], last_file[512] = "";
+        while (fgets(line, sizeof line, f)) {
+            char *toks[24]; int nt = 0;
+            for (char *p = strtok(line, " \t\n"); p && nt < 24; p = strtok(NULL, " \t\n"))
+                toks[nt++] = p;
+            int ai = -1;                       /* the address column */
+            for (int k = 0; k < nt; k++)
+                if (toks[k][0] == '0' && toks[k][1] == 'x') { ai = k; break; }
+            if (ai < 1) continue;
+            char *lns = toks[ai - 1];
+            if (lns[0] < '0' || lns[0] > '9') continue;   /* not a data row */
+            const char *file = (ai >= 2) ? toks[ai - 2] : last_file;
+            if (ai >= 2) snprintf(last_file, sizeof last_file, "%s", file);
+            add_row(m, strtoul(toks[ai], NULL, 0),
+                    kfile_intern(m, file), atoi(lns), 0);
+        }
+        pclose(f);
+    }
+    write_embdbg(m, out, m->b, m->len);
+    fprintf(stderr, "embdbg: kernel .embdbg — %d funcs, %d line rows\n", m->ndfn, m->nrows);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -1727,6 +1788,12 @@ int main(int argc, char **argv)
         if (is_embdbg) die("input is already .embdbg");
         if (argc < 4) die("emit needs an output path");
         write_embdbg(&m, argv[3], m.b, m.len);   /* build_id = hash of this ELF */
+        return 0;
+    }
+    if (strcmp(cmd, "emit-kernel") == 0) {
+        if (is_embdbg) die("input is already .embdbg");
+        if (argc < 4) die("emit-kernel needs an output path");
+        emit_kernel(&m, argv[1], argv[3]);       /* funcs from symtab, lines via readelf */
         return 0;
     }
     if (strcmp(cmd, "verify") == 0) {
