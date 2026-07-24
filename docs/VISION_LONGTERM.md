@@ -46,7 +46,15 @@ EmbCC is designed specifically for EmbLinkOS and understands its architecture.
   (`/system/abi/include`, crt0/syscalls/libc as TARGET_ABI §4 lays them out).
 * Native understanding of EmbLinkOS syscalls and services — starting with
   first-class fixed-register inline-asm constraints so the `__TINYC__`
-  workaround in the syscall header can die (ARCHITECTURE §4).
+  workaround in the syscall header can die (ARCHITECTURE §4). **Landed
+  2026-07-24:** EmbCC has GCC extended inline asm with the fixed-register
+  letters (a/b/c/d/S/D), `register T x __asm__("r10")` bindings for `r`, and
+  the `inline` keyword — enough that the gcc branch of `embk_syscall.h`
+  compiles under EmbCC, so the `__TINYC__` workaround dies for EmbCC. Proven
+  on the OS: EmbCC-compiled `int $0x80` stubs made real write(1,…) and
+  exit(42) syscalls (kernel `test embcc asm`). Scope is the userland rim
+  only (the kernel's asm stays the cross gcc's — DECISIONS); the template
+  vocabulary is `int $imm` today, a deliberate seam.
 
 ## Advanced diagnostics
 
