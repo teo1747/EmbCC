@@ -611,16 +611,29 @@ static struct expr *parse_primary(struct parser *ps)
         e->ty = ty_base(t->fnum_is_float ? TY_FLOAT : TY_DOUBLE, 0);
         advance(ps);
         return e;
-    case TOK_STR:
+    case TOK_STR: {
+        /* Adjacent string literals concatenate (C translation phase 6):
+         * "foo" "bar" is one literal "foobar". num counts the NUL, so
+         * each join drops the running string's terminator and appends
+         * the next literal's bytes (including its NUL). */
         e = new_expr(EXPR_STR, t->line);
-        e->name = t->text;
-        e->num = t->num;
+        size_t len = (size_t)t->num;
+        char *bytes = xmalloc(len);
+        memcpy(bytes, t->text, len);
         advance(ps);
-        if (cur(ps)->kind == TOK_STR)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "adjacent string literal concatenation is not "
-                       "supported yet");
+        while (cur(ps)->kind == TOK_STR) {
+            size_t add = (size_t)cur(ps)->num;
+            char *nb = xmalloc(len - 1 + add);
+            memcpy(nb, bytes, len - 1);
+            memcpy(nb + len - 1, cur(ps)->text, add);
+            bytes = nb;
+            len = len - 1 + add;
+            advance(ps);
+        }
+        e->name = bytes;
+        e->num = (long)len;
         return e;
+    }
     case TOK_LPAREN:
         advance(ps);
         e = parse_comma(ps);

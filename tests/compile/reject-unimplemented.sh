@@ -117,10 +117,6 @@ int main(void) { struct P p = { .x = 1 }; return p.x; }' \
 check non-char-array-from-string \
     'int main(void) { int a[4] = "abc"; return a[0]; }' \
     "only a char array"
-check adjacent-strings \
-    'int puts(char *);
-int main(void) { puts("a" "b"); return 0; }' \
-    "concatenation is not supported"
 check varargs-definition \
     'int f(int a, ...) { return a; }
 int main(void) { return f(1); }' \
