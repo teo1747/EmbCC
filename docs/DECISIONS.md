@@ -270,3 +270,50 @@ concrete.
 **Reopens if:** the interim (picolibc) proves good enough that owning the libc
 never earns itself under D-006 — the same earn-by-capability gate everything
 here answers to.
+
+---
+
+## D-010 — Debug info: **DWARF as the bridge, native `.embdbg` derived last**
+
+**Decided:** 2026-07-24. **Status:** current intent, deferred; requirements
+written (`docs/EMBDBG_Requirements.md`), no byte layout, no implementation.
+
+EmbCC's first debug output will be **minimal DWARF line info**, because it is
+debuggable by tools that already exist (gdb/lldb) on the host, the day it lands
+— no EmbDBG required. A **native `.embdbg`** sidecar is the eventual owned form,
+but its byte layout is derived **later**, from what EmbDBG (a debugger that does
+not exist yet) actually needs.
+
+**Why.** This is the DECISIONS D-003 fork again — own-the-stack vs
+meet-the-world — and it resolves the same way, for the same reason. A byte-exact
+`.embdbg` today would be designed against a producer that emits nothing (EmbCC
+puts no line/local/type info in its objects) and a consumer that does not exist.
+That is the exact inversion D-003 was reopened *with eyes open about*: derive the
+on-disk shape last, from invariants. DWARF line info sidesteps it entirely — its
+consumer (gdb) is real, so "prove it on the host first" (D-005) applies to
+debugging exactly as it did to codegen. And EmbCC is unusually well-placed to
+emit it: it already knows `file:line` at every node (diagnostics use it), every
+local lives in a fixed stack slot (one `DW_OP_fbreg`, DWARF's trivial case), and
+`rbp` is kept as a frame pointer, so unwinding is a pointer walk with no CFI.
+
+**The dual-form stance, stated so it is not re-litigated:** DWARF is the bridge
+for host debugging and stays for as long as that is useful; `.embdbg` is the
+native form EmbDBG consumes, mirroring EMBX's ELF-for-porting /
+native-for-the-owned-world split (D-003) and EMBKFS's FAT32 / native split. The
+EMBX spec already reserved the slot — `EMBX_COMPAT_DEBUG_SIDECAR`, a *compat* bit
+(a loader that does not understand debug info ignores it), and `EMBX_F_STRIPPED`
+for its absence.
+
+**Rejected:** a byte-exact `.embdbg` format now. Designing the container before
+there is a producer or a consumer is D-003's mistake at a smaller scale, and
+`EMBDBG_Requirements.md` §6 refuses it explicitly.
+
+**Order:** after M3 (ARCHITECTURE §8 lists DWARF among the deliberate early
+non-goals; VISION_LONGTERM gates debug info on a debugger existing to consume
+it). The one honest exception is DWARF line info, cheap enough and useful enough
+— it would help debug the self-hosting compiler *through* M3 — that it is the
+one step plausibly worth pulling earlier.
+
+**Reopens if:** EmbDBG's real needs turn out not to fit a DWARF-derived model,
+or the kernel debugging contract (the open question that gates a native
+debugger, D-007) lands and dictates a shape.

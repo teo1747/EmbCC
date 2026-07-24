@@ -81,7 +81,7 @@ as self-hosting. It does not change stream A's order.
 | `embread` | EMBX dumper + verifier | **done** — `tools/embread/`, EMBX spec §9 |
 | `EmbLD` | the integrated linker; emits ELF ET_EXEC and EMBX | stream B |
 | `emlibc` | the OS's own non-POSIX libc | DECISIONS D-009, deferred; OS-side requirements exist |
-| `EmbDBG` | debugger | needs debug info first (DWARF, or the spec's `.embdbg` sidecar) — after M3 |
+| `EmbDBG` | debugger | design recorded (`docs/EMBDBG_Requirements.md`, D-010): DWARF line info first (host-debuggable via gdb, no EmbDBG needed), native `.embdbg` derived later. After M3. |
 
 ## Stream B — the integrated linker (M3's long pole, started now)
 

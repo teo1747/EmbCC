@@ -74,6 +74,7 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M0–M4, each with a concrete acceptance test |
 | [docs/WORKPLAN.md](docs/WORKPLAN.md) | The team's three parallel streams (core, linker, proving ground) and the process that keeps them off each other's critical path |
+| [docs/EMBDBG_Requirements.md](docs/EMBDBG_Requirements.md) | Debug-info requirements + the DWARF-bridge / native-`.embdbg` decision (D-010) — no byte layout yet, on purpose |
 | [src/embx/embx.h](src/embx/embx.h) | The EMBX container, byte-exact — mirrors the kernel's loader header; read by `embread`, to be written by the linker |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The discipline inherited from EmbLinkOS (prove on the host, selftest the invariant, THE RULE) |
 
