@@ -142,7 +142,7 @@ check global-nonconst-init \
     'int a = 1;
 int b = a;
 int main(void) { return b; }' \
-    "must be an integer literal"
+    "must be a constant or a string-literal address"
 check extern-with-init \
     'extern int g = 5;
 int main(void) { return g; }' \
@@ -150,7 +150,7 @@ int main(void) { return g; }' \
 check ptr-global-bad-init \
     'int *p = 42;
 int main(void) { return !p; }' \
-    "initialized to 0"
+    "cannot convert int to int . without a cast"
 check global-use-before-decl \
     'int main(void) { return g; }
 int g = 42;' \

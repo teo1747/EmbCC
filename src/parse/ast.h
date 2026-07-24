@@ -77,6 +77,18 @@ struct initelem {
     struct expr *e;
 };
 
+/* A relocation inside a static object's byte image: a pointer-typed slot
+ * whose value is an address the linker fills in. For now the target is a
+ * string literal (the only kind EmbCC's own source needs); the seam for
+ * &global / &func addends is left open deliberately. */
+struct greloc {
+    int off;              /* byte offset within the object */
+    const char *str;      /* string-literal bytes the slot points at */
+    int str_len;          /* including its NUL */
+    int str_off;          /* driver: the target's offset inside .rodata */
+    long addend;
+};
+
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
                  STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE,
                  STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT };
@@ -89,7 +101,6 @@ struct stmt {
     int is_static;        /* STMT_DECL: a static local -> its own global */
     struct initelem *inits; /* STMT_DECL: flattened aggregate init */
     int ninits;
-    const char *sbytes;   /* STMT_DECL: a static local's constant bytes */
     struct global *sglob; /* STMT_DECL: the global a static local became */
     int var_index;        /* STMT_DECL: set by sema */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
@@ -122,9 +133,13 @@ struct global {
     int is_static;
     int is_extern;        /* THIS declaration was 'extern' */
     int has_init;
-    long init;            /* constant initializer value */
-    const char *init_bytes; /* string initializer (char arrays) */
+    long init;            /* constant initializer value (scalar) */
+    struct expr *init_expr; /* aggregate/relocatable initializer, lowered
+                             * by sema into init_bytes + relocs */
+    const char *init_bytes; /* the constant byte image (string or aggregate) */
     int init_len;
+    struct greloc *relocs;  /* pointer slots the linker resolves */
+    int nrelocs;
     struct global *next;
 
     int defined;          /* sema, canonical: some declaration defines it */

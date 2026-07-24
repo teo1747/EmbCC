@@ -149,6 +149,21 @@ static int compile(const char *in, const char *out, int pp_only)
         }
     }
 
+    /* Global initializers that point at string literals need those
+     * strings in .rodata. Intern them now — before the image below is
+     * built — so the pool includes them, and record each slot's target
+     * offset for its relocation. Deduping shares a literal already used
+     * in code. */
+    for (struct global *g = u->globals; g; g = g->next) {
+        if (g->absorbed || !g->defined)
+            continue;
+        for (int i = 0; i < g->nrelocs; i++) {
+            int si = ir_intern_string(iu, g->relocs[i].str,
+                                      g->relocs[i].str_len);
+            g->relocs[i].str_off = iu->strs[si].off;
+        }
+    }
+
     /* .rodata: the string literals, at the offsets irgen assigned. */
     char *rodata = NULL;
     if (iu->rodata_len) {
@@ -253,6 +268,19 @@ static int compile(const char *in, const char *out, int pp_only)
         elfw_add_rela(w, text_ndx, (Elf64_Addr)gs[i].patch_off,
                       gs[i].glob->sym_ndx, R_X86_64_PC32, -4);
     free(gs);
+
+    /* Pointer slots in .data initialized by a string literal: an absolute
+     * 64-bit address into .rodata, against its section symbol. A global
+     * carrying relocations is initialized, hence in .data, never .bss. */
+    for (struct global *g = u->globals; g; g = g->next) {
+        if (g->absorbed || !g->defined || g->in_bss)
+            continue;
+        for (int i = 0; i < g->nrelocs; i++)
+            elfw_add_rela(w, data_ndx,
+                          (Elf64_Addr)(g->off + g->relocs[i].off),
+                          rodata_sym, R_X86_64_64,
+                          g->relocs[i].str_off + g->relocs[i].addend);
+    }
 
     /* Function addresses: PC32 against the function's symbol; an
      * address-taken external gets an UNDEF symbol like a called one. */

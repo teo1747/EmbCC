@@ -1208,33 +1208,46 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
     if (g->ty->kind == TY_VOID)
         diag_fatal(ps->lx.file, line, "a variable cannot have type void");
     g->ty = parse_array_dims(ps, g->ty);
+    int has_init = cur(ps)->kind == TOK_ASSIGN;
     /* `extern T x[];` is legal: the definition, and the size, live in
-     * another translation unit. Nothing is emitted for it here. */
-    if (ty_size(g->ty) == 0 && !is_extern)
+     * another translation unit. An omitted array size is legal when an
+     * initializer follows — it supplies the count — so defer that check. */
+    int size_from_init = g->ty->kind == TY_ARRAY && g->ty->count == 0 &&
+                         has_init;
+    if (ty_size(g->ty) == 0 && !is_extern && !size_from_init)
         diag_fatal(ps->lx.file, line,
                    "'%s' has incomplete type %s", name, ty_name(g->ty));
-    if (cur(ps)->kind == TOK_ASSIGN) {
+    if (has_init) {
         advance(ps);
         if (is_extern)
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "'extern' with an initializer");
-        if (g->ty->kind == TY_ARRAY)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "array initializers are not supported yet");
-        /* Constant initializers only: a literal, optionally negated —
-         * constant folding arrives with the preprocessor era. */
-        int neg = 0;
-        if (cur(ps)->kind == TOK_MINUS) {
-            neg = 1;
-            advance(ps);
+        if (g->ty->kind == TY_ARRAY || g->ty->kind == TY_STRUCT) {
+            /* Aggregates (and any string/relocation content) are lowered
+             * by sema: it flattens the initializer against the type and
+             * const-folds each leaf into the object's byte image. */
+            g->init_expr = parse_initializer(ps);
+            if (g->ty->kind == TY_ARRAY && g->ty->count == 0) {
+                struct expr *ie = g->init_expr;
+                if (ie->kind == EXPR_STR &&
+                    g->ty->pointee->kind == TY_CHAR)
+                    g->ty = ty_array(g->ty->pointee, (int)ie->num);
+                else if (ie->kind == EXPR_INITLIST)
+                    g->ty = ty_array(g->ty->pointee, ie->nelems);
+                else
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "'%s' needs a brace or string initializer "
+                               "to supply its size", name);
+            }
+            g->has_init = 1;
+        } else {
+            /* A scalar/pointer global: a constant expression — an integer
+             * literal, sizeof arithmetic, a string-literal address for a
+             * pointer, 0 for a null pointer. sema flattens and folds it
+             * through the same path as an aggregate leaf. */
+            g->init_expr = parse_cond(ps);
+            g->has_init = 1;
         }
-        if (cur(ps)->kind != TOK_NUM)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "a global initializer must be an integer literal "
-                       "for now");
-        g->has_init = 1;
-        g->init = neg ? -cur(ps)->num : cur(ps)->num;
-        advance(ps);
     }
     return g; /* caller handles ',' and ';' */
 }
@@ -1440,7 +1453,10 @@ struct unit *parse_unit(const char *file, const char *src)
     int seq = 0;
     while (cur(&ps)->kind != TOK_EOF)
         parse_top(&ps, u, &ftail, &gtail, seq++);
-    if (!u->funcs)
-        diag_fatal(file, 0, "no functions in file");
+    /* A translation unit of only data (a table of globals, no functions)
+     * is valid C — EmbCC's own predef macro table is exactly that. Refuse
+     * only a unit with nothing at all to emit. */
+    if (!u->funcs && !u->globals)
+        diag_fatal(file, 0, "no functions or globals in file");
     return u;
 }

@@ -125,4 +125,9 @@ struct ir_unit {
 
 struct ir_unit *irgen(struct unit *u);
 
+/* Intern a string into the unit's .rodata pool (used by the driver to
+ * place a global initializer's string targets). Returns its index; the
+ * offset is iu->strs[index].off. */
+int ir_intern_string(struct ir_unit *iu, const char *bytes, int len);
+
 #endif

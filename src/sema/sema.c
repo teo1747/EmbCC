@@ -869,6 +869,74 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
     flatten_init(u, f, sc, init->elems[0], ty, off, out);
 }
 
+/* Lower flattened initializer leaves into a static object's byte image
+ * plus a relocation list. Shared by file-scope globals and static locals
+ * — both have static storage, so every leaf must reduce to constant
+ * bytes now, save pointer slots initialized by a string literal, which
+ * become relocations the linker resolves. */
+static void lower_static_bytes(struct unit *u, int line, int size,
+                               struct initelem *v, int n,
+                               const char **out_bytes,
+                               struct greloc **out_rel, int *out_nrel)
+{
+    char *bytes = xcalloc(1, (size_t)(size ? size : 1));
+    struct greloc *rel = NULL;
+    int nrel = 0, caprel = 0;
+    for (int k = 0; k < n; k++) {
+        struct expr *core = v[k].e;
+        while (core && core->kind == EXPR_CAST)
+            core = core->rhs;
+        if (core && core->kind == EXPR_STR && v[k].ty->kind == TY_PTR) {
+            /* a pointer slot pointing at a string literal: 8 zero bytes
+             * stay in the image; the linker writes the address. */
+            if (nrel == caprel) {
+                caprel = caprel ? caprel * 2 : 4;
+                rel = xrealloc(rel, (size_t)caprel * sizeof *rel);
+            }
+            rel[nrel].off = v[k].off;
+            rel[nrel].str = core->name;
+            rel[nrel].str_len = (int)core->num;
+            rel[nrel].addend = 0;
+            nrel++;
+            continue;
+        }
+        long cv;
+        if (!const_fold(v[k].e, &cv))
+            diag_fatal(u->file, line,
+                       "a static initializer must be a constant or a "
+                       "string-literal address");
+        int sz = ty_size(v[k].ty);
+        for (int b = 0; b < sz; b++)
+            bytes[v[k].off + b] = (char)((unsigned long)cv >> (8 * b));
+    }
+    *out_bytes = bytes;
+    *out_rel = rel;
+    *out_nrel = nrel;
+}
+
+/* Reduce every file-scope global's aggregate/relocatable initializer to
+ * its byte image + relocations, now that types and sizes are settled. */
+static void lower_globals(struct unit *u)
+{
+    struct func gf = { 0 };
+    gf.name = "<global initializer>";
+    for (struct global *g = u->globals; g; g = g->next) {
+        if (g->absorbed || !g->defined || !g->init_expr)
+            continue;
+        /* An initializer may reference any name declared before this
+         * global — mirror the source position so the declare-before-use
+         * rule (and enum-constant visibility) matches C. */
+        cur_body_seq = g->seq;
+        struct scope sc = { 0, 0, 0, 0 };
+        struct initbuf ib = { 0, 0, 0 };
+        flatten_init(u, &gf, &sc, g->init_expr, g->ty, 0, &ib);
+        lower_static_bytes(u, g->line, ty_size(g->ty), ib.v, ib.n,
+                           &g->init_bytes, &g->relocs, &g->nrelocs);
+        g->init_len = ty_size(g->ty);
+        g->init_expr = NULL;
+    }
+}
+
 /* Declarations anywhere in the function share one flat scope, and
  * shadowing is rejected outright. C gives inner blocks their own scope;
  * refusing shadowed names accepts strictly fewer programs than C does,
@@ -979,30 +1047,9 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             if (s->is_static) {
                 /* A static local has static STORAGE and internal
                  * linkage: it becomes a global of its own, named so it
-                 * cannot collide with a file-scope name. */
-                long sval = 0;
-                if (s->ninits) {
-                    /* a static aggregate's bytes must be constant */
-                    char *bytes = xcalloc(1, (size_t)ty_size(s->dty));
-                    for (int k = 0; k < s->ninits; k++) {
-                        long cv;
-                        if (!const_fold(s->inits[k].e, &cv))
-                            diag_fatal(u->file, s->line,
-                                       "a static local needs constant "
-                                       "initializers");
-                        int sz = ty_size(s->inits[k].ty);
-                        for (int b = 0; b < sz; b++)
-                            bytes[s->inits[k].off + b] =
-                                (char)((unsigned long)cv >> (8 * b));
-                    }
-                    s->sbytes = bytes;
-                    s->ninits = 0;
-                }
-                if (s->expr && s->expr->kind != EXPR_STR &&
-                    !const_fold(s->expr, &sval))
-                    diag_fatal(u->file, s->line,
-                               "a static local needs a constant "
-                               "initializer");
+                 * cannot collide with a file-scope name, and its
+                 * initializer is lowered to a byte image + relocations
+                 * through the same path as any file-scope global. */
                 struct global *g = xcalloc(1, sizeof *g);
                 size_t n = strlen(f->name) + strlen(s->name) + 8;
                 char *nm = xmalloc(n);
@@ -1014,18 +1061,26 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 g->is_static = 1;
                 g->defined = 1;
                 g->used = 1;
-                if (s->sbytes) {
-                    g->init_bytes = s->sbytes;
+                /* Aggregates arrive pre-flattened in s->inits; a scalar's
+                 * value is a single leaf at offset 0. */
+                struct initelem one;
+                struct initelem *iv = s->inits;
+                int in = s->ninits;
+                if (!in && s->expr) {
+                    one.off = 0;
+                    one.ty = s->dty;
+                    one.e = s->expr;
+                    iv = &one;
+                    in = 1;
+                }
+                if (in) {
+                    lower_static_bytes(u, s->line, ty_size(s->dty), iv, in,
+                                       &g->init_bytes, &g->relocs,
+                                       &g->nrelocs);
                     g->init_len = ty_size(s->dty);
                     g->has_init = 1;
-                } else if (s->expr && s->expr->kind == EXPR_STR) {
-                    g->init_bytes = s->expr->name;
-                    g->init_len = (int)s->expr->num;
-                    g->has_init = 1;
-                } else if (s->expr) {
-                    g->init = sval;
-                    g->has_init = sval != 0;
                 }
+                s->ninits = 0;
                 struct global **gt = &u->globals;
                 while (*gt)
                     gt = &(*gt)->next;
@@ -1285,10 +1340,6 @@ static void merge_globals(struct unit *u)
     for (struct global *g = u->globals; g; g = g->next) {
         if (g->absorbed)
             continue;
-        if (g->ty->kind == TY_PTR && g->has_init && g->init != 0)
-            diag_fatal(u->file, g->line,
-                       "a pointer global can only be initialized to 0 "
-                       "for now");
         struct global *canon = find_global(u, g->name);
         if (find_func(u, g->name))
             diag_fatal(u->file, g->line,
@@ -1298,7 +1349,21 @@ static void merge_globals(struct unit *u)
             g->defined = !g->is_extern;
             continue;
         }
-        if (!ty_equal(canon->ty, g->ty))
+        /* Two declarations of an array are compatible when their element
+         * types match and at most one gives a size — `extern T x[];`
+         * completed by `T x[N] = …`. The canonical node adopts the
+         * complete type so its symbol carries the real size. */
+        int compat = ty_equal(canon->ty, g->ty);
+        if (!compat && canon->ty->kind == TY_ARRAY &&
+            g->ty->kind == TY_ARRAY &&
+            ty_equal(canon->ty->pointee, g->ty->pointee) &&
+            (canon->ty->count == 0 || g->ty->count == 0 ||
+             canon->ty->count == g->ty->count)) {
+            compat = 1;
+            if (canon->ty->count == 0)
+                canon->ty = g->ty;
+        }
+        if (!compat)
             diag_fatal(u->file, g->line,
                        "conflicting types for '%s': %s here, %s at "
                        "line %d", g->name, ty_name(g->ty),
@@ -1313,6 +1378,7 @@ static void merge_globals(struct unit *u)
                            g->name);
             canon->has_init = 1;
             canon->init = g->init;
+            canon->init_expr = g->init_expr;
         }
         canon->defined |= !g->is_extern;
         g->absorbed = 1;
@@ -1323,6 +1389,7 @@ void sema_check(struct unit *u)
 {
     merge_decls(u);
     merge_globals(u);
+    lower_globals(u);
 
     /* Walk in source order so `declared` mirrors C's rule exactly: a
      * name is usable from its first declaration on, and a body is

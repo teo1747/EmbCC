@@ -41,6 +41,17 @@ struct section {
 };
 
 #define ELFW_MAX_SECTIONS 32
+#define ELFW_MAX_RELA 4      /* distinct target sections: .text, .data, ... */
+
+/* Relocations are grouped by the section they apply to; each group emits
+ * its own .rela.<name> section. One group (.text) is the common case; a
+ * global initializer pointing into .rodata adds a .data group. */
+struct rela_group {
+    int target;          /* section index the relocations apply to */
+    struct buf rela;     /* array of Elf64_Rela */
+    int nrela;
+    int sec_ndx;         /* the .rela.<name> section, set at write time */
+};
 
 struct elfw {
     struct section sec[ELFW_MAX_SECTIONS];
@@ -51,9 +62,8 @@ struct elfw {
     int globals_started; /* set once a non-local is added */
     struct buf strtab;   /* symbol names */
     struct buf shstrtab; /* section names */
-    struct buf rela;     /* array of Elf64_Rela against rela_target */
-    int nrela;
-    int rela_target;     /* section index the relocations apply to */
+    struct rela_group relagrp[ELFW_MAX_RELA];
+    int nrelagrp;
 };
 
 struct elfw *elfw_new(void)
@@ -84,7 +94,8 @@ void elfw_free(struct elfw *w)
     free(w->symtab.p);
     free(w->strtab.p);
     free(w->shstrtab.p);
-    free(w->rela.p);
+    for (int i = 0; i < w->nrelagrp; i++)
+        free(w->relagrp[i].rela.p);
     free(w);
 }
 
@@ -147,32 +158,48 @@ static Elf64_Off align_up(Elf64_Off off, Elf64_Xword align)
 void elfw_add_rela(struct elfw *w, int target_ndx, Elf64_Addr offset,
                    int sym, int type, long addend)
 {
-    if (w->nrela && w->rela_target != target_ndx) {
-        /* One .rela.text is all the writer speaks today; a second
-         * target section is a writer extension, not a silent merge. */
-        fprintf(stderr, "embcc: elf writer: relocations against two "
-                        "sections are not supported yet\n");
-        exit(1);
+    /* Route to the group for this target section, creating it on first
+     * use. Grouping keeps each .rela.<name> pointing at exactly one
+     * section, as the gABI requires. */
+    struct rela_group *gp = NULL;
+    for (int i = 0; i < w->nrelagrp; i++)
+        if (w->relagrp[i].target == target_ndx) {
+            gp = &w->relagrp[i];
+            break;
+        }
+    if (!gp) {
+        if (w->nrelagrp >= ELFW_MAX_RELA) {
+            fprintf(stderr, "embcc: elf writer: too many relocation "
+                            "target sections (max %d)\n", ELFW_MAX_RELA);
+            exit(1);
+        }
+        gp = &w->relagrp[w->nrelagrp++];
+        memset(gp, 0, sizeof *gp);
+        gp->target = target_ndx;
     }
-    w->rela_target = target_ndx;
     Elf64_Rela r;
     r.r_offset = offset;
     r.r_info = ELF64_R_INFO((Elf64_Xword)sym, (Elf64_Xword)type);
     r.r_addend = addend;
-    buf_append(&w->rela, &r, sizeof r);
-    w->nrela++;
+    buf_append(&gp->rela, &r, sizeof r);
+    gp->nrela++;
 }
 
 int elfw_write(struct elfw *w, const char *path)
 {
-    /* Materialize the bookkeeping sections after the user's:
-     * .rela.text first (its sh_link/sh_info are patched below once the
-     * symtab index exists), then .symtab/.strtab/.shstrtab. */
-    int rela_ndx = 0;
-    if (w->nrela)
-        rela_ndx = elfw_add_section(w, ".rela.text", SHT_RELA,
-                                    SHF_INFO_LINK, w->rela.p, w->rela.len,
-                                    8);
+    /* Materialize the bookkeeping sections after the user's: one
+     * .rela.<target> per relocation group (sh_link/sh_info patched below
+     * once the symtab index exists), then .symtab/.strtab/.shstrtab. The
+     * name is ".rela" + the target's own name (".rela.text", ".rela.data"). */
+    for (int i = 0; i < w->nrelagrp; i++) {
+        struct rela_group *gp = &w->relagrp[i];
+        const char *tname = (const char *)w->shstrtab.p +
+                            w->sec[gp->target].hdr.sh_name;
+        char rname[64];
+        snprintf(rname, sizeof rname, ".rela%s", tname);
+        gp->sec_ndx = elfw_add_section(w, rname, SHT_RELA, SHF_INFO_LINK,
+                                       gp->rela.p, gp->rela.len, 8);
+    }
     int symtab_ndx = elfw_add_section(w, ".symtab", SHT_SYMTAB, 0,
                                       w->symtab.p, w->symtab.len, 8);
     int strtab_ndx = elfw_add_section(w, ".strtab", SHT_STRTAB, 0,
@@ -192,10 +219,11 @@ int elfw_write(struct elfw *w, const char *path)
     w->sec[symtab_ndx].hdr.sh_link = (Elf64_Word)strtab_ndx;
     w->sec[symtab_ndx].hdr.sh_info = (Elf64_Word)w->nlocal;
     w->sec[symtab_ndx].hdr.sh_entsize = sizeof(Elf64_Sym);
-    if (w->nrela) {
-        w->sec[rela_ndx].hdr.sh_link = (Elf64_Word)symtab_ndx;
-        w->sec[rela_ndx].hdr.sh_info = (Elf64_Word)w->rela_target;
-        w->sec[rela_ndx].hdr.sh_entsize = sizeof(Elf64_Rela);
+    for (int i = 0; i < w->nrelagrp; i++) {
+        struct rela_group *gp = &w->relagrp[i];
+        w->sec[gp->sec_ndx].hdr.sh_link = (Elf64_Word)symtab_ndx;
+        w->sec[gp->sec_ndx].hdr.sh_info = (Elf64_Word)gp->target;
+        w->sec[gp->sec_ndx].hdr.sh_entsize = sizeof(Elf64_Rela);
     }
 
     /* Lay out: ehdr, section payloads, then the section header table. */

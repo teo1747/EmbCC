@@ -231,9 +231,11 @@ static int gen_expr(struct ir_func *fn, struct expr *e);
  * process, so a file-scope current-unit pointer is honest. */
 static struct ir_unit *cur_unit;
 
-static int intern_str(const char *bytes, int len)
+/* Intern a string into the unit's .rodata pool, returning its index.
+ * Deduping means a literal shared by code and a global initializer lands
+ * once. */
+int ir_intern_string(struct ir_unit *iu, const char *bytes, int len)
 {
-    struct ir_unit *iu = cur_unit;
     for (int i = 0; i < iu->nstrs; i++)
         if (iu->strs[i].len == len &&
             memcmp(iu->strs[i].bytes, bytes, (size_t)len) == 0)
@@ -249,6 +251,11 @@ static int intern_str(const char *bytes, int len)
     s->off = iu->rodata_len;
     iu->rodata_len += len;
     return iu->nstrs++;
+}
+
+static int intern_str(const char *bytes, int len)
+{
+    return ir_intern_string(cur_unit, bytes, len);
 }
 
 /* !x and conditions want "is zero" — comparison against a zero of the
