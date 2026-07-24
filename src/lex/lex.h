@@ -36,6 +36,8 @@ enum tok_kind {
     TOK_KW_CONST,
     TOK_KW_VOLATILE,
     TOK_KW_RESTRICT,
+    TOK_KW_ASM,
+    TOK_KW_INLINE,
     TOK_DOT,
     TOK_ARROW,
     TOK_KW_IF,

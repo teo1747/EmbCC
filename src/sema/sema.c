@@ -18,6 +18,7 @@ struct vardef {
     struct global *g;   /* non-NULL for a static local: it lives in
                          * static storage, not the frame */
     int active;         /* 0 once its block has closed */
+    const char *asm_reg; /* a register-asm binding, else NULL */
 };
 
 /* Block scoping without giving up unique frame slots: entries are never
@@ -59,6 +60,7 @@ static int scope_add(struct scope *sc, const char *name, struct type *ty,
     sc->vars[sc->n].ty = ty;
     sc->vars[sc->n].g = g;
     sc->vars[sc->n].active = 1;
+    sc->vars[sc->n].asm_reg = NULL;
     return sc->n++;
 }
 
@@ -261,6 +263,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->var_index = i;
             e->ty = sc->vars[i].ty;
             e->gref = sc->vars[i].g; /* set for a static local */
+            e->asm_reg = sc->vars[i].asm_reg; /* register-asm binding */
         } else {
             /* enumerators fold to their constant right here */
             struct econst *ec = u->econsts;
@@ -983,6 +986,109 @@ static void lower_globals(struct unit *u)
     }
 }
 
+/* Register name -> encoding number (0-15). The table type is file scope
+ * because EmbCC's own subset (which compiles this file) has no block-scope
+ * type definitions. */
+struct regname { const char *name; int reg; };
+static const struct regname reg_names[] = {
+    { "rax", 0 }, { "rbx", 3 }, { "rcx", 1 }, { "rdx", 2 },
+    { "rsi", 6 }, { "rdi", 7 }, { "r8", 8 }, { "r9", 9 },
+    { "r10", 10 }, { "r11", 11 }, { "r12", 12 }, { "r13", 13 },
+    { "r14", 14 }, { "r15", 15 },
+};
+static int asm_reg_by_name(const char *n)
+{
+    for (unsigned i = 0; i < sizeof reg_names / sizeof reg_names[0]; i++)
+        if (strcmp(n, reg_names[i].name) == 0)
+            return reg_names[i].reg;
+    return -1;
+}
+
+/* The fixed register a constraint pins its operand to (0-15). Output
+ * constraints carry a leading '=' (write) or '+' (read-write); '&'
+ * (earlyclobber) is accepted and ignored. EmbCC supports the fixed-register
+ * letters a/b/c/d/S/D and 'r' bound through a register-asm variable
+ * (`register T x __asm__("r10")`) — enough for the int-$0x80 syscall stubs;
+ * general 'r' allocation is a seam left open. */
+static int asm_resolve_reg(struct unit *u, struct stmt *s,
+                           struct asm_operand *op, int is_out)
+{
+    const char *c = op->constraint;
+    if (is_out && *c != '=' && *c != '+')
+        diag_fatal(u->file, s->line,
+                   "an asm output constraint must start with '=' or '+' "
+                   "(got \"%s\")", op->constraint);
+    while (*c == '=' || *c == '+' || *c == '&')
+        c++;
+    switch (*c) {
+    case 'a': return 0;
+    case 'b': return 3;
+    case 'c': return 1;
+    case 'd': return 2;
+    case 'S': return 6;
+    case 'D': return 7;
+    case 'r': {
+        /* 'r' must name a register-asm variable so EmbCC knows WHICH
+         * register — it does no general register allocation. */
+        if (op->expr->kind == EXPR_VAR && op->expr->asm_reg) {
+            int r = asm_reg_by_name(op->expr->asm_reg);
+            if (r >= 0)
+                return r;
+        }
+        diag_fatal(u->file, s->line,
+                   "asm 'r' constraint needs a register-asm variable "
+                   "(register T x __asm__(\"r10\")) — EmbCC does no general "
+                   "register allocation");
+        return -1;
+    }
+    default:
+        diag_fatal(u->file, s->line,
+                   "asm constraint \"%s\" is not supported "
+                   "(EmbCC handles a/b/c/d/S/D and 'r' via a register-asm "
+                   "variable)", op->constraint);
+        return -1;
+    }
+}
+
+/* Assemble the asm template into machine bytes. EmbCC has no general
+ * text assembler; it recognizes the fixed vocabulary real low-level C
+ * needs — today just `int $imm`, the EmbLinkOS syscall trap — and refuses
+ * anything else loudly (THE RULE). Templates that need %0/%1 operand
+ * substitution are not accepted; the syscall stubs bind operands through
+ * constraints, so their template is operand-free. */
+static void asm_assemble_template(struct unit *u, struct stmt *s)
+{
+    const char *p = s->asm_s->tmpl;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    if (p[0] == 'i' && p[1] == 'n' && p[2] == 't' &&
+        (p[3] == ' ' || p[3] == '\t')) {
+        p += 3;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '$') {
+            char *end;
+            long imm = strtol(p + 1, &end, 0);
+            p = end;
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+                p++;
+            if (*p == '\0') {
+                if (imm < 0 || imm > 255)
+                    diag_fatal(u->file, s->line,
+                               "asm 'int' vector %ld out of range [0,255]",
+                               imm);
+                s->asm_s->code[0] = 0xcd;
+                s->asm_s->code[1] = (unsigned char)imm;
+                s->asm_s->codelen = 2;
+                return;
+            }
+        }
+    }
+    diag_fatal(u->file, s->line,
+               "asm template instruction not supported: \"%s\" "
+               "(EmbCC assembles only 'int $imm')", s->asm_s->tmpl);
+}
+
 /* Declarations anywhere in the function share one flat scope, and
  * shadowing is rejected outright. C gives inner blocks their own scope;
  * refusing shadowed names accepts strictly fewer programs than C does,
@@ -1073,6 +1179,7 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                            "'%s' is already declared in this block",
                            s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
+            sc->vars[s->var_index].asm_reg = s->asm_reg;
             if (s->expr && s->dty->kind != TY_ARRAY &&
                 s->dty->kind != TY_STRUCT) {
                 check_expr(u, f, sc, s->expr);
@@ -1158,6 +1265,22 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
         case STMT_EXPR:
             check_expr(u, f, sc, s->expr);
             break;
+        case STMT_ASM: {
+            struct asm_stmt *a = s->asm_s;
+            for (int i = 0; i < a->nout; i++) {
+                check_expr(u, f, sc, a->out[i].expr);
+                if (!is_lvalue(a->out[i].expr))
+                    diag_fatal(u->file, s->line,
+                               "an asm output operand must be an lvalue");
+                a->out[i].reg = asm_resolve_reg(u, s, &a->out[i], 1);
+            }
+            for (int i = 0; i < a->nin; i++) {
+                check_expr(u, f, sc, a->in[i].expr);
+                a->in[i].reg = asm_resolve_reg(u, s, &a->in[i], 0);
+            }
+            asm_assemble_template(u, s);
+            break;
+        }
         case STMT_IF:
             check_expr(u, f, sc, s->cond);
             need_scalar(u, s->cond, "'if'");

@@ -1021,20 +1021,116 @@ static struct stmt *parse_block(struct parser *ps)
     return s;
 }
 
+/* A string literal (a run of adjacent ones concatenated), as a plain
+ * NUL-terminated C string — for asm templates, constraints, and clobbers. */
+static char *parse_str_literal(struct parser *ps, const char *what)
+{
+    if (cur(ps)->kind != TOK_STR)
+        diag_fatal(ps->lx.file, cur(ps)->line, "expected %s", what);
+    struct token *t = cur(ps);
+    size_t len = (size_t)t->num;            /* includes the NUL */
+    char *bytes = xmalloc(len);
+    memcpy(bytes, t->text, len);
+    advance(ps);
+    while (cur(ps)->kind == TOK_STR) {
+        size_t add = (size_t)cur(ps)->num;
+        char *nb = xmalloc(len - 1 + add);
+        memcpy(nb, bytes, len - 1);
+        memcpy(nb + len - 1, cur(ps)->text, add);
+        bytes = nb;
+        len = len - 1 + add;
+        advance(ps);
+    }
+    return bytes;
+}
+
+/* A ':'-delimited operand list of `"constraint"(expr)` items, empty when the
+ * next token is ':' or ')'. */
+static void parse_asm_operands(struct parser *ps, struct asm_operand **out,
+                               int *nout)
+{
+    int cap = 0;
+    while (cur(ps)->kind != TOK_COLON && cur(ps)->kind != TOK_RPAREN) {
+        if (*nout == cap) {
+            cap = cap ? cap * 2 : 4;
+            *out = xrealloc(*out, (size_t)cap * sizeof **out);
+        }
+        struct asm_operand *op = &(*out)[(*nout)++];
+        op->constraint = parse_str_literal(ps, "an asm constraint");
+        expect(ps, TOK_LPAREN, "'(' after an asm constraint");
+        op->expr = parse_expr(ps);
+        expect(ps, TOK_RPAREN, "')' after an asm operand");
+        if (cur(ps)->kind != TOK_COMMA)
+            break;
+        advance(ps);
+    }
+}
+
+/* GCC extended asm: asm [volatile] ( template
+ *     [ : outputs [ : inputs [ : clobbers ] ] ] ) ;  */
+static struct stmt *parse_asm_stmt(struct parser *ps)
+{
+    struct stmt *s = new_stmt(STMT_ASM, cur(ps)->line);
+    struct asm_stmt *a = xcalloc(1, sizeof *a);
+    s->asm_s = a;
+    advance(ps); /* 'asm' / '__asm__' */
+    if (cur(ps)->kind == TOK_KW_VOLATILE) {
+        a->is_volatile = 1;
+        advance(ps);
+    }
+    expect(ps, TOK_LPAREN, "'(' after asm");
+    a->tmpl = parse_str_literal(ps, "an asm template string");
+    if (cur(ps)->kind == TOK_COLON) {
+        advance(ps);
+        parse_asm_operands(ps, &a->out, &a->nout);
+    }
+    if (cur(ps)->kind == TOK_COLON) {
+        advance(ps);
+        parse_asm_operands(ps, &a->in, &a->nin);
+    }
+    if (cur(ps)->kind == TOK_COLON) {
+        /* clobbers: string literals, parsed and discarded — EmbCC keeps
+         * every value in a stack slot, so a clobbered register holds no
+         * live value to preserve. */
+        advance(ps);
+        while (cur(ps)->kind == TOK_STR) {
+            (void)parse_str_literal(ps, "a clobber");
+            if (cur(ps)->kind != TOK_COMMA)
+                break;
+            advance(ps);
+        }
+    }
+    expect(ps, TOK_RPAREN, "')' to close asm");
+    expect(ps, TOK_SEMI, "';'");
+    return s;
+}
+
 static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
 {
     struct token *t = cur(ps);
     struct stmt *s;
 
-    if (t->kind == TOK_KW_STATIC || at_type_start(ps)) {
+    if (t->kind == TOK_KW_ASM)
+        return parse_asm_stmt(ps);
+
+    /* `register` is otherwise an ignored storage hint, but it carries the
+     * `register T x __asm__("r10")` binding EmbCC needs to place an asm 'r'
+     * operand — so accept it as a qualifier before the type. */
+    int is_register = t->kind == TOK_IDENT &&
+                      strcmp(t->text, "register") == 0;
+    if (t->kind == TOK_KW_STATIC || is_register || at_type_start(ps)) {
         int local_static = 0;
         if (t->kind == TOK_KW_STATIC) {
             local_static = 1;
             advance(ps);
-            if (!at_type_start(ps))
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "expected a type after 'static'");
+        } else if (is_register) {
+            advance(ps);
         }
+        while (cur(ps)->kind == TOK_KW_INLINE) /* accepted, ignored */
+            advance(ps);
+        if ((t->kind == TOK_KW_STATIC || is_register) && !at_type_start(ps))
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a type after the storage specifier");
         if (!allow_decl)
             diag_fatal(ps->lx.file, t->line,
                        "a declaration cannot be the body of if/while/for "
@@ -1055,6 +1151,14 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                            tok_describe(cur(ps)));
             s->name = dname;
             s->is_static = local_static;
+            /* An optional `__asm__("reg")` register binding follows the
+             * declarator: `register long r10 __asm__("r10") = a4;`. */
+            if (cur(ps)->kind == TOK_KW_ASM) {
+                advance(ps);
+                expect(ps, TOK_LPAREN, "'(' after __asm__ register binding");
+                s->asm_reg = parse_str_literal(ps, "a register name");
+                expect(ps, TOK_RPAREN, "')' after the register name");
+            }
             int was_array = s->dty->kind == TY_ARRAY;
             (void)was_array;
             if (cur(ps)->kind == TOK_ASSIGN) {
@@ -1275,12 +1379,20 @@ static void parse_top(struct parser *ps, struct unit *u,
     int is_static = 0, is_extern = 0;
     ps->seq = seq;
 
-    if (cur(ps)->kind == TOK_KW_STATIC) {
-        is_static = 1;
-        advance(ps);
-    } else if (cur(ps)->kind == TOK_KW_EXTERN) {
-        is_extern = 1;
-        advance(ps);
+    /* Storage/function specifiers in any order; `inline` is accepted and
+     * ignored — EmbCC emits an inline function as an ordinary one. */
+    for (;;) {
+        if (cur(ps)->kind == TOK_KW_STATIC) {
+            is_static = 1;
+            advance(ps);
+        } else if (cur(ps)->kind == TOK_KW_EXTERN) {
+            is_extern = 1;
+            advance(ps);
+        } else if (cur(ps)->kind == TOK_KW_INLINE) {
+            advance(ps);
+        } else {
+            break;
+        }
     }
     if (cur(ps)->kind == TOK_KW_TYPEDEF) {
         if (is_static || is_extern)

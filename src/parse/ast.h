@@ -69,6 +69,8 @@ struct expr {
     int nelems;
     const char *desig_field; /* an initlist element's .field designator,
                               * NULL when it is positional */
+    const char *asm_reg;  /* EXPR_VAR: a register-asm binding propagated
+                           * from the variable's declaration, else NULL */
 };
 
 /* An aggregate initializer, flattened by sema into (offset, type,
@@ -93,7 +95,34 @@ struct greloc {
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
                  STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE,
-                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT };
+                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT, STMT_ASM };
+
+/* One operand of an extended-asm statement: a constraint string and the C
+ * expression it binds. Output constraints begin with '=' (or '+') and name
+ * an lvalue; input constraints name any expression. EmbCC supports the
+ * fixed-register letters a/b/c/d/S/D and 'r' (bound via a register-asm
+ * variable) — enough for EmbLinkOS's int-$0x80 syscall stubs. */
+struct asm_operand {
+    const char *constraint;
+    struct expr *expr;
+    int reg;              /* the fixed register (0-15), resolved by sema */
+};
+
+/* An extended-asm statement (VISION_LONGTERM: first-class fixed-register
+ * constraints, so the syscall header's gcc branch compiles). The template
+ * is assembled by a tiny fixed vocabulary (int $imm today); clobbers are
+ * parsed and ignored, sound because EmbCC keeps every value in a stack
+ * slot, never a register, across statements. */
+struct asm_stmt {
+    const char *tmpl;
+    struct asm_operand *out;
+    int nout;
+    struct asm_operand *in;
+    int nin;
+    int is_volatile;
+    unsigned char code[16]; /* the assembled template bytes (sema) */
+    int codelen;
+};
 
 struct stmt {
     enum stmt_kind kind;
@@ -105,6 +134,9 @@ struct stmt {
     int ninits;
     struct global *sglob; /* STMT_DECL: the global a static local became */
     int var_index;        /* STMT_DECL: set by sema */
+    const char *asm_reg;  /* STMT_DECL: a register-asm binding, `register T
+                           * x __asm__("r10")` — NULL for an ordinary local */
+    struct asm_stmt *asm_s; /* STMT_ASM */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
     struct expr *cond;    /* IF/WHILE/FOR */
     struct expr *init, *step; /* FOR: either may be NULL */

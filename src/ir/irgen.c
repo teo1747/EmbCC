@@ -867,6 +867,33 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
         case STMT_EXPR:
             gen_expr(fn, s->expr); /* value discarded */
             break;
+        case STMT_ASM: {
+            struct asm_stmt *a = s->asm_s;
+            struct ir_asm *ia = xcalloc(1, sizeof *ia);
+            ia->code = a->code;
+            ia->codelen = a->codelen;
+            ia->nin = a->nin;
+            ia->nout = a->nout;
+            ia->in = xcalloc((size_t)(a->nin ? a->nin : 1), sizeof *ia->in);
+            ia->out = xcalloc((size_t)(a->nout ? a->nout : 1),
+                              sizeof *ia->out);
+            /* An input carries its VALUE; an output the ADDRESS of its
+             * lvalue. Registers were resolved by sema. */
+            for (int i = 0; i < a->nin; i++) {
+                ia->in[i].reg = a->in[i].reg;
+                ia->in[i].temp = gen_expr(fn, a->in[i].expr);
+                ia->in[i].size = 8;
+            }
+            for (int i = 0; i < a->nout; i++) {
+                ia->out[i].reg = a->out[i].reg;
+                ia->out[i].temp = gen_addr(fn, a->out[i].expr);
+                ia->out[i].size = ty_size(a->out[i].expr->ty);
+            }
+            struct ir_ins *ins = emit(fn);
+            ins->op = IR_ASM;
+            ins->asm_ir = ia;
+            break;
+        }
         case STMT_RETURN: {
             struct ir_ins *i;
             int v = s->expr ? gen_expr(fn, s->expr) : -1;

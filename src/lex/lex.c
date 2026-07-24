@@ -71,7 +71,13 @@ static const struct {
     { "typedef", TOK_KW_TYPEDEF },
     { "const", TOK_KW_CONST },
     { "volatile", TOK_KW_VOLATILE },
+    { "__volatile__", TOK_KW_VOLATILE },
     { "restrict", TOK_KW_RESTRICT },
+    { "asm", TOK_KW_ASM },
+    { "__asm__", TOK_KW_ASM },
+    { "inline", TOK_KW_INLINE },
+    { "__inline", TOK_KW_INLINE },
+    { "__inline__", TOK_KW_INLINE },
     { "if", TOK_KW_IF },
     { "else", TOK_KW_ELSE },
     { "while", TOK_KW_WHILE },
@@ -441,6 +447,8 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_CONST: return "'const'";
     case TOK_KW_VOLATILE: return "'volatile'";
     case TOK_KW_RESTRICT: return "'restrict'";
+    case TOK_KW_ASM: return "'asm'";
+    case TOK_KW_INLINE: return "'inline'";
     case TOK_DOT: return "'.'";
     case TOK_ARROW: return "'->'";
     case TOK_KW_IF: return "'if'";

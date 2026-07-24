@@ -556,6 +556,29 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_store_slot(text, sd[i->dst], 8);
             break;
         }
+        case IR_ASM: {
+            /* Extended asm. Load each input from its stack slot into the
+             * fixed register its constraint chose, emit the assembled
+             * template, then store each output register through the
+             * lvalue address (also in a slot). Clobbers need nothing:
+             * every live value is in memory, never a register, across the
+             * asm. A scratch that avoids the output register carries the
+             * address so the result register survives the store. */
+            struct ir_asm *ia = i->asm_ir;
+            for (int k = 0; k < ia->nin; k++)
+                x86_load_reg_mem(text, ia->in[k].reg, REG_RBP,
+                                 sd[ia->in[k].temp], 8);
+            for (int k = 0; k < ia->codelen; k++)
+                code_byte(text, ia->code[k]);
+            for (int k = 0; k < ia->nout; k++) {
+                int scratch = ia->out[k].reg == REG_RCX ? REG_RDX : REG_RCX;
+                x86_load_reg_mem(text, scratch, REG_RBP,
+                                 sd[ia->out[k].temp], 8);
+                x86_store_mem_reg(text, scratch, 0, ia->out[k].reg,
+                                  ia->out[k].size);
+            }
+            break;
+        }
         case IR_VA_START:
             /* Build a __va_list_tag on the frame and point the va_list at
              * it. Layout (SysV): gp_offset u32, fp_offset u32,

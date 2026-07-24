@@ -56,8 +56,28 @@ enum ir_op {
     IR_MEMZERO,/* zero `size` bytes at (addr a) */
     IR_BRZ,   /* if (a == 0) goto label  (w) */
     IR_BRNZ,  /* if (a != 0) goto label  (w) */
-    IR_VA_START /* init the va_list whose ADDRESS is in temp a (SysV:
-                 * fill a __va_list_tag on the frame, point *a at it) */
+    IR_VA_START, /* init the va_list whose ADDRESS is in temp a (SysV:
+                  * fill a __va_list_tag on the frame, point *a at it) */
+    IR_ASM    /* extended asm: load inputs to fixed registers, assemble the
+               * template, store outputs. Detail in ir_ins.asm_ir */
+};
+
+/* One resolved asm operand: an input carries the temp holding its VALUE, an
+ * output the temp holding its lvalue ADDRESS; reg is the fixed register
+ * (0-15) the constraint pins it to. */
+struct ir_asm_op {
+    int temp;
+    int reg;
+    int size;
+};
+
+struct ir_asm {
+    const unsigned char *code;   /* assembled template bytes */
+    int codelen;
+    struct ir_asm_op *in;
+    int nin;
+    struct ir_asm_op *out;
+    int nout;
 };
 
 struct ir_ins {
@@ -96,6 +116,7 @@ struct ir_ins {
     int retnclass;
     enum arg_class retcls[2];
     int scratch;             /* frame offset of the returned struct */
+    struct ir_asm *asm_ir;   /* IR_ASM */
 };
 
 struct ir_func {
