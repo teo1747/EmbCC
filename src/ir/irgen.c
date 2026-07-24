@@ -182,7 +182,68 @@ static void emit_store(struct ir_func *fn, int addr, int val,
     i->size = ty_size(t);
 }
 
+static void emit_mov(struct ir_func *fn, int dst, int src)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_MOV;
+    i->dst = dst;
+    i->a = src;
+}
+
+static int emit_cmp(struct ir_func *fn, enum binop pred, int a, int b,
+                    int w, int sign)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_CMP;
+    i->pred = pred;
+    i->a = a;
+    i->b = b;
+    i->w = w;
+    i->sign = sign;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
 static int gen_expr(struct ir_func *fn, struct expr *e);
+
+/* va_arg(ap, T) for an INTEGER-class T (SysV). ap's value is a pointer to
+ * a __va_list_tag { gp_offset u32, fp_offset u32, overflow_arg_area ptr,
+ * reg_save_area ptr }. If gp_offset < 48 the argument sits in the register
+ * save area at reg_save_area + gp_offset and gp_offset advances by 8;
+ * otherwise it is next in the overflow area, which advances by 8. */
+static int gen_va_arg(struct ir_func *fn, struct expr *e)
+{
+    struct type *rt = e->ty;
+    struct type *u32 = ty_base(TY_INT, 1);
+    struct type *ptr = ty_base(TY_LONG, 1); /* an 8-byte slot */
+    int ap = gen_expr(fn, e->lhs);          /* pointer to the tag */
+
+    int a_ova = emit_bin(fn, IR_ADD, ap, emit_const(fn, 8, 8), 8, 1);
+    int a_rsa = emit_bin(fn, IR_ADD, ap, emit_const(fn, 16, 8), 8, 1);
+    int gp = emit_load(fn, ap, u32);        /* gp_offset (at ap+0) */
+    int in_reg = emit_cmp(fn, B_LT, gp, emit_const(fn, 48, 4), 4, 0);
+
+    int addr = new_temp(fn);
+    int l_over = new_label(fn), l_done = new_label(fn);
+    emit_brz(fn, in_reg, 4, l_over);        /* gp_offset >= 48 -> overflow */
+
+    /* register save area: addr = reg_save_area + gp_offset; gp_offset += 8 */
+    int rsa = emit_load(fn, a_rsa, ptr);
+    emit_mov(fn, addr, emit_bin(fn, IR_ADD, rsa, gp, 8, 1));
+    emit_store(fn, ap, emit_bin(fn, IR_ADD, gp, emit_const(fn, 8, 4), 4, 0),
+               u32);
+    emit_jmp(fn, l_done);
+
+    /* overflow area: addr = overflow_arg_area; advance it by 8 */
+    emit_label(fn, l_over);
+    int ova = emit_load(fn, a_ova, ptr);
+    emit_mov(fn, addr, ova);
+    emit_store(fn, a_ova, emit_bin(fn, IR_ADD, ova, emit_const(fn, 8, 8),
+                                   8, 1), ptr);
+
+    emit_label(fn, l_done);
+    return emit_load(fn, addr, rt);
+}
 
 /* The address of an lvalue (or of a struct-typed expression — struct
  * "values" are represented by their address, since sema bars them from
@@ -504,6 +565,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     }
     case EXPR_SIZEOF:
         break; /* folded to EXPR_NUM by sema; unreachable */
+    case EXPR_VA_ARG:
+        return gen_va_arg(fn, e);
     case EXPR_BINOP: {
         struct type *lt = e->lhs->ty, *rt = e->rhs->ty;
 

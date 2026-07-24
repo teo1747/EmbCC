@@ -564,6 +564,20 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         e->ty = ty_base(TY_LONG, 1);
         break;
     }
+    case EXPR_VA_ARG:
+        check_expr(u, f, sc, e->lhs);   /* the va_list */
+        if (e->cast_ty->kind == TY_VOID)
+            diag_fatal(u->file, e->line, "va_arg cannot read type 'void'");
+        if (e->cast_ty->kind == TY_STRUCT)
+            diag_fatal(u->file, e->line,
+                       "va_arg of a struct passed by value is not "
+                       "supported yet");
+        if (ty_is_float(e->cast_ty))
+            diag_fatal(u->file, e->line,
+                       "va_arg of a floating type is not supported yet "
+                       "(EmbCC reads integer and pointer varargs)");
+        e->ty = e->cast_ty;
+        break;
     case EXPR_BINOP: {
         check_expr(u, f, sc, e->lhs);
         check_expr(u, f, sc, e->rhs);

@@ -22,7 +22,7 @@ enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
-                 EXPR_COMPOUND, EXPR_INITLIST };
+                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.

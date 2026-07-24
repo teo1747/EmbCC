@@ -640,6 +640,20 @@ static struct expr *parse_primary(struct parser *ps)
         expect(ps, TOK_RPAREN, "')'");
         return e;
     case TOK_IDENT: {
+        /* va_arg(ap, type) -> __builtin_va_arg((ap), type): a special form,
+         * because its second argument is a TYPE, not an expression. lhs
+         * holds ap; cast_ty holds the type read. */
+        if (strcmp(t->text, "__builtin_va_arg") == 0) {
+            int line = t->line;
+            advance(ps);
+            expect(ps, TOK_LPAREN, "'(' after __builtin_va_arg");
+            e = new_expr(EXPR_VA_ARG, line);
+            e->lhs = parse_expr(ps);
+            expect(ps, TOK_COMMA, "',' before the va_arg type");
+            e->cast_ty = parse_stars(ps, parse_type_spec(ps, 0));
+            expect(ps, TOK_RPAREN, "')' to close __builtin_va_arg");
+            return e;
+        }
         reject_reserved(ps, t->text, t->line);
         e = new_expr(EXPR_VAR, t->line);
         e->name = t->text;
