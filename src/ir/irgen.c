@@ -213,18 +213,6 @@ static int gen_addr(struct ir_func *fn, struct expr *e)
     }
 }
 
-static int log2_size(int size)
-{
-    switch (size) {
-    case 1: return 0;
-    case 2: return 1;
-    case 4: return 2;
-    case 8: return 3;
-    }
-    fprintf(stderr, "embcc: internal: bad object size %d\n", size);
-    exit(1);
-}
-
 static int gen_expr(struct ir_func *fn, struct expr *e);
 
 /* The unit being generated — for the string table. One compilation per
@@ -567,15 +555,18 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         case B_SUB: {
             int lp = lt->kind == TY_PTR, rp = rt->kind == TY_PTR;
             if (lp && rp) {
-                /* ptr - ptr: byte difference, scaled down */
+                /* ptr - ptr: signed byte difference divided by the element
+                 * size. Division (not a shift) so any element size works,
+                 * including non-powers-of-two like a 24-byte struct — the
+                 * mirror of the IR_MUL scaling on the ptr+int path. */
                 int a = gen_expr(fn, e->lhs);
                 int b = gen_expr(fn, e->rhs);
                 int diff = emit_bin(fn, IR_SUB, a, b, 8, 1);
-                int sh = log2_size(ty_size(lt->pointee));
-                if (!sh)
+                int size = ty_size(lt->pointee);
+                if (size <= 1)
                     return diff;
-                int c = emit_const(fn, sh, 4);
-                return emit_bin(fn, IR_SHR, diff, c, 8, 1);
+                int c = emit_const(fn, size, 8);
+                return emit_bin(fn, IR_DIV, diff, c, 8, 1);
             }
             if (lp || rp) {
                 /* ptr +/- int: scale the (already long) index */
