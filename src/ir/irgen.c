@@ -15,16 +15,19 @@ static struct ir_ins *emit(struct ir_func *fn)
         fn->ins = xrealloc(fn->ins, (size_t)fn->cap * sizeof *fn->ins);
     }
     struct ir_ins *i = &fn->ins[fn->nins++];
+    /* Zero first: the array is grown with xrealloc, so a reused slot
+     * carries a previous instruction's bytes. Fields an instruction does
+     * not set (retsize/retnclass on a non-struct call, the whole va/arg
+     * machinery on a plain op) must read as 0, not stale garbage — a
+     * garbage retnclass once walked retcls[] off the end and crashed. */
+    memset(i, 0, sizeof *i);
     i->op = IR_CONST;
     i->dst = i->a = i->b = -1;
     i->w = 4;
     i->size = 4;
     i->sign = 1;
-    i->imm = 0;
     i->pred = B_ADD;
     i->label = -1;
-    i->callee = 0;
-    i->nargs = 0;
     return i;
 }
 
