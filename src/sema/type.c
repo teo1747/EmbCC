@@ -61,12 +61,16 @@ struct type *ty_struct(const char *tag, int is_union)
     return t;
 }
 
-void ty_struct_layout(struct type *t, struct member *members, int n)
+/* `packed` drops every member's alignment to 1 (no inter-member padding,
+ * struct align 1); `user_align`, from __attribute__((aligned(N))), raises
+ * the struct's alignment to at least N. */
+void ty_struct_layout(struct type *t, struct member *members, int n,
+                      int packed, int user_align)
 {
     int off = 0, align = 1;
 
     for (int i = 0; i < n; i++) {
-        int ma = ty_align(members[i].ty);
+        int ma = packed ? 1 : ty_align(members[i].ty);
         int ms = ty_size(members[i].ty);
         if (t->is_union) {
             members[i].off = 0;
@@ -80,6 +84,8 @@ void ty_struct_layout(struct type *t, struct member *members, int n)
         if (ma > align)
             align = ma;
     }
+    if (user_align > align)
+        align = user_align;
     t->members = members;
     t->nmembers = n;
     t->align = align;

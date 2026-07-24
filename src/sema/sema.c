@@ -949,16 +949,30 @@ static void lower_static_bytes(struct unit *u, int line, int size,
         struct expr *core = v[k].e;
         while (core && core->kind == EXPR_CAST)
             core = core->rhs;
-        if (core && core->kind == EXPR_STR && v[k].ty->kind == TY_PTR) {
-            /* a pointer slot pointing at a string literal: 8 zero bytes
-             * stay in the image; the linker writes the address. */
+        /* The address of a global: `&g`, or an array/function global that
+         * decayed to a pointer (`char **environ = embk_empty_env`). */
+        struct global *gt = NULL;
+        if (core && core->kind == EXPR_VAR && core->gref)
+            gt = core->gref;
+        else if (core && core->kind == EXPR_ADDR) {
+            struct expr *in = core->rhs;
+            while (in && in->kind == EXPR_CAST)
+                in = in->rhs;
+            if (in && in->kind == EXPR_VAR && in->gref)
+                gt = in->gref;
+        }
+        if ((core && core->kind == EXPR_STR && v[k].ty->kind == TY_PTR) ||
+            (gt && v[k].ty->kind == TY_PTR)) {
+            /* a pointer slot: zero bytes stay, the linker writes the
+             * address of a string literal or a global. */
             if (nrel == caprel) {
                 caprel = caprel ? caprel * 2 : 4;
                 rel = xrealloc(rel, (size_t)caprel * sizeof *rel);
             }
             rel[nrel].off = v[k].off;
-            rel[nrel].str = core->name;
-            rel[nrel].str_len = (int)core->num;
+            rel[nrel].str = gt ? NULL : core->name;
+            rel[nrel].str_len = gt ? 0 : (int)core->num;
+            rel[nrel].gtarget = gt;
             rel[nrel].addend = 0;
             nrel++;
             continue;
@@ -966,8 +980,8 @@ static void lower_static_bytes(struct unit *u, int line, int size,
         long cv;
         if (!const_fold(v[k].e, &cv))
             diag_fatal(u->file, line,
-                       "a static initializer must be a constant or a "
-                       "string-literal address");
+                       "a static initializer must be a constant, a "
+                       "string literal, or the address of a global");
         int sz = ty_size(v[k].ty);
         for (int b = 0; b < sz; b++)
             bytes[v[k].off + b] = (char)((unsigned long)cv >> (8 * b));
@@ -989,7 +1003,7 @@ static void lower_globals(struct unit *u)
         /* An initializer may reference any name declared before this
          * global — mirror the source position so the declare-before-use
          * rule (and enum-constant visibility) matches C. */
-        cur_body_seq = g->seq;
+        cur_body_seq = g->def_seq;
         struct scope sc = { 0, 0, 0, 0 };
         struct initbuf ib = { 0, 0, 0 };
         flatten_init(u, &gf, &sc, g->init_expr, g->ty, 0, &ib);
@@ -1510,6 +1524,7 @@ static void merge_decls(struct unit *u)
             for (int i = 0; i < f->nparams; i++)
                 canon->params[i] = f->params[i]; /* definition names win */
         }
+        canon->is_weak |= f->is_weak;  /* weak on any declaration is weak */
         f->absorbed = 1;
     }
 }
@@ -1562,8 +1577,10 @@ static void merge_globals(struct unit *u)
             canon->has_init = 1;
             canon->init = g->init;
             canon->init_expr = g->init_expr;
+            canon->def_seq = g->seq;   /* the initializer's real position */
         }
         canon->defined |= !g->is_extern;
+        canon->is_weak |= g->is_weak;
         g->absorbed = 1;
     }
 }

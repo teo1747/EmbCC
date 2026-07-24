@@ -78,6 +78,8 @@ static const struct {
     { "inline", TOK_KW_INLINE },
     { "__inline", TOK_KW_INLINE },
     { "__inline__", TOK_KW_INLINE },
+    { "__attribute__", TOK_KW_ATTRIBUTE },
+    { "__attribute", TOK_KW_ATTRIBUTE },
     { "if", TOK_KW_IF },
     { "else", TOK_KW_ELSE },
     { "while", TOK_KW_WHILE },
@@ -449,6 +451,7 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_RESTRICT: return "'restrict'";
     case TOK_KW_ASM: return "'asm'";
     case TOK_KW_INLINE: return "'inline'";
+    case TOK_KW_ATTRIBUTE: return "'__attribute__'";
     case TOK_DOT: return "'.'";
     case TOK_ARROW: return "'->'";
     case TOK_KW_IF: return "'if'";

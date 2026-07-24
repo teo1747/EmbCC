@@ -473,6 +473,62 @@ static struct type *parse_array_dims(struct parser *ps, struct type *t)
     return t;
 }
 
+/* The GNU attributes EmbCC honors; everything else is parsed and dropped. */
+struct attrs { int packed; int aligned; int weak; };
+
+/* Match `name`, `__name`, or `__name__` against a base attribute name. */
+static int attr_is(const char *n, const char *base)
+{
+    if (strcmp(n, base) == 0)
+        return 1;
+    size_t bl = strlen(base);
+    return strncmp(n, "__", 2) == 0 &&
+           strncmp(n + 2, base, bl) == 0 &&
+           strcmp(n + 2 + bl, "__") == 0;
+}
+
+/* Consume a run of `__attribute__((...))`. packed / aligned(N) (struct
+ * layout) and weak (symbol binding) are recorded in `out`; every other
+ * attribute is skipped along with its balanced parenthesized arguments.
+ * Callers pass out=NULL where no attribute is meaningful (member/param). */
+static void parse_attributes(struct parser *ps, struct attrs *out)
+{
+    while (cur(ps)->kind == TOK_KW_ATTRIBUTE) {
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after __attribute__");
+        expect(ps, TOK_LPAREN, "a second '(' after __attribute__");
+        while (cur(ps)->kind != TOK_RPAREN && cur(ps)->kind != TOK_EOF) {
+            const char *name = cur(ps)->kind == TOK_IDENT ? cur(ps)->text
+                                                          : NULL;
+            advance(ps);
+            long arg = -1;
+            if (cur(ps)->kind == TOK_LPAREN) {
+                advance(ps);
+                if (cur(ps)->kind == TOK_NUM)
+                    arg = cur(ps)->num;
+                int depth = 1;
+                while (depth > 0 && cur(ps)->kind != TOK_EOF) {
+                    if (cur(ps)->kind == TOK_LPAREN) depth++;
+                    else if (cur(ps)->kind == TOK_RPAREN) depth--;
+                    advance(ps);
+                }
+            }
+            if (name && out) {
+                if (attr_is(name, "packed")) out->packed = 1;
+                else if (attr_is(name, "weak")) out->weak = 1;
+                else if (attr_is(name, "aligned"))
+                    out->aligned = arg > 0 ? (int)arg : 16;
+            }
+            if (cur(ps)->kind == TOK_COMMA)
+                advance(ps);
+            else
+                break;
+        }
+        expect(ps, TOK_RPAREN, "')'");
+        expect(ps, TOK_RPAREN, "a second ')' to close __attribute__");
+    }
+}
+
 static struct type *parse_struct_body(struct parser *ps, struct type *t)
 {
     expect(ps, TOK_LBRACE, "'{'");
@@ -513,6 +569,7 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
                 cap = cap ? cap * 2 : 8;
                 ms = xrealloc(ms, (size_t)cap * sizeof *ms);
             }
+            parse_attributes(ps, NULL); /* member attributes: ignored */
             ms[n].name = mname;
             ms[n].ty = mty;
             ms[n].off = 0;
@@ -526,10 +583,12 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
         expect(ps, TOK_SEMI, "';'");
     }
     advance(ps); /* '}' */
+    struct attrs at = { 0, 0, 0 };
+    parse_attributes(ps, &at);   /* struct {...} __attribute__((packed)) */
     if (n == 0)
         diag_fatal(ps->lx.file, cur(ps)->line,
                    "a struct/union needs at least one member");
-    ty_struct_layout(t, ms, n);
+    ty_struct_layout(t, ms, n, at.packed, at.aligned);
     return t;
 }
 
@@ -1391,6 +1450,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                       int seq)
 {
     int is_static = 0, is_extern = 0;
+    struct attrs at = { 0, 0, 0 };
     ps->seq = seq;
 
     /* A file-scope `__asm__("...")` block (crt0's _start stub). Basic asm
@@ -1423,6 +1483,8 @@ static void parse_top(struct parser *ps, struct unit *u,
             advance(ps);
         } else if (cur(ps)->kind == TOK_KW_INLINE) {
             advance(ps);
+        } else if (cur(ps)->kind == TOK_KW_ATTRIBUTE) {
+            parse_attributes(ps, &at); /* leading __attribute__((weak)) etc. */
         } else {
             break;
         }
@@ -1496,9 +1558,13 @@ static void parse_top(struct parser *ps, struct unit *u,
                 diag_fatal(ps->lx.file, gline,
                            "a variable cannot have a function type — "
                            "did you mean a function pointer (*)?");
+            parse_attributes(ps, &at); /* int x __attribute__((weak)) = ... */
             struct global *g = parse_global(ps, gt, gname, gline,
                                             is_static, is_extern);
+            parse_attributes(ps, &at); /* trailing: T x[] __attribute__((weak)) */
+            g->is_weak = at.weak;
             g->seq = seq;
+            g->def_seq = seq;
             **gtail = g;
             *gtail = &g->next;
             if (cur(ps)->kind != TOK_COMMA)
@@ -1513,6 +1579,7 @@ static void parse_top(struct parser *ps, struct unit *u,
     struct func *f = xcalloc(1, sizeof *f);
     /* 'extern' on a function is the default linkage — accept, ignore */
     f->is_static = is_static;
+    f->is_weak = at.weak;   /* leading __attribute__((weak)) */
     f->ret_ty = ty;
     f->name = name;
     f->file = ps->lx.file;
@@ -1569,6 +1636,10 @@ static void parse_top(struct parser *ps, struct unit *u,
         }
     }
     expect(ps, TOK_RPAREN, "')'");
+
+    /* trailing attributes: void f(void) __attribute__((noreturn/weak)) */
+    parse_attributes(ps, &at);
+    f->is_weak = at.weak;
 
     if (cur(ps)->kind == TOK_SEMI) {
         advance(ps); /* prototype */

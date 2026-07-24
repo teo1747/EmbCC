@@ -171,6 +171,8 @@ static int compile(const char *in, const char *out, int pp_only)
         if (g->absorbed || !g->defined)
             continue;
         for (int i = 0; i < g->nrelocs; i++) {
+            if (!g->relocs[i].str)   /* a &global reloc needs no .rodata */
+                continue;
             int si = ir_intern_string(iu, g->relocs[i].str,
                                       g->relocs[i].str_len);
             g->relocs[i].str_off = iu->strs[si].off;
@@ -253,14 +255,14 @@ static int compile(const char *in, const char *out, int pp_only)
             f->sym_ndx = elfw_add_symbol(
                 w, f->name, (Elf64_Addr)f->code_off,
                 (Elf64_Xword)f->code_len,
-                ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
+                ELF64_ST_INFO(f->is_weak ? STB_WEAK : STB_GLOBAL, STT_FUNC),
                 (Elf64_Half)text_ndx);
     for (struct global *g = u->globals; g; g = g->next)
         if (!g->absorbed && g->defined && !g->is_static)
             g->sym_ndx = elfw_add_symbol(
                 w, g->name, (Elf64_Addr)g->off,
                 (Elf64_Xword)ty_size(g->ty),
-                ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT),
+                ELF64_ST_INFO(g->is_weak ? STB_WEAK : STB_GLOBAL, STT_OBJECT),
                 (Elf64_Half)(g->in_bss ? bss_ndx : data_ndx));
     /* File-scope asm's .global labels (_start): global functions at their
      * .text offset. Local labels stay internal — the assembler already
@@ -279,7 +281,8 @@ static int compile(const char *in, const char *out, int pp_only)
         if (!g->absorbed && !g->defined && g->used)
             g->sym_ndx = elfw_add_symbol(
                 w, g->name, 0, 0,
-                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE), SHN_UNDEF);
+                ELF64_ST_INFO(g->is_weak ? STB_WEAK : STB_GLOBAL,
+                              STT_NOTYPE), SHN_UNDEF);
 
     /* Every called external gets one UNDEF symbol, and every call site
      * a PLT32 relocation against it. addend -4: rel32 is relative to
@@ -332,17 +335,22 @@ static int compile(const char *in, const char *out, int pp_only)
                       gs[i].glob->sym_ndx, R_X86_64_PC32, -4);
     free(gs);
 
-    /* Pointer slots in .data initialized by a string literal: an absolute
-     * 64-bit address into .rodata, against its section symbol. A global
+    /* Pointer slots in .data initialized by an address: an absolute 64-bit
+     * relocation, against the .rodata section symbol for a string literal
+     * or against the target global's own symbol for an &global. A global
      * carrying relocations is initialized, hence in .data, never .bss. */
     for (struct global *g = u->globals; g; g = g->next) {
         if (g->absorbed || !g->defined || g->in_bss)
             continue;
-        for (int i = 0; i < g->nrelocs; i++)
+        for (int i = 0; i < g->nrelocs; i++) {
+            int sym = g->relocs[i].gtarget ? g->relocs[i].gtarget->sym_ndx
+                                           : rodata_sym;
+            long add = g->relocs[i].gtarget ? g->relocs[i].addend
+                       : g->relocs[i].str_off + g->relocs[i].addend;
             elfw_add_rela(w, data_ndx,
                           (Elf64_Addr)(g->off + g->relocs[i].off),
-                          rodata_sym, R_X86_64_64,
-                          g->relocs[i].str_off + g->relocs[i].addend);
+                          sym, R_X86_64_64, add);
+        }
     }
 
     /* Function addresses: PC32 against the function's symbol; an

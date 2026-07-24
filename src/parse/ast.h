@@ -87,9 +87,10 @@ struct initelem {
  * &global / &func addends is left open deliberately. */
 struct greloc {
     int off;              /* byte offset within the object */
-    const char *str;      /* string-literal bytes the slot points at */
+    const char *str;      /* a string-literal target (NULL if a global) */
     int str_len;          /* including its NUL */
     int str_off;          /* driver: the target's offset inside .rodata */
+    struct global *gtarget; /* an &global target (NULL if a string) */
     long addend;
 };
 
@@ -163,9 +164,14 @@ struct global {
     int line;
     int seq;              /* source order, shared counter with funcs —
                            * enforces declare-before-use across kinds */
+    int def_seq;          /* source order of the DEFINING declaration (the
+                           * one with the initializer) — its initializer may
+                           * reference names declared before it, not merely
+                           * before the first (extern) declaration */
     struct type *ty;
     int is_static;
     int is_extern;        /* THIS declaration was 'extern' */
+    int is_weak;          /* __attribute__((weak)) */
     int has_init;
     long init;            /* constant initializer value (scalar) */
     struct expr *init_expr; /* aggregate/relocatable initializer, lowered
@@ -190,6 +196,7 @@ struct func {
     int line;
     int seq;              /* source order (see struct global) */
     int is_static;
+    int is_weak;          /* __attribute__((weak)) */
     int is_varargs;       /* declared with a trailing ", ..." */
     struct type *ret_ty;
     int nparams;

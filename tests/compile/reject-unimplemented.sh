@@ -140,7 +140,7 @@ check global-nonconst-init \
     'int a = 1;
 int b = a;
 int main(void) { return b; }' \
-    "must be a constant or a string-literal address"
+    "must be a constant, a string literal, or the address of a global"
 check extern-with-init \
     'extern int g = 5;
 int main(void) { return g; }' \
