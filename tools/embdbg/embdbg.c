@@ -68,6 +68,13 @@
 
 static void die(const char *msg) { fprintf(stderr, "embdbg: %s\n", msg); exit(1); }
 
+/* Added to every code address the DWARF readers decode. 0 for normal tool use
+ * (a .o yields .text-relative addresses, a linked image absolute ones). EmbLD
+ * sets it to a debug object's FINAL .text vaddr, so a relocatable object's
+ * .text-relative addresses come out absolute — the link-time producer that
+ * gives .embdbg the absolute vaddrs the spec wants (§2 "producer finding"). */
+static long g_addr_bias = 0;
+
 static unsigned char *slurp(const char *path, long *len_out)
 {
     FILE *f = fopen(path, "rb");
@@ -163,7 +170,7 @@ static void load_funcs(struct img *m)
         if (ELF64_ST_TYPE(sym[i].st_info) != STT_FUNC || sym[i].st_size == 0)
             continue;
         m->fn[m->nfn].name = (const char *)strt->data + sym[i].st_name;
-        m->fn[m->nfn].addr = sym[i].st_value;
+        m->fn[m->nfn].addr = sym[i].st_value + (unsigned long)g_addr_bias;
         m->fn[m->nfn].size = sym[i].st_size;
         m->nfn++;
     }
@@ -243,7 +250,7 @@ static void decode_lines(struct img *m)
                 if (sub == DW_LNE_set_address) {
                     int found;
                     unsigned long a = reloc_lookup(m, ".rela.debug_line", (unsigned long)i, &found);
-                    addr = found ? a : u64(p + i);
+                    addr = found ? (unsigned long)((long)a + g_addr_bias) : u64(p + i);
                 } else if (sub == DW_LNE_end_sequence) {
                     add_row(m, addr, file, line, 1);
                     addr = 0; file = 1; line = 1;
@@ -346,7 +353,8 @@ static void decode_info(struct img *m)
             case DW_FORM_addr: {
                 int found;
                 unsigned long v = reloc_lookup(m, ".rela.debug_info", secoff, &found);
-                if (!found) v = u64(p + i);
+                if (found) v = (unsigned long)((long)v + g_addr_bias);
+                else v = u64(p + i);
                 i += 8;
                 if (at == DW_AT_low_pc) low = v;
                 else if (at == DW_AT_high_pc) high = v;
@@ -735,7 +743,8 @@ static int cmp_rows(const void *a, const void *b)
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
-static void write_embdbg(struct img *m, const char *path)
+static void write_embdbg(struct img *m, const char *path,
+                         const unsigned char *bid_src, long bid_len)
 {
     struct strtab st; memset(&st, 0, sizeof st);
     struct ob files = {0,0,0}, line = {0,0,0}, funcs = {0,0,0},
@@ -822,7 +831,7 @@ static void write_embdbg(struct img *m, const char *path)
     ob_u16(&out, 1);                             /* format_version */
     ob_u16(&out, 64);                            /* header_size */
     ob_u32(&out, 0);                             /* flags */
-    unsigned char bid[32]; sha256(m->b, m->len, bid);
+    unsigned char bid[32]; sha256(bid_src, bid_len, bid);
     ob_bytes(&out, bid, 32);                     /* build_id = SHA-256(image) */
     ob_u16(&out, (unsigned)nsec);
     ob_u16(&out, 0);                             /* reserved */
@@ -973,6 +982,26 @@ static void cmd_verify(struct img *m)
     printf("verify OK\n");
 }
 
+/* Link-time entry point (used by EmbLD): parse one relocatable object's DWARF
+ * with `addr_bias` = its final .text vaddr so addresses come out absolute,
+ * and write a .embdbg whose build_id is the SHA-256 of the linked `image`. */
+int embdbg_emit_object(const unsigned char *obj, long objlen, long addr_bias,
+                       const unsigned char *image, long imagelen,
+                       const char *out)
+{
+    struct img m; memset(&m, 0, sizeof m);
+    m.b = (unsigned char *)obj; m.len = objlen;
+    g_addr_bias = addr_bias;
+    load_sections(&m);
+    load_funcs(&m);
+    decode_lines(&m);
+    decode_info(&m);
+    write_embdbg(&m, out, image, imagelen);
+    g_addr_bias = 0;
+    return 0;
+}
+
+#ifndef EMBDBG_NO_MAIN
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -1005,7 +1034,7 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "emit") == 0) {
         if (is_embdbg) die("input is already .embdbg");
         if (argc < 4) die("emit needs an output path");
-        write_embdbg(&m, argv[3]);
+        write_embdbg(&m, argv[3], m.b, m.len);   /* build_id = hash of this ELF */
         return 0;
     }
     if (strcmp(cmd, "verify") == 0) {
@@ -1023,3 +1052,4 @@ int main(int argc, char **argv)
     else { fprintf(stderr, "embdbg: unknown command '%s'\n", cmd); return 1; }
     return 0;
 }
+#endif /* EMBDBG_NO_MAIN */

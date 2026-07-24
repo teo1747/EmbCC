@@ -37,10 +37,14 @@ embcc: $(OBJS)
 # embld — the integrated linker (ARCHITECTURE §6, WORKPLAN stream B), as
 # a standalone tool for host development. The link library also gets
 # wired into embcc so `embcc prog.c -o prog` links in-process.
+# embld also links the EmbDBG core (compiled -DEMBDBG_NO_MAIN, so no CLI main)
+# so the linker can emit a native .embdbg at link time through the SAME format
+# writer the embdbg tool uses — one implementation, not two.
 embld: tools/embld/embld.c src/link/link.c src/driver/util.c \
-       src/link/link.h src/elf/elf.h
-	$(CC) $(CFLAGS) -o $@ tools/embld/embld.c src/link/link.c \
-	    src/driver/util.c
+       src/link/link.h src/elf/elf.h tools/embdbg/embdbg.c tools/embdbg/embdbg_core.h
+	$(CC) $(CFLAGS) -DEMBDBG_NO_MAIN -Wno-unused-function -o $@ \
+	    tools/embld/embld.c src/link/link.c \
+	    src/driver/util.c tools/embdbg/embdbg.c
 
 # embread — the EMBX dumper/verifier (EMBX spec §9). A separate binary,
 # not part of embcc: it reads images, it does not compile. The EMBX

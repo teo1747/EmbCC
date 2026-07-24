@@ -19,6 +19,7 @@
 
 #include "../driver/util.h"
 #include "../elf/elf.h"
+#include "../../tools/embdbg/embdbg_core.h"
 
 /* EmbLink app image (TARGET_ABI §4a, newlib.ld): text at 0x400000
  * (R+X), then a page boundary (W^X), then data (R+W). */
@@ -778,6 +779,57 @@ static void write_exec(struct linker *l, const char *out,
     free(img);
 }
 
+static unsigned char *read_file(const char *path, long *len);
+
+/* Emit a native .embdbg sidecar for a debug-carrying input, now that layout
+ * has assigned final vaddrs. This is the link-time producer the format wants
+ * (EMBDBG spec §2/§3: absolute vaddrs, build_id bound to the image). EmbCC
+ * emits ET_REL objects with .text-relative debug addresses; the link is what
+ * makes them absolute, so this belongs HERE, not in the compiler.
+ *
+ * v1 scope: the FIRST directly-listed input object that carries .debug_line.
+ * Archive members are skipped — newlib's libc.a ships with debug info, but the
+ * intent of a -g link is to debug YOUR object, not an incidentally-pulled libc
+ * member. One debug object is the common case (you compile your program with
+ * -g; crt0/syscalls/libc do not). Merging several objects' debug info into one
+ * .embdbg is a stated next step (it needs multi-CU handling), announced rather
+ * than silently partial. */
+static void emit_embdbg(struct linker *l, const char *out)
+{
+    for (int i = 0; i < l->nobj; i++) {
+        struct object *o = l->objs[i];
+        if (strchr(o->name, '('))       /* "libc.a(member.o)" — an archive member */
+            continue;
+        int has_dbg = 0, text_idx = -1, other_dbg = 0;
+        for (int s = 0; s < o->nsh; s++) {
+            const char *nm = o->shstr + o->shdrs[s].sh_name;
+            if (strcmp(nm, ".debug_line") == 0) has_dbg = 1;
+            if (strcmp(nm, ".text") == 0) text_idx = s;
+        }
+        if (!has_dbg) continue;
+        /* note (do not merge) any further directly-listed debug objects */
+        for (int k = i + 1; k < l->nobj; k++) {
+            struct object *o2 = l->objs[k];
+            if (strchr(o2->name, '(')) continue;
+            for (int s = 0; s < o2->nsh; s++)
+                if (strcmp(o2->shstr + o2->shdrs[s].sh_name, ".debug_line") == 0)
+                    { other_dbg = 1; break; }
+        }
+        Elf64_Addr tv = 0;
+        if (text_idx >= 0 && o->sec_out[text_idx] >= 0)
+            tv = l->insecs[o->sec_out[text_idx]].vaddr;
+        long ilen;
+        unsigned char *img = read_file(out, &ilen);
+        char emb[4096];
+        snprintf(emb, sizeof emb, "%s.embdbg", out);
+        embdbg_emit_object(o->buf, o->len, (long)tv, img, ilen, emb);
+        free(img);
+        fprintf(stderr, "embld: wrote %s (debug info for %s%s)\n",
+                emb, o->name, other_dbg ? "; other debug objects not yet merged" : "");
+        return;
+    }
+}
+
 /* ---- driver ---- */
 
 static unsigned char *read_file(const char *path, long *len)
@@ -839,5 +891,6 @@ int embld_link(const char **inputs, int ninputs, const char *out,
 
     write_exec(&l, out, e->value, text_start, text_size,
                data_start, data_filesz, data_memsz);
+    emit_embdbg(&l, out);   /* a .embdbg sidecar if any input carries -g info */
     return 0;
 }
