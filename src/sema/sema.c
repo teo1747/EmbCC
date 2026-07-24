@@ -281,7 +281,10 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                            "enumerator '%s' is used before its "
                            "declaration", e->name);
             struct global *g = find_global(u, e->name);
-            if (g && g->seq < cur_body_seq) {
+            /* '<=' not '<': a global's own name is in scope within its
+             * initializer (C11 6.2.1p7), so `void *p = &p` is legal; seqs
+             * are unique, so this only ever admits that self-reference. */
+            if (g && g->seq <= cur_body_seq) {
                 e->gref = g;
                 g->used = 1;
                 e->ty = g->ty;

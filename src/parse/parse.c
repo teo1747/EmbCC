@@ -184,6 +184,15 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
     return parse_array_dims(ps, base);
 }
 
+/* An abstract type name (a cast target, a sizeof operand): a declarator
+ * with the name omitted — so `void (*)(void)` and `int (*)[4]` parse, not
+ * just pointer stars. parse_declarator already allows a missing name. */
+static struct type *parse_type_name(struct parser *ps, struct type *base)
+{
+    const char *unused = NULL;
+    return parse_declarator(ps, base, &unused);
+}
+
 /* The '(params)' of a function TYPE (as in a function pointer). */
 static struct type *parse_fn_params(struct parser *ps, struct type *ret)
 {
@@ -716,7 +725,7 @@ static struct expr *parse_primary(struct parser *ps)
             e = new_expr(EXPR_VA_ARG, line);
             e->lhs = parse_expr(ps);
             expect(ps, TOK_COMMA, "',' before the va_arg type");
-            e->cast_ty = parse_stars(ps, parse_type_spec(ps, 0));
+            e->cast_ty = parse_type_name(ps, parse_type_spec(ps, 0));
             expect(ps, TOK_RPAREN, "')' to close __builtin_va_arg");
             return e;
         }
@@ -853,7 +862,7 @@ static struct expr *parse_unary(struct parser *ps)
             struct lexer save = ps->lx;
             advance(ps);
             if (at_type_start(ps)) {
-                e->cast_ty = parse_stars(ps, parse_type_spec(ps, 0));
+                e->cast_ty = parse_type_name(ps, parse_type_spec(ps, 0));
                 expect(ps, TOK_RPAREN, "')'");
                 return e;
             }
@@ -867,7 +876,7 @@ static struct expr *parse_unary(struct parser *ps)
         struct lexer save = ps->lx;
         advance(ps);
         if (at_type_start(ps)) {
-            struct type *ct = parse_stars(ps, parse_type_spec(ps, 0));
+            struct type *ct = parse_type_name(ps, parse_type_spec(ps, 0));
             expect(ps, TOK_RPAREN, "')'");
             e = new_expr(EXPR_CAST, t->line);
             e->cast_ty = ct;
