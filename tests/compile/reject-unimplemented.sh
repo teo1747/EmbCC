@@ -119,10 +119,6 @@ check array-index-designator \
 check field-designator-in-array \
     'int main(void) { int a[2] = { .x = 1 }; return a[0]; }' \
     "field designator '.x' in an array"
-check varargs-definition \
-    'int f(int a, ...) { return a; }
-int main(void) { return f(1); }' \
-    "variadic function is not supported"
 check member-dot-on-int \
     'int main(void) { int x = 1; return x.y; }' \
     "needs a struct/union, got int"

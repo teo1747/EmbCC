@@ -19,7 +19,8 @@
  * up to 8, then one 8-byte slot per temporary. Returns the per-vreg
  * displacement table (caller frees). */
 static int *layout_frame(struct ir_func *fn, int *frame_out,
-                         int *scratch_base_out, int *sret_slot_out)
+                         int *scratch_base_out, int *sret_slot_out,
+                         int *va_save_out, int *va_tag_out)
 {
     struct func *f = fn->src;
     int *disp = xmalloc((size_t)(fn->nvregs ? fn->nvregs : 1)
@@ -48,6 +49,18 @@ static int *layout_frame(struct ir_func *fn, int *frame_out,
     /* struct-return temporaries sit above the outgoing area */
     running += fn->scratch_bytes;
     *scratch_base_out = -running;
+    /* A variadic function reserves the SysV register save area (6 int
+     * eightbytes + 8 SSE sixteen-bytes = 176) plus one __va_list_tag (24)
+     * that va_start initializes. Named source uses a single va_list, so
+     * one tag suffices (a second concurrent va_list is a future seam). */
+    *va_save_out = 0;
+    *va_tag_out = 0;
+    if (f->is_varargs) {
+        running += 176;
+        *va_save_out = -running;
+        running += 24;
+        *va_tag_out = -running;
+    }
     /* The outgoing stack-argument area is the BOTTOM of the frame, so
      * it starts exactly at rsp and a call can address it as [rsp+off]
      * without moving rsp — which also keeps the 16-byte alignment the
@@ -117,7 +130,13 @@ static void gen_func(struct ir_func *fn, struct code *text,
     int frame;
     int scratch_base;
     int sret_slot;
-    int *sd = layout_frame(fn, &frame, &scratch_base, &sret_slot);
+    int va_save, va_tag;
+    int *sd = layout_frame(fn, &frame, &scratch_base, &sret_slot,
+                           &va_save, &va_tag);
+    /* Set by the parameter pass below, read by IR_VA_START: how many
+     * named arguments the integer and SSE register files hold, and the
+     * rbp offset of the first stack-passed argument (the overflow area). */
+    int va_named_int = 0, va_named_sse = 0, va_overflow = 16;
 
     /* Branch targets and sites are function-local; both arrays are
      * resolved before this function returns. */
@@ -132,6 +151,19 @@ static void gen_func(struct ir_func *fn, struct code *text,
     f->code_off = text->len;
 
     x86_prologue(text, frame);
+    /* Variadic: spill the whole argument register file into the save area
+     * FIRST, before the parameter pass below uses rcx/rax as scratch and
+     * so clobbers the vararg registers. Storing a register does not alter
+     * it, so the named-parameter loads that follow still see rdi..r9 and
+     * xmm0..7 intact. The SSE slots are 16 apart (SysV) but only their low
+     * 8 bytes — a double — are stored, which is all vfprintf reads. */
+    if (f->is_varargs) {
+        for (int r = 0; r < 6; r++)
+            x86_store_mem_reg(text, REG_RBP, va_save + r * 8,
+                              x86_argreg(r), 8);
+        for (int r = 0; r < 8; r++)
+            x86_movs_store_base(text, REG_RBP, va_save + 48 + r * 16, r, 8);
+    }
     {   /* The same two-file split, in reverse. A hidden return pointer
          * (sret) consumes rdi BEFORE any real parameter, and MEMORY
          * parameters arrive on the caller's stack at [rbp+16...]. */
@@ -179,6 +211,9 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                       x86_argreg(ireg++), 8);
             }
         }
+        va_named_int = ireg;
+        va_named_sse = freg;
+        va_overflow = incoming;
     }
 
     for (int n = 0; n < fn->nins; n++) {
@@ -510,6 +545,23 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_store_slot(text, sd[i->dst], 8);
             break;
         }
+        case IR_VA_START:
+            /* Build a __va_list_tag on the frame and point the va_list at
+             * it. Layout (SysV): gp_offset u32, fp_offset u32,
+             * overflow_arg_area ptr, reg_save_area ptr. */
+            x86_mov_eax_imm(text, va_named_int * 8, 4);
+            x86_store_mem_reg(text, REG_RBP, va_tag + 0, REG_RAX, 4);
+            x86_mov_eax_imm(text, 48 + va_named_sse * 16, 4);
+            x86_store_mem_reg(text, REG_RBP, va_tag + 4, REG_RAX, 4);
+            x86_lea_reg_slot(text, REG_RAX, va_overflow);
+            x86_store_mem_reg(text, REG_RBP, va_tag + 8, REG_RAX, 8);
+            x86_lea_reg_slot(text, REG_RAX, va_save);
+            x86_store_mem_reg(text, REG_RBP, va_tag + 16, REG_RAX, 8);
+            /* *ap = &tag  (i->a holds the address of the va_list) */
+            x86_mov_rcx_slot(text, sd[i->a]);
+            x86_lea_reg_slot(text, REG_RAX, va_tag);
+            x86_store_mem_reg(text, REG_RCX, 0, REG_RAX, 8);
+            break;
         case IR_RET:
             if (i->a >= 0 && f->ret_ty->kind == TY_STRUCT) {
                 enum arg_class rc[2];

@@ -673,6 +673,33 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     }
     case EXPR_CALL: {
+        /* The stdarg builtins are not real functions: va_start needs the
+         * ADDRESS of its va_list (irgen takes it), and neither is
+         * declared anywhere. Type-check the operands, mark the enclosing
+         * function variadic, and hand back void. va_end is a no-op. */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            (strcmp(e->lhs->name, "__builtin_va_start") == 0 ||
+             strcmp(e->lhs->name, "__builtin_va_end") == 0)) {
+            int is_start = strcmp(e->lhs->name, "__builtin_va_start") == 0;
+            int want = is_start ? 2 : 1;
+            if (e->nargs != want)
+                diag_fatal(u->file, e->line,
+                           "%s takes %d argument%s", e->lhs->name, want,
+                           want == 1 ? "" : "s");
+            for (int i = 0; i < e->nargs; i++)
+                check_expr(u, f, sc, e->args[i]);
+            if (!is_lvalue(e->args[0]))
+                diag_fatal(u->file, e->line,
+                           "the first argument to %s must be a va_list "
+                           "variable", e->lhs->name);
+            if (is_start && !f->is_varargs)
+                diag_fatal(u->file, e->line,
+                           "va_start in '%s', which is not variadic",
+                           f->name);
+            e->name = e->lhs->name;   /* irgen dispatches on it */
+            e->ty = ty_base(TY_VOID, 0);
+            break;
+        }
         /* Direct when the callee is a name that is not a variable in
          * scope and names a function; otherwise a call through a
          * function-pointer value. */

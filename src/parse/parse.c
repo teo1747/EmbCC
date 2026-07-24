@@ -1432,11 +1432,6 @@ static void parse_top(struct parser *ps, struct unit *u,
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "expected '{' or ';' before %s",
                        tok_describe(cur(ps)));
-        if (f->is_varargs)
-            diag_fatal(ps->lx.file, f->line,
-                       "defining a variadic function is not supported "
-                       "yet (no va_list); only calls to external "
-                       "variadic functions work");
         for (int i = 0; i < f->nparams; i++)
             if (!f->params[i])
                 diag_fatal(ps->lx.file, f->line,

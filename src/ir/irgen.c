@@ -701,6 +701,18 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return dst;
     }
     case EXPR_CALL: {
+        /* stdarg builtins: va_start records where its va_list lives so
+         * codegen can point it at a freshly built __va_list_tag; va_end
+         * is a no-op. Neither is a real call. */
+        if (e->name && strcmp(e->name, "__builtin_va_start") == 0) {
+            int ap = gen_addr(fn, e->args[0]);
+            struct ir_ins *i = emit(fn);
+            i->op = IR_VA_START;
+            i->a = ap;
+            return -1;
+        }
+        if (e->name && strcmp(e->name, "__builtin_va_end") == 0)
+            return -1;
         int args[MAX_PARAMS];
         int fptemp = -1;
         if (!e->callee) /* through a pointer: evaluate the callee */

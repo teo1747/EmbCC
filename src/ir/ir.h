@@ -55,7 +55,9 @@ enum ir_op {
     IR_MEMCPY,/* copy `size` bytes: *(addr a) <- *(addr b) */
     IR_MEMZERO,/* zero `size` bytes at (addr a) */
     IR_BRZ,   /* if (a == 0) goto label  (w) */
-    IR_BRNZ   /* if (a != 0) goto label  (w) */
+    IR_BRNZ,  /* if (a != 0) goto label  (w) */
+    IR_VA_START /* init the va_list whose ADDRESS is in temp a (SysV:
+                 * fill a __va_list_tag on the frame, point *a at it) */
 };
 
 struct ir_ins {

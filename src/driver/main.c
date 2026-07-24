@@ -373,6 +373,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "embcc: error: no input file\n");
         return 1;
     }
+
+    /* EmbCC's own freestanding headers (stddef, stdarg, stdbool, float)
+     * ship beside the binary, so <stdarg.h> resolves with no -I — exactly
+     * as a compiler finds its own headers. Appended last, below every -I,
+     * so a project header of the same name still wins. */
+    if (nincdirs < MAX_INCDIRS) {
+        static char selfinc[4096];
+        const char *slash = strrchr(argv[0], '/');
+        if (slash)
+            snprintf(selfinc, sizeof selfinc, "%.*s/include",
+                     (int)(slash - argv[0]), argv[0]);
+        else
+            snprintf(selfinc, sizeof selfinc, "./include");
+        incdirs[nincdirs++] = selfinc;
+    }
     if (pp_only)
         return compile(input, NULL, 1);
     if (!compile_mode) {
