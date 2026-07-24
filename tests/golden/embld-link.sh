@@ -117,7 +117,46 @@ EOF
     echo "archive: fixed-point pull + back-ref, dead member excluded, exit 42"
 fi
 
-# 5. the ET_EXEC is well-formed: readelf accepts it, it is EXEC not DYN
+# 5. CONSTRUCTORS: a program with __attribute__((constructor)) whose
+#    _start walks __init_array_start..__init_array_end. If EmbLD's
+#    bracket symbols are the real .init_array group bounds, the ctor
+#    runs; if they were 0 (B1's weak-→0 for an empty array), it would
+#    not. Also exercises R_X86_64_64 into .init_array (the fn pointer).
+cat > "$out/ctor.c" << 'EOF'
+static int marker = 0;
+__attribute__((constructor)) static void set_marker(void){ marker = 42; }
+extern void (*__init_array_start[])(void);
+extern void (*__init_array_end[])(void);
+static long do_exit(long c){long r;
+  __asm__ volatile("syscall":"=a"(r):"a"(60),"D"(c):"rcx","r11","memory");return r;}
+void _start(void){
+    for (void (**p)(void)=__init_array_start; p<__init_array_end; p++) (*p)();
+    do_exit(marker);
+}
+EOF
+gcc -c -ffreestanding -fno-pie -O0 "$out/ctor.c" -o "$out/ctor.o"
+"$EMBLD" -o "$out/ctor" "$out/ctor.o" || { echo "ctor: embld failed"; exit 1; }
+chmod +x "$out/ctor"; "$out/ctor"; got=$?
+[ "$got" -eq 42 ] || {
+    echo "ctor: exit $got, expected 42 (0 = __init_array brackets empty)"
+    exit 1; }
+echo "constructors: __init_array bracket symbols correct, ctor ran, exit 42"
+
+# 6. COMMON (tentative definitions) placed into .bss and usable.
+cat > "$out/common.c" << 'EOF'
+int common_var;
+int other_common;
+int compute(void){ common_var = 40; other_common = 2;
+                   return common_var + other_common; }
+EOF
+gcc -c -ffreestanding -fno-pie -O0 -fcommon "$out/common.c" -o "$out/common.o"
+"$EMBLD" -o "$out/common" "$out/start.o" "$out/common.o" || {
+    echo "common: embld failed"; exit 1; }
+chmod +x "$out/common"; "$out/common"; got=$?
+[ "$got" -eq 42 ] || { echo "common: exit $got, expected 42"; exit 1; }
+echo "COMMON symbols placed in .bss and usable, exit 42"
+
+# 7. the ET_EXEC is well-formed: readelf accepts it, it is EXEC not DYN
 #    (TARGET_ABI §4b: never PIE), entry lands in the executable segment.
 readelf -h "$out/one" | grep -q "EXEC (Executable file)" || {
     echo "output is not ET_EXEC"; exit 1; }

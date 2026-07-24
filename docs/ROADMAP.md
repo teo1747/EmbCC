@@ -9,10 +9,14 @@ they contain.*
 2026-07-24.** The integrated linker links: EmbLD linked the M1 program
 (crt0 + syscalls + an EmbCC object + newlib's libc.a) into an ET_EXEC and
 the kernel ran it to exit 42, no cross-ld involved — the compiler and the
-linker are now both ours end to end for a real program. What remains for
-M3's self-hosting acceptance: the GOT (first stdio program), real
-init_array bracket symbols, COMMON, then compiling EmbCC's own sources to
-the stage2-byte-identical fixed point (WORKPLAN stream B).
+linker are now both ours end to end for a real program. EmbLD B2 followed
+the same day: output-section grouping gives correct __init_array/ctors
+bracket symbols (a constructor program runs its ctor) and COMMON
+placement, and an EmbCC-compiled + EmbLD-linked printf program prints
+correctly on the OS. The GOT was verified unneeded for this newlib (zero
+GOTPCREL). What remains for M3's self-hosting acceptance: compile EmbCC's
+own sources with EmbCC, link with EmbLD, and close the stage2-byte-
+identical fixed point (WORKPLAN stream B).
 
 **M2 COMPLETE — confirmed on the OS 2026-07-24.** The
 acceptance test passed on EmbLinkOS itself: value.c, wire.c, sval.c and

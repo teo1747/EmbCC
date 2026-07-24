@@ -119,12 +119,29 @@ identical inputs — the data segment byte-for-byte the same; D-005), then
 on the OS. `tests/golden/embld-b1.sh` keeps the host half green;
 `embld-link.sh` covers the linker's mechanics.
 
-**Next (B2), toward self-hosting (M3):** the GOT (GOTPCREL, built AND
-filled — the first stdio program needs it, TCC patch 0003); real
-`__init_array` bracket symbols (B1's weak-→0 is correct only because the
-array is empty — a program with constructors needs the true bounds);
-COMMON placed into a synthetic `.bss`; then link EmbCC's OWN sources and
-close the stage1/stage2 fixed point.
+**B2 — DONE (2026-07-24).** Output-section grouping (input sections
+merged by name, the way a linker script's `*(.init_array)` does), so:
+- **`__init_array`/`ctors` bracket symbols** are the real group bounds —
+  a program with constructors runs them (proven: a ctor sets a global,
+  `_start` walks the brackets, exits 42; with B1's weak-→0 it would have
+  exited 0). Closes the B1 caveat.
+- **COMMON** (tentative defs) placed into `.bss` and usable.
+- **The GOT was found NOT to be needed:** this newlib (`newlib-c99`) has
+  **zero GOTPCREL relocations** and zero COMMON in libc.a — verified,
+  not assumed. TARGET_ABI §3's `_impure_ptr` GOT fact was a *different*
+  newlib build. So no GOT was built: D-006 / THE RULE — a feature no
+  input needs is not written. It slots in as an output section
+  (OSEC_GOT) the day a corpus actually produces GOTPCREL.
+
+Bonus validation on the OS: an EmbCC-compiled, EmbLD-linked **printf**
+program printed `hello from embld 42` and exited — the whole libc stdio
+path (printf -> vfprintf -> _write -> syscall) works through our linker,
+not just exit-42.
+
+**Next, toward M3's acceptance:** compile EmbCC's OWN sources with EmbCC,
+link with EmbLD, and close the stage1/stage2 byte-identical fixed point.
+That is the self-hosting loop; what it surfaces is the real remaining
+work, found by attempting it rather than guessed.
 
 **Contract B also consumes:** `src/embx/embx.h` — the EMBX container,
 byte-exact, mirroring the kernel's `embx.h` (which is the authority).

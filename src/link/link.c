@@ -46,16 +46,36 @@ struct object {
 /* An allocated input section placed into the output. */
 enum seg { SEG_TEXT, SEG_DATA };
 
+/* Output sections, in layout order. Input sections are grouped by name
+ * into these, so — the reason this exists — all .init_array inputs land
+ * contiguously and the bracket symbols __init_array_start/_end are just
+ * the group's bounds, the way a linker script's `*(.init_array)` places
+ * them. Order matters: constructors precede ordinary data; .bss is last
+ * (NOBITS, the memsz tail). */
+enum osec {
+    OSEC_TEXT, OSEC_RODATA,               /* text segment (R+X) */
+    OSEC_INIT_ARRAY, OSEC_FINI_ARRAY,     /* data segment (R+W) */
+    OSEC_CTORS, OSEC_DTORS,
+    OSEC_DATA, OSEC_BSS,
+    OSEC_COUNT
+};
+
 struct insec {
     struct object *obj;
     int shndx;
+    const char *name;
     const unsigned char *data; /* NULL for NOBITS (.bss) */
     Elf64_Xword size;
     Elf64_Xword align;
     int is_bss;
     enum seg seg;
+    int osec;
     Elf64_Addr vaddr;          /* assigned in layout */
 };
+
+/* The final [start,end) vaddr span of each output section — the source
+ * of the bracket symbols. */
+struct osec_bound { Elf64_Addr start, end; };
 
 struct symbol {
     const char *name;
@@ -185,6 +205,33 @@ static struct object *parse_object(const char *name, unsigned char *buf,
     return o;
 }
 
+/* Which output section a named input section joins. Matched by prefix so
+ * .text.foo joins .text, .data.rel joins .data, and so on — exactly the
+ * grouping a linker script's wildcards express. */
+static int classify_osec(const char *name, int writable, int is_bss)
+{
+    static const struct { const char *pfx; int osec; } map[] = {
+        { ".init_array", OSEC_INIT_ARRAY },
+        { ".fini_array", OSEC_FINI_ARRAY },
+        { ".ctors", OSEC_CTORS },
+        { ".dtors", OSEC_DTORS },
+        { ".text", OSEC_TEXT },
+        { ".rodata", OSEC_RODATA },
+        { ".data", OSEC_DATA },
+        { ".bss", OSEC_BSS },
+    };
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) {
+        size_t n = strlen(map[i].pfx);
+        if (strncmp(name, map[i].pfx, n) == 0 &&
+            (name[n] == 0 || name[n] == '.'))
+            return map[i].osec;
+    }
+    /* an unrecognized allocated section: place by its flags */
+    if (is_bss)
+        return OSEC_BSS;
+    return writable ? OSEC_DATA : OSEC_RODATA;
+}
+
 /* Collect the object's SHF_ALLOC sections into the global insec list and
  * record where each landed (sec_out), so relocations and symbols can map
  * a (object, section) back to its output placement. */
@@ -203,13 +250,20 @@ static void collect_sections(struct linker *l, struct object *o)
         memset(s, 0, sizeof *s);
         s->obj = o;
         s->shndx = i;
+        s->name = o->shstr + sh->sh_name;
         s->size = sh->sh_size;
         s->align = sh->sh_addralign ? sh->sh_addralign : 1;
         s->is_bss = sh->sh_type == SHT_NOBITS;
         s->data = s->is_bss ? NULL : o->buf + sh->sh_offset;
+        s->osec = classify_osec(s->name, sh->sh_flags & SHF_WRITE,
+                                s->is_bss);
         /* text segment: executable OR read-only allocatable (.rodata);
-         * data segment: writable (.data, .bss). W^X by construction. */
-        s->seg = (sh->sh_flags & SHF_WRITE) ? SEG_DATA : SEG_TEXT;
+         * data segment: writable and the constructor arrays. W^X by
+         * construction — the constructor arrays are read-only data that
+         * the ABI keeps in the writable segment (they hold relocated
+         * pointers), never executable. */
+        s->seg = (s->osec == OSEC_TEXT || s->osec == OSEC_RODATA)
+                     ? SEG_TEXT : SEG_DATA;
         o->sec_out[i] = l->nsec;
         l->nsec++;
     }
@@ -440,49 +494,62 @@ static Elf64_Addr align_up(Elf64_Addr v, Elf64_Xword a)
     return (v + a - 1) & ~(a - 1);
 }
 
-/* Assign every allocated section a vaddr: all of the text segment first
- * (non-writable), a page break for W^X, then data, then bss (NOBITS,
- * which the loader zero-fills). Returns via out-params the segment
- * geometry the ET_EXEC writer needs. */
-static void layout(struct linker *l,
+/* Places every insec belonging to output section `os`, recording the
+ * group's [start,end) bounds. Advances *va. */
+static void place_osec(struct linker *l, int os, Elf64_Addr *va,
+                       struct osec_bound *b)
+{
+    b[os].start = *va;
+    for (int i = 0; i < l->nsec; i++) {
+        struct insec *s = &l->insecs[i];
+        if (s->osec != os)
+            continue;
+        *va = align_up(*va, s->align);
+        s->vaddr = *va;
+        *va += s->size;
+    }
+    b[os].end = *va;
+}
+
+/* Lay the output sections out in order into the two segments, recording
+ * each group's bounds. COMMON (tentative) symbols are placed at the end
+ * of .bss, since they have no input section of their own. */
+static void layout(struct linker *l, struct osec_bound *b,
                    Elf64_Addr *text_start, Elf64_Xword *text_size,
                    Elf64_Addr *data_start, Elf64_Xword *data_filesz,
                    Elf64_Xword *data_memsz)
 {
     Elf64_Addr va = l->base;
 
-    /* text: SEG_TEXT, non-bss (there is no bss in text) */
     *text_start = va;
-    for (int i = 0; i < l->nsec; i++) {
-        struct insec *s = &l->insecs[i];
-        if (s->seg != SEG_TEXT)
-            continue;
-        va = align_up(va, s->align);
-        s->vaddr = va;
-        va += s->size;
-    }
+    place_osec(l, OSEC_TEXT, &va, b);
+    place_osec(l, OSEC_RODATA, &va, b);
     *text_size = va - *text_start;
 
-    /* page break, then data: file-backed sections first, then bss */
-    va = align_up(va, PAGE);
+    va = align_up(va, PAGE);           /* W^X boundary */
     *data_start = va;
-    for (int i = 0; i < l->nsec; i++) {
-        struct insec *s = &l->insecs[i];
-        if (s->seg != SEG_DATA || s->is_bss)
+    place_osec(l, OSEC_INIT_ARRAY, &va, b);
+    place_osec(l, OSEC_FINI_ARRAY, &va, b);
+    place_osec(l, OSEC_CTORS, &va, b);
+    place_osec(l, OSEC_DTORS, &va, b);
+    place_osec(l, OSEC_DATA, &va, b);
+    *data_filesz = va - *data_start;   /* .bss is beyond the file image */
+
+    b[OSEC_BSS].start = va;
+    place_osec(l, OSEC_BSS, &va, b);   /* real .bss inputs first */
+    /* then COMMON: each tentative symbol gets space, largest alignment
+     * honored, and its value fixed to the reserved slot. */
+    for (int i = 0; i < l->nsym; i++) {
+        struct symbol *g = &l->syms[i];
+        if (!g->common)
             continue;
-        va = align_up(va, s->align);
-        s->vaddr = va;
-        va += s->size;
+        va = align_up(va, g->align ? g->align : 1);
+        g->value = va;
+        g->insec = -1;                 /* now an absolute address */
+        g->common = 0;
+        va += g->size;
     }
-    *data_filesz = va - *data_start;
-    for (int i = 0; i < l->nsec; i++) {
-        struct insec *s = &l->insecs[i];
-        if (s->seg != SEG_DATA || !s->is_bss)
-            continue;
-        va = align_up(va, s->align);
-        s->vaddr = va;
-        va += s->size;
-    }
+    b[OSEC_BSS].end = va;
     *data_memsz = va - *data_start;
 }
 
@@ -492,14 +559,45 @@ static void finalize_symbols(struct linker *l)
 {
     for (int i = 0; i < l->nsym; i++) {
         struct symbol *g = &l->syms[i];
-        if (!g->defined)
-            continue;
-        if (g->common)
-            continue; /* placed with the synthetic .bss below (B2) */
-        if (g->insec >= 0)
-            g->value += l->insecs[g->insec].vaddr;
-        /* insec == -1 is ABS: value is already absolute */
+        if (!g->defined || g->insec < 0)
+            continue; /* insec == -1: ABS or already-placed COMMON */
+        g->value += l->insecs[g->insec].vaddr;
     }
+}
+
+/* Define (or override a weak-undefined) linker symbol at an absolute
+ * address. The __init_array_start/_end family are weak-undefined in
+ * crt0 (which is why B1 linked with them at 0); defining them at the
+ * real group bounds is what makes a program WITH constructors correct,
+ * not just one whose .init_array happens to be empty. */
+static void define_linker_symbol(struct linker *l, const char *name,
+                                 Elf64_Addr value)
+{
+    struct symbol *g = sym_intern(l, name);
+    /* only define it if something references it (it was interned) and it
+     * is not already defined by a real object — a real definition wins */
+    if (g->defined && g->insec >= 0)
+        return;
+    g->defined = 1;
+    g->weak = 0;
+    g->common = 0;
+    g->insec = -1;
+    g->value = value;
+}
+
+/* The bracket symbols crt0 walks, each pair the bounds of its group. An
+ * empty group has start == end, so the walk does nothing — matching
+ * cross-ld, which defines them even when empty. */
+static void define_brackets(struct linker *l, const struct osec_bound *b)
+{
+    define_linker_symbol(l, "__init_array_start", b[OSEC_INIT_ARRAY].start);
+    define_linker_symbol(l, "__init_array_end", b[OSEC_INIT_ARRAY].end);
+    define_linker_symbol(l, "__fini_array_start", b[OSEC_FINI_ARRAY].start);
+    define_linker_symbol(l, "__fini_array_end", b[OSEC_FINI_ARRAY].end);
+    define_linker_symbol(l, "__ctors_start", b[OSEC_CTORS].start);
+    define_linker_symbol(l, "__ctors_end", b[OSEC_CTORS].end);
+    define_linker_symbol(l, "__dtors_start", b[OSEC_DTORS].start);
+    define_linker_symbol(l, "__dtors_end", b[OSEC_DTORS].end);
 }
 
 /* The absolute vaddr of a symbol referenced by a relocation. Undefined
@@ -725,9 +823,12 @@ int embld_link(const char **inputs, int ninputs, const char *out,
 
     Elf64_Addr text_start, data_start;
     Elf64_Xword text_size, data_filesz, data_memsz;
-    layout(&l, &text_start, &text_size, &data_start, &data_filesz,
+    struct osec_bound bounds[OSEC_COUNT];
+    memset(bounds, 0, sizeof bounds);
+    layout(&l, bounds, &text_start, &text_size, &data_start, &data_filesz,
            &data_memsz);
     finalize_symbols(&l);
+    define_brackets(&l, bounds);
 
     struct symbol *e = sym_find(&l, l.entry);
     if (!e || !e->defined)
