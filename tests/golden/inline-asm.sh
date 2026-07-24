@@ -61,6 +61,34 @@ echo "$sr" | grep -qE 'R_X86_64_PLT32 +start_c' || { echo "MISSING: PLT32 to sta
 echo "$sd" | grep -q 'e9 fb ff ff ff'       || { echo "MISSING: jmp 1b (e9 fb ff ff ff)"; f2=1; }
 [ "$f2" -eq 0 ] && echo "file-scope asm: _start stub correct" || exit 1
 
+# REGRESSION: a STATIC function reachable ONLY through file-scope asm must NOT
+# be dead-code-eliminated. crt0's start_c is static and called solely from
+# _start's `call start_c`; irgen prunes unused statics, and the asm reference
+# wasn't counted as a use until AFTER irgen -- so start_c's body was never
+# generated and the reloc bound to a value-0 placeholder that aliased the
+# function at .text offset 0 (a syscall stub). On the OS the EmbCC rim then
+# called the wrong function and hung on a bogus SYS_write. The fix marks
+# asm-call targets used BEFORE irgen. Discriminator: the target's symbol must
+# have a NON-ZERO size (a real emitted body), not the 0/0 placeholder.
+cat > "$out/dce.c" <<'CEOF'
+static long sys1(long n){ long r;
+    __asm__ volatile("int $0x80":"=a"(r):"a"(n):"memory"); return r; }
+static void real_entry(void){ (void)sys1(60); }
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "    call real_entry\n"
+    "1:  jmp 1b\n"
+);
+CEOF
+"$EMBCC" -c "$out/dce.c" -o "$out/dce.o" || { echo "embcc failed on dce"; exit 1; }
+dt=$(objdump -t "$out/dce.o" 2>/dev/null)
+f4=0
+echo "$dt" | grep -qE 'F \.text.* real_entry$' || { echo "MISSING: real_entry emitted as a .text FUNC (DCE'd?)"; f4=1; }
+rsz=$(echo "$dt" | awk '/[[:space:]]real_entry$/{print $(NF-1)}')
+[ "$rsz" != "0000000000000000" ] && [ -n "$rsz" ] || { echo "BUG: real_entry has zero size ($rsz) -- body not generated, aliases .text offset 0"; f4=1; }
+[ "$f4" -eq 0 ] && echo "file-scope asm: static asm-only callee survives DCE (size=$rsz)" || exit 1
+
 # Advanced inline asm: cpuid (fixed a/b/c/d), and rdrand/setc with %-operand
 # substitution + general 'r'/'qm' register allocation (syscalls.c's RNG path).
 cat > "$out/adv.c" <<'CEOF'

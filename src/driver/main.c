@@ -119,6 +119,25 @@ static int compile(const char *in, const char *out, int pp_only)
     }
     struct unit *u = parse_unit(in, pp);
     sema_check(u);
+
+    /* File-scope asm (crt0's _start) can reference a function by name with
+     * `call sym`. That reference has to count as a USE before irgen decides
+     * which static functions to emit — otherwise a static function called
+     * ONLY from asm (crt0's start_c, reached solely through _start's `call
+     * start_c`) is pruned as dead, its body never generated, and the asm's
+     * relocation binds to a value-0 placeholder symbol that aliases whatever
+     * sits at .text offset 0. Assemble each block now — it depends only on
+     * its own template, not on code layout — and mark its call targets used.
+     * The placement pass further down reuses these already-assembled bytes. */
+    for (struct topasm *ta = u->topasm; ta; ta = ta->next) {
+        topasm_assemble(ta);
+        for (int r = 0; r < ta->nrels; r++)
+            for (struct func *f = u->funcs; f; f = f->next)
+                if (!f->absorbed &&
+                    strcmp(f->name, ta->rels[r].target) == 0)
+                    f->used = 1;
+    }
+
     struct ir_unit *iu = irgen(u);
 
     struct code text = { 0, 0, 0 };
@@ -188,21 +207,15 @@ static int compile(const char *in, const char *out, int pp_only)
                    (size_t)iu->strs[i].len);
     }
 
-    /* File-scope asm blocks (crt0's _start): assemble each, place its bytes
-     * in .text after the functions (16-aligned), and record where so its
-     * labels and relocations land at the right offset. Mark any function a
-     * call targets as used so it gets a symbol to relocate against. */
+    /* File-scope asm blocks (crt0's _start): place each block's bytes in
+     * .text after the functions (16-aligned) and record where, so its labels
+     * and relocations land at the right offset. The blocks were already
+     * assembled above (before irgen) and their call targets marked used. */
     for (struct topasm *ta = u->topasm; ta; ta = ta->next) {
-        topasm_assemble(ta);
         code_align(&text, 16, 0x90);
         ta->text_off = text.len;
         for (int k = 0; k < ta->codelen; k++)
             code_byte(&text, ta->code[k]);
-        for (int r = 0; r < ta->nrels; r++)
-            for (struct func *f = u->funcs; f; f = f->next)
-                if (!f->absorbed &&
-                    strcmp(f->name, ta->rels[r].target) == 0)
-                    f->used = 1;
     }
 
     struct elfw *w = elfw_new();
