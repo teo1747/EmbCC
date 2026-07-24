@@ -77,6 +77,27 @@ void x86_cvtsi2s(struct code *c, int disp, int srcw, int dstw);
 void x86_cvtts2si(struct code *c, int disp, int srcw, int dstw);
 void x86_cvts2s(struct code *c, int disp, int srcw);
 void x86_mov_al_imm(struct code *c, int v); /* varargs: xmm count in al */
+
+/* ---- general [base+disp] addressing, for struct traffic ----------
+ * Register numbers are the encoding's: rax0 rcx1 rdx2 rbx3 rsp4 rbp5
+ * rsi6 rdi7. Sizes are 1/2/4/8. These exist because a struct copy and
+ * an aggregate argument address memory through a POINTER, not through
+ * the frame pointer everything else uses. */
+#define REG_RAX 0
+#define REG_RCX 1
+#define REG_RDX 2
+#define REG_RSP 4
+#define REG_RBP 5
+#define REG_RSI 6
+#define REG_RDI 7
+void x86_load_reg_mem(struct code *c, int dst, int base, int disp, int size);
+void x86_store_mem_reg(struct code *c, int base, int disp, int src, int size);
+void x86_movs_load_base(struct code *c, int xmm, int base, int disp, int w);
+void x86_movs_store_base(struct code *c, int base, int disp, int xmm, int w);
+void x86_lea_reg_slot(struct code *c, int dst, int disp); /* lea r,[rbp+d] */
+void x86_mov_reg_reg(struct code *c, int dst, int src);   /* 64-bit */
+/* argument registers by index, for aggregates arriving in pieces */
+int  x86_argreg(int index);
 void x86_not_eax(struct code *c, int w);
 
 /* cmp eax/rax with a slot, then set al by condition and zero-extend.

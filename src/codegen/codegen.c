@@ -18,12 +18,23 @@
 /* Frame layout: variables first, each occupying its real size rounded
  * up to 8, then one 8-byte slot per temporary. Returns the per-vreg
  * displacement table (caller frees). */
-static int *layout_frame(struct ir_func *fn, int *frame_out)
+static int *layout_frame(struct ir_func *fn, int *frame_out,
+                         int *scratch_base_out, int *sret_slot_out)
 {
     struct func *f = fn->src;
     int *disp = xmalloc((size_t)(fn->nvregs ? fn->nvregs : 1)
                         * sizeof *disp);
     int running = 0;
+    enum arg_class rcls[2];
+
+    /* A function returning a MEMORY-class struct is handed a hidden
+     * pointer in rdi; it must survive until the return, so it gets a
+     * slot of its own. */
+    *sret_slot_out = 0;
+    if (f->ret_ty->kind == TY_STRUCT && ty_classify(f->ret_ty, rcls) == 0) {
+        running += 8;
+        *sret_slot_out = -running;
+    }
 
     for (int i = 0; i < f->nvars; i++) {
         int sz = (ty_size(f->var_tys[i]) + 7) & ~7;
@@ -34,6 +45,14 @@ static int *layout_frame(struct ir_func *fn, int *frame_out)
         running += 8;
         disp[t] = -running;
     }
+    /* struct-return temporaries sit above the outgoing area */
+    running += fn->scratch_bytes;
+    *scratch_base_out = -running;
+    /* The outgoing stack-argument area is the BOTTOM of the frame, so
+     * it starts exactly at rsp and a call can address it as [rsp+off]
+     * without moving rsp — which also keeps the 16-byte alignment the
+     * ABI requires at every call, since the frame is a multiple of 16. */
+    running += fn->outgoing_bytes;
     *frame_out = (running + 15) & ~15;
     return disp;
 }
@@ -88,7 +107,9 @@ static void gen_func(struct ir_func *fn, struct code *text,
 {
     struct func *f = fn->src;
     int frame;
-    int *sd = layout_frame(fn, &frame);
+    int scratch_base;
+    int sret_slot;
+    int *sd = layout_frame(fn, &frame, &scratch_base, &sret_slot);
 
     /* Branch targets and sites are function-local; both arrays are
      * resolved before this function returns. */
@@ -106,14 +127,52 @@ static void gen_func(struct ir_func *fn, struct code *text,
     f->code_off = text->len;
 
     x86_prologue(text, frame);
-    {   /* the same two-file split, in reverse */
+    {   /* The same two-file split, in reverse. A hidden return pointer
+         * (sret) consumes rdi BEFORE any real parameter, and MEMORY
+         * parameters arrive on the caller's stack at [rbp+16...]. */
         int ireg = 0, freg = 0;
+        enum arg_class rcls[2];
+        int ret_mem = f->ret_ty->kind == TY_STRUCT &&
+                      ty_classify(f->ret_ty, rcls) == 0;
+        if (ret_mem) {
+            x86_store_arg(text, ireg++, sret_slot);
+        }
+        int incoming = 16; /* saved rbp + return address */
         for (int i = 0; i < f->nparams; i++) {
-            if (ty_is_float(f->param_tys[i]))
-                x86_movs_store(text, freg++, sd[i],
-                               ty_size(f->param_tys[i]));
-            else
-                x86_store_arg(text, ireg++, sd[i]);
+            struct type *pt = f->param_tys[i];
+            enum arg_class cls[2];
+            int n = ty_classify(pt, cls);
+            if (pt->kind != TY_STRUCT) {
+                if (ty_is_float(pt))
+                    x86_movs_store(text, freg++, sd[i], ty_size(pt));
+                else
+                    x86_store_arg(text, ireg++, sd[i]);
+                continue;
+            }
+            if (n == 0) {
+                /* MEMORY: copy it out of the caller's frame into ours,
+                 * so its address is a normal local. */
+                int sz = ty_size(pt);
+                x86_lea_reg_slot(text, REG_RCX, sd[i]);
+                for (int off = 0; off < sz; off += 8) {
+                    int chunk = sz - off >= 8 ? 8 : sz - off;
+                    x86_load_reg_mem(text, REG_RAX, REG_RBP,
+                                     incoming + off, chunk >= 8 ? 8 : chunk);
+                    x86_store_mem_reg(text, REG_RCX, off, REG_RAX,
+                                      chunk >= 8 ? 8 : chunk);
+                }
+                incoming += (sz + 7) & ~7;
+                continue;
+            }
+            /* registers -> the parameter's own storage */
+            x86_lea_reg_slot(text, REG_RCX, sd[i]);
+            for (int k = 0; k < n; k++) {
+                if (cls[k] == CLASS_SSE)
+                    x86_movs_store_base(text, REG_RCX, k * 8, freg++, 8);
+                else
+                    x86_store_mem_reg(text, REG_RCX, k * 8,
+                                      x86_argreg(ireg++), 8);
+            }
         }
     }
 
@@ -276,6 +335,22 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_load_slot(text, sd[i->a], i->size, i->sign, i->w);
             x86_store_slot(text, sd[i->dst], 8);
             break;
+        case IR_MEMCPY: {
+            /* a struct copy: 8 bytes at a time, then the tail */
+            x86_load_slot(text, sd[i->a], 8, 0, 8);
+            x86_mov_reg_reg(text, REG_RCX, REG_RAX);       /* dst */
+            x86_load_slot(text, sd[i->b], 8, 0, 8);
+            x86_mov_reg_reg(text, REG_RDX, REG_RAX);       /* src */
+            int off = 0;
+            while (off < i->size) {
+                int chunk = i->size - off;
+                chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4 : chunk >= 2 ? 2 : 1;
+                x86_load_reg_mem(text, REG_RAX, REG_RDX, off, chunk);
+                x86_store_mem_reg(text, REG_RCX, off, REG_RAX, chunk);
+                off += chunk;
+            }
+            break;
+        }
         case IR_LABEL:
             label_off[i->label] = text->len;
             break;
@@ -304,12 +379,53 @@ static void gen_func(struct ir_func *fn, struct code *text,
             /* SysV walks TWO register files independently: integers and
              * pointers take rdi..r9, floats take xmm0..7. */
             int ireg = 0, freg = 0;
+
+            /* MEMORY-class aggregates go to the outgoing area first,
+             * while rax/rcx/rdx are still free to copy with. */
             for (int k = 0; k < i->nargs; k++) {
-                if (i->argflt[k])
-                    x86_movs_load(text, freg++, sd[i->args[k]],
-                                  i->argw[k]);
+                if (!i->argv[k].is_struct || i->argv[k].nclass != 0)
+                    continue;
+                x86_load_slot(text, sd[i->argv[k].vreg], 8, 0, 8);
+                x86_mov_reg_reg(text, REG_RDX, REG_RAX); /* src */
+                int sz = i->argv[k].size;
+                for (int off = 0; off < sz; ) {
+                    int chunk = sz - off;
+                    chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4
+                          : chunk >= 2 ? 2 : 1;
+                    x86_load_reg_mem(text, REG_RAX, REG_RDX, off, chunk);
+                    x86_store_mem_reg(text, REG_RSP,
+                                      i->argv[k].stk_off + off, REG_RAX,
+                                      chunk);
+                    off += chunk;
+                }
+            }
+            /* A struct returned in MEMORY takes rdi as a hidden pointer
+             * to the caller's scratch, before any real argument. */
+            if (i->retsize && i->retnclass == 0) {
+                x86_lea_reg_slot(text, REG_RDI,
+                                 scratch_base + i->scratch);
+                ireg++;
+            }
+            for (int k = 0; k < i->nargs; k++) {
+                struct ir_arg *a = &i->argv[k];
+                if (a->is_struct) {
+                    if (a->nclass == 0)
+                        continue; /* already on the stack */
+                    x86_load_slot(text, sd[a->vreg], 8, 0, 8);
+                    for (int q = 0; q < a->nclass; q++) {
+                        if (a->cls[q] == CLASS_SSE)
+                            x86_movs_load_base(text, freg++, REG_RAX,
+                                               q * 8, 8);
+                        else
+                            x86_load_reg_mem(text, x86_argreg(ireg++),
+                                             REG_RAX, q * 8, 8);
+                    }
+                    continue;
+                }
+                if (a->cls[0] == CLASS_SSE)
+                    x86_movs_load(text, freg++, sd[a->vreg], a->size);
                 else
-                    x86_load_arg(text, ireg++, sd[i->args[k]]);
+                    x86_load_arg(text, ireg++, sd[a->vreg]);
             }
             if (i->indirect)
                 x86_mov_r11_slot(text, sd[i->a]);
@@ -339,6 +455,28 @@ static void gen_func(struct ir_func *fn, struct code *text,
                     PUSH(st->ext, st->next, st->capext, ec);
                 }
             }
+            if (i->retsize) {
+                /* The value of a struct call is the ADDRESS it landed
+                 * at: the scratch we reserved. A MEMORY return already
+                 * wrote there; a register return is unpacked into it. */
+                if (i->retnclass > 0) {
+                    x86_lea_reg_slot(text, REG_RCX,
+                                     scratch_base + i->scratch);
+                    int ir = 0, fr = 0;
+                    for (int q = 0; q < i->retnclass; q++) {
+                        if (i->retcls[q] == CLASS_SSE)
+                            x86_movs_store_base(text, REG_RCX, q * 8,
+                                                fr++, 8);
+                        else
+                            x86_store_mem_reg(text, REG_RCX, q * 8,
+                                              ir++ == 0 ? REG_RAX
+                                                        : REG_RDX, 8);
+                    }
+                }
+                x86_lea_rax_slot(text, scratch_base + i->scratch);
+                x86_store_slot(text, sd[i->dst], 8);
+                break;
+            }
             if (i->flt)
                 x86_movs_store(text, 0, sd[i->dst], i->w);
             else
@@ -346,10 +484,51 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
         case IR_RET:
-            if (i->a >= 0 && i->flt)
-                x86_movs_load(text, 0, sd[i->a], i->w);
-            else if (i->a >= 0)
+            if (i->a >= 0 && f->ret_ty->kind == TY_STRUCT) {
+                enum arg_class rc[2];
+                int rn = ty_classify(f->ret_ty, rc);
+                int sz = ty_size(f->ret_ty);
                 x86_load_slot(text, sd[i->a], 8, 0, 8);
+                x86_mov_reg_reg(text, REG_RDX, REG_RAX); /* the value */
+                if (rn == 0) {
+                    /* MEMORY: copy into the caller's buffer and hand
+                     * the pointer back in rax, as the ABI requires. */
+                    x86_load_slot(text, sret_slot, 8, 0, 8);
+                    x86_mov_reg_reg(text, REG_RCX, REG_RAX);
+                    for (int off = 0; off < sz; ) {
+                        int chunk = sz - off;
+                        chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4
+                              : chunk >= 2 ? 2 : 1;
+                        x86_load_reg_mem(text, REG_RAX, REG_RDX, off,
+                                         chunk);
+                        x86_store_mem_reg(text, REG_RCX, off, REG_RAX,
+                                          chunk);
+                        off += chunk;
+                    }
+                    x86_load_slot(text, sret_slot, 8, 0, 8);
+                } else {
+                    /* Small enough to travel in registers: eightbytes
+                     * take the next register of their OWN class, so
+                     * INTEGER fills rax then rdx and SSE fills xmm0
+                     * then xmm1. The address is held in rcx because rdx
+                     * is itself a destination. */
+                    x86_mov_reg_reg(text, REG_RCX, REG_RDX);
+                    int ir = 0, fr = 0;
+                    for (int q = 0; q < rn; q++) {
+                        if (rc[q] == CLASS_SSE)
+                            x86_movs_load_base(text, fr++, REG_RCX,
+                                               q * 8, 8);
+                        else
+                            x86_load_reg_mem(text,
+                                             ir++ == 0 ? REG_RAX : REG_RDX,
+                                             REG_RCX, q * 8, 8);
+                    }
+                }
+            } else if (i->a >= 0 && i->flt) {
+                x86_movs_load(text, 0, sd[i->a], i->w);
+            } else if (i->a >= 0) {
+                x86_load_slot(text, sd[i->a], 8, 0, 8);
+            }
             x86_epilogue(text);
             break;
         }

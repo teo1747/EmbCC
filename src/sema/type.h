@@ -70,6 +70,23 @@ int ty_is_scalar(const struct type *t);     /* integer or pointer */
 int ty_wide(const struct type *t);          /* 1 = 64-bit value class */
 int ty_signed_int(const struct type *t);    /* signed integer? */
 
+/* ---- SysV AMD64 argument classification (the ABI's §3.2.3) ----
+ *
+ * Getting this wrong does not fail loudly: it produces an object that
+ * links against gcc-built code and passes arguments in the wrong place.
+ * So it is implemented in full rather than only for the case a given
+ * program happens to need.
+ *
+ * An aggregate larger than two eightbytes is MEMORY (stack / hidden
+ * return pointer). Otherwise each eightbyte is SSE when every scalar
+ * overlapping it is floating, and INTEGER otherwise. */
+enum arg_class { CLASS_INTEGER, CLASS_SSE, CLASS_MEMORY };
+
+/* Fills classes[] with one entry per eightbyte and returns the count
+ * (1 or 2); returns 0 when the type is MEMORY class. Non-aggregates
+ * answer with their single natural class. */
+int ty_classify(const struct type *t, enum arg_class *classes);
+
 /* Diagnostic spelling, e.g. "unsigned char **". Static buffer. */
 const char *ty_name(const struct type *t);
 

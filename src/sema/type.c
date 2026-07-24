@@ -178,6 +178,64 @@ int ty_signed_int(const struct type *t)
     return ty_is_integer(t) && !t->is_unsigned;
 }
 
+/* Merge rule for two scalars landing in the same eightbyte: anything
+ * non-floating makes the whole eightbyte INTEGER. */
+static void class_merge(enum arg_class *slot, int *seen, enum arg_class c)
+{
+    if (!*seen) {
+        *slot = c;
+        *seen = 1;
+        return;
+    }
+    if (c == CLASS_INTEGER)
+        *slot = CLASS_INTEGER;
+}
+
+/* Walks every scalar leaf of t at byte offset `off`, classifying the
+ * eightbyte each one falls in. Arrays and nested structs recurse, which
+ * is what makes "all floating" mean all the way down. */
+static void classify_fields(const struct type *t, int off,
+                            enum arg_class *cls, int *seen)
+{
+    if (t->kind == TY_STRUCT) {
+        for (int i = 0; i < t->nmembers; i++)
+            classify_fields(t->members[i].ty, off + t->members[i].off,
+                            cls, seen);
+        return;
+    }
+    if (t->kind == TY_ARRAY) {
+        int esz = ty_size(t->pointee);
+        for (int i = 0; i < t->count; i++)
+            classify_fields(t->pointee, off + i * esz, cls, seen);
+        return;
+    }
+    int idx = off / 8;
+    if (idx < 0 || idx > 1)
+        return; /* caller already decided MEMORY */
+    class_merge(&cls[idx], &seen[idx],
+                ty_is_float(t) ? CLASS_SSE : CLASS_INTEGER);
+}
+
+int ty_classify(const struct type *t, enum arg_class *classes)
+{
+    if (t->kind != TY_STRUCT) {
+        classes[0] = ty_is_float(t) ? CLASS_SSE : CLASS_INTEGER;
+        return 1;
+    }
+    int size = ty_size(t);
+    if (size > 16)
+        return 0; /* MEMORY */
+
+    int seen[2] = { 0, 0 };
+    classes[0] = classes[1] = CLASS_INTEGER;
+    classify_fields(t, 0, classes, seen);
+    int n = (size + 7) / 8;
+    for (int i = 0; i < n; i++)
+        if (!seen[i])
+            classes[i] = CLASS_INTEGER; /* padding-only: harmless */
+    return n;
+}
+
 const char *ty_name(const struct type *t)
 {
     /* Rotating buffers so one diagnostic can name two types — with a

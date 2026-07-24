@@ -392,6 +392,17 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return emit_load(fn, addr, e->ty);
     }
     case EXPR_ASSIGN: {
+        if (e->ty->kind == TY_STRUCT) {
+            /* a struct assignment is a copy of its bytes */
+            int dst = gen_addr(fn, e->lhs);
+            int src = gen_expr(fn, e->rhs); /* structs ARE addresses */
+            struct ir_ins *i = emit(fn);
+            i->op = IR_MEMCPY;
+            i->a = dst;
+            i->b = src;
+            i->size = ty_size(e->ty);
+            return dst;
+        }
         if (e->lhs->kind == EXPR_VAR && !e->lhs->gref) {
             int v = gen_expr(fn, e->rhs);
             emit_stvar(fn, e->lhs->var_index, v, e->ty);
@@ -656,10 +667,34 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         i->call_varargs = e->callee ? e->callee->is_varargs
                                     : e->lhs->ty->pointee->is_varargs;
         i->nargs = e->nargs;
+
+        /* Classify every argument here, where the types still exist;
+         * codegen only places what it is told. MEMORY-class arguments
+         * are assigned offsets in this call's outgoing area, and the
+         * function's frame reserves the widest such area. */
+        int stk = 0;
         for (int k = 0; k < e->nargs; k++) {
-            i->args[k] = args[k];
-            i->argflt[k] = ty_is_float(e->args[k]->ty);
-            i->argw[k] = ty_size(e->args[k]->ty);
+            struct type *at = e->args[k]->ty;
+            i->argv[k].vreg = args[k];
+            i->argv[k].is_struct = at->kind == TY_STRUCT;
+            i->argv[k].size = ty_size(at);
+            i->argv[k].nclass = ty_classify(at, i->argv[k].cls);
+            i->argv[k].stk_off = 0;
+            if (i->argv[k].nclass == 0) { /* MEMORY: goes on the stack */
+                stk = (stk + 7) & ~7;
+                i->argv[k].stk_off = stk;
+                stk += (ty_size(at) + 7) & ~7;
+            }
+        }
+        if (stk > fn->outgoing_bytes)
+            fn->outgoing_bytes = stk;
+
+        if (e->ty->kind == TY_STRUCT) {
+            i->retsize = ty_size(e->ty);
+            i->retnclass = ty_classify(e->ty, i->retcls);
+            fn->scratch_bytes = (fn->scratch_bytes + 7) & ~7;
+            i->scratch = fn->scratch_bytes;
+            fn->scratch_bytes += (i->retsize + 7) & ~7;
         }
         i->flt = ty_is_float(e->ty);
         i->w = i->flt ? ty_size(e->ty) : 8;
@@ -690,7 +725,21 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
         case STMT_DECL:
             if (s->expr) {
                 int v = gen_expr(fn, s->expr);
-                emit_stvar(fn, s->var_index, v, s->dty);
+                if (s->dty->kind == TY_STRUCT) {
+                    /* initializing a struct is the same byte copy an
+                     * assignment is */
+                    struct ir_ins *a = emit(fn);
+                    a->op = IR_ADDR;
+                    a->a = s->var_index;
+                    a->dst = new_temp(fn);
+                    struct ir_ins *i = emit(fn);
+                    i->op = IR_MEMCPY;
+                    i->a = a->dst;
+                    i->b = v;
+                    i->size = ty_size(s->dty);
+                } else {
+                    emit_stvar(fn, s->var_index, v, s->dty);
+                }
             }
             break;
         case STMT_EXPR:
@@ -705,6 +754,11 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             if (s->expr && ty_is_float(s->expr->ty)) {
                 i->flt = 1; /* the value goes home in xmm0, not rax */
                 i->w = ty_size(s->expr->ty);
+            } else if (s->expr && s->expr->ty->kind == TY_STRUCT) {
+                /* `a` is the ADDRESS of the value; how it travels home
+                 * is the callee's classification, computed in codegen
+                 * from the function's own return type. */
+                i->size = ty_size(s->expr->ty);
             }
             break;
         }

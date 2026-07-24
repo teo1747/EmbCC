@@ -163,20 +163,17 @@ check missing-include \
     '#include "no/such/file.h"
 int main(void) { return 0; }' \
     "cannot find include"
-check struct-assign \
+check struct-assign-mismatch \
     'struct P { int x; };
-int main(void) { struct P a; struct P b; a.x = 1; b = a; return b.x; }' \
-    "struct assignment is not supported"
-check struct-param \
+struct Q { int x; };
+int main(void) { struct P a; struct Q b; b.x = 1; a = b; return a.x; }' \
+    "cannot assign"
+check struct-arg-mismatch \
     'struct P { int x; };
+struct Q { int x; };
 static int f(struct P p) { return p.x; }
-int main(void) { return 0; }' \
-    "pass a pointer"
-check struct-return \
-    'struct P { int x; };
-static struct P f(void) { struct P p; p.x = 1; return p; }
-int main(void) { return 0; }' \
-    "return a pointer"
+int main(void) { struct Q q; q.x = 1; return f(q); }' \
+    "cannot convert"
 check incomplete-var \
     'struct Later;
 int main(void) { struct Later v; return 0; }' \

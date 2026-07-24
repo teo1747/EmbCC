@@ -176,6 +176,12 @@ static void check_u64_float(struct unit *u, int line, struct type *a,
 static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                                    struct type *to, const char *ctx)
 {
+    if (to->kind == TY_STRUCT || rhs->ty->kind == TY_STRUCT) {
+        if (!ty_equal(to, rhs->ty))
+            diag_fatal(u->file, rhs->line, "%s: cannot convert %s to %s",
+                       ctx, ty_name(rhs->ty), ty_name(to));
+        return rhs; /* same struct type: passed/returned as its bytes */
+    }
     if (ty_is_arith(to) && ty_is_arith(rhs->ty)) {
         check_u64_float(u, rhs->line, to, rhs->ty);
         return mk_cast(rhs, to);
@@ -287,13 +293,16 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line, "cannot assign to an array");
         if (e->lhs->fref)
             diag_fatal(u->file, e->line, "cannot assign to a function");
-        if (e->lhs->ty->kind == TY_STRUCT)
-            diag_fatal(u->file, e->line,
-                       "struct assignment is not supported yet — copy "
-                       "the members, or memcpy through pointers");
         check_expr(u, f, sc, e->rhs);
-        need_scalar(u, e->rhs, "assignment");
-        e->rhs = convert_assign(u, e->rhs, e->lhs->ty, "assignment");
+        if (e->lhs->ty->kind == TY_STRUCT) {
+            if (!ty_equal(e->lhs->ty, e->rhs->ty))
+                diag_fatal(u->file, e->line,
+                           "cannot assign %s to %s",
+                           ty_name(e->rhs->ty), ty_name(e->lhs->ty));
+        } else {
+            need_scalar(u, e->rhs, "assignment");
+            e->rhs = convert_assign(u, e->rhs, e->lhs->ty, "assignment");
+        }
         e->ty = e->lhs->ty;
         break;
     case EXPR_INCDEC: {
@@ -620,7 +629,8 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        ft->nptypes == 1 ? "" : "s", e->nargs);
         for (int i = 0; i < e->nargs; i++) {
             check_expr(u, f, sc, e->args[i]);
-            need_scalar(u, e->args[i], "an argument");
+            if (e->args[i]->ty->kind != TY_STRUCT)
+                need_scalar(u, e->args[i], "an argument");
             if (i < ft->nptypes)
                 e->args[i] = convert_assign(u, e->args[i],
                                             ft->ptypes[i], "argument");
@@ -760,7 +770,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
         case STMT_DECL:
             if (s->expr) {
                 check_expr(u, f, sc, s->expr);
-                need_scalar(u, s->expr, "an initializer");
+                if (s->dty->kind != TY_STRUCT)
+                    need_scalar(u, s->expr, "an initializer");
                 s->expr = convert_assign(u, s->expr, s->dty,
                                          "initialization");
             }
@@ -783,7 +794,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                                "'%s' returns %s; 'return' needs a value",
                                f->name, ty_name(f->ret_ty));
                 check_expr(u, f, sc, s->expr);
-                need_scalar(u, s->expr, "'return'");
+                if (s->expr->ty->kind != TY_STRUCT)
+                    need_scalar(u, s->expr, "'return'");
                 s->expr = convert_assign(u, s->expr, f->ret_ty, "return");
             }
             break;

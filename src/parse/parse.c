@@ -1212,10 +1212,6 @@ static void parse_top(struct parser *ps, struct unit *u,
     struct func *f = xcalloc(1, sizeof *f);
     /* 'extern' on a function is the default linkage — accept, ignore */
     f->is_static = is_static;
-    if (ty->kind == TY_STRUCT)
-        diag_fatal(ps->lx.file, line,
-                   "returning a struct/union by value is not supported "
-                   "yet (SysV classification) — return a pointer");
     f->ret_ty = ty;
     f->name = name;
     f->line = line;
@@ -1259,11 +1255,6 @@ static void parse_top(struct parser *ps, struct unit *u,
             if (pt->kind == TY_VOID)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "a parameter cannot have type void");
-            if (pt->kind == TY_STRUCT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
-                           "struct/union parameters by value are not "
-                           "supported yet (SysV classification) — "
-                           "pass a pointer");
             if (f->nparams >= MAX_PARAMS)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "more than %d parameters "

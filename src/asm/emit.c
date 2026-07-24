@@ -55,6 +55,133 @@ static void modrm_rbp(struct code *c, int reg, int disp)
     }
 }
 
+/* ModRM for [base+disp] with an arbitrary base register. rsp needs a
+ * SIB byte; rbp cannot use the disp-less form (that encoding means
+ * RIP-relative), so both take an explicit displacement. */
+static void modrm_base(struct code *c, int reg, int base, int disp)
+{
+    int rm = base & 7;
+    int mod;
+
+    if (disp >= -128 && disp <= 127)
+        mod = 1;
+    else
+        mod = 2;
+    code_byte(c, (mod << 6) | ((reg & 7) << 3) | rm);
+    if (rm == 4)
+        code_byte(c, 0x24); /* SIB: base=rsp, no index */
+    if (mod == 1)
+        code_byte(c, disp & 0xff);
+    else
+        code_u32(c, (unsigned long)(unsigned int)disp);
+}
+
+/* REX for a (reg, base) pair; emitted when 64-bit or when either
+ * register is r8..r15 (none are used here, but the bits are correct). */
+static void rex_rb(struct code *c, int w64, int reg, int base)
+{
+    int rex = 0x40 | (w64 ? 8 : 0) | ((reg & 8) ? 4 : 0) |
+              ((base & 8) ? 1 : 0);
+    if (rex != 0x40)
+        code_byte(c, rex);
+}
+
+void x86_load_reg_mem(struct code *c, int dst, int base, int disp,
+                      int size)
+{
+    switch (size) {
+    case 1:
+        rex_rb(c, 0, dst, base);
+        code_byte(c, 0x0f);
+        code_byte(c, 0xb6); /* movzx r32, r/m8 */
+        break;
+    case 2:
+        rex_rb(c, 0, dst, base);
+        code_byte(c, 0x0f);
+        code_byte(c, 0xb7); /* movzx r32, r/m16 */
+        break;
+    case 4:
+        rex_rb(c, 0, dst, base);
+        code_byte(c, 0x8b);
+        break;
+    case 8:
+        rex_rb(c, 1, dst, base);
+        code_byte(c, 0x8b);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+    modrm_base(c, dst, base, disp);
+}
+
+void x86_store_mem_reg(struct code *c, int base, int disp, int src,
+                       int size)
+{
+    switch (size) {
+    case 1:
+        rex_rb(c, 0, src, base);
+        code_byte(c, 0x88);
+        break;
+    case 2:
+        code_byte(c, 0x66);
+        rex_rb(c, 0, src, base);
+        code_byte(c, 0x89);
+        break;
+    case 4:
+        rex_rb(c, 0, src, base);
+        code_byte(c, 0x89);
+        break;
+    case 8:
+        rex_rb(c, 1, src, base);
+        code_byte(c, 0x89);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad store size %d\n", size);
+        exit(1);
+    }
+    modrm_base(c, src, base, disp);
+}
+
+void x86_movs_load_base(struct code *c, int xmm, int base, int disp,
+                        int w)
+{
+    code_byte(c, w == 4 ? 0xf3 : 0xf2);
+    code_byte(c, 0x0f);
+    code_byte(c, 0x10);
+    modrm_base(c, xmm, base, disp);
+}
+
+void x86_movs_store_base(struct code *c, int base, int disp, int xmm,
+                         int w)
+{
+    code_byte(c, w == 4 ? 0xf3 : 0xf2);
+    code_byte(c, 0x0f);
+    code_byte(c, 0x11);
+    modrm_base(c, xmm, base, disp);
+}
+
+void x86_lea_reg_slot(struct code *c, int dst, int disp)
+{
+    rex_rb(c, 1, dst, REG_RBP);
+    code_byte(c, 0x8d);
+    modrm_base(c, dst, REG_RBP, disp);
+}
+
+void x86_mov_reg_reg(struct code *c, int dst, int src)
+{
+    rex_rb(c, 1, src, dst);
+    code_byte(c, 0x89); /* mov r/m64, r64 */
+    code_byte(c, 0xc0 | ((src & 7) << 3) | (dst & 7));
+}
+
+int x86_argreg(int index)
+{
+    static const int regs[6] = { REG_RDI, REG_RSI, REG_RDX, REG_RCX,
+                                 8 /* r8 */, 9 /* r9 */ };
+    return regs[index];
+}
+
 void x86_prologue(struct code *c, int framesize)
 {
     if (framesize % 16 != 0) {

@@ -12,6 +12,7 @@
 #define EMBCC_IR_IR_H
 
 #include "../parse/ast.h"
+#include "../sema/type.h"
 
 /* Width/representation model (see sema/type.h): temporaries hold
  * promoted values — `w` is 4 (int class) or 8 (long/pointer class) and
@@ -51,6 +52,7 @@ enum ir_op {
     IR_RET,   /* return a (a == -1: void return) */
     IR_LABEL, /* label: (id in `label`) */
     IR_JMP,   /* goto label */
+    IR_MEMCPY,/* copy `size` bytes: *(addr a) <- *(addr b) */
     IR_BRZ,   /* if (a == 0) goto label  (w) */
     IR_BRNZ   /* if (a != 0) goto label  (w) */
 };
@@ -69,19 +71,35 @@ struct ir_ins {
     int indirect;            /* IR_CALL through a function pointer */
     int call_varargs;        /* al = 0 needed at the call */
     struct global *glob;     /* IR_GADDR */
-    int args[MAX_PARAMS];    /* IR_CALL: argument vregs */
-    /* SysV splits the argument REGISTERS by class: integers walk
-     * rdi..r9, floats walk xmm0..7, independently. So each argument
-     * carries its class and width. */
-    int argflt[MAX_PARAMS];
-    int argw[MAX_PARAMS];
+    /* IR_CALL arguments. SysV splits the argument REGISTERS by class —
+     * integers walk rdi..r9, floats walk xmm0..7, independently — and
+     * an aggregate is either taken apart into eightbytes or copied to
+     * the stack. Each argument therefore carries its own classification,
+     * decided in irgen where the types still exist. */
+    struct ir_arg {
+        int vreg;            /* value, or the ADDRESS when is_struct */
+        int is_struct;
+        int size;            /* struct size, or the scalar's width */
+        int nclass;          /* eightbyte count; 0 = MEMORY (stack) */
+        enum arg_class cls[2];
+        int stk_off;         /* MEMORY args: offset in the outgoing area */
+    } argv[MAX_PARAMS];
     int nargs;
+    /* IR_CALL returning a struct: its size, classification, and the
+     * caller-side scratch the result lands in. nclass 0 means MEMORY,
+     * i.e. the hidden-pointer (sret) convention. */
+    int retsize;
+    int retnclass;
+    enum arg_class retcls[2];
+    int scratch;             /* frame offset of the returned struct */
 };
 
 struct ir_func {
     struct func *src;        /* name, linkage, code_off/len live here */
     int nvregs;
     int nlabels;
+    int scratch_bytes;       /* struct-return temporaries */
+    int outgoing_bytes;      /* widest stack-argument area of any call */
     struct ir_ins *ins;
     int nins, cap;
 };
