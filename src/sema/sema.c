@@ -948,8 +948,19 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                        s->dty->kind == TY_ARRAY && s->dty->count == 0) {
                 /* an omitted array size is the element count */
                 s->dty = ty_array(s->dty->pointee, s->expr->nelems);
-            } else if (s->expr && s->dty->kind != TY_ARRAY &&
-                       s->dty->kind != TY_STRUCT) {
+            }
+            /* The name is in scope WITHIN its own initializer (C11
+             * 6.2.1p7: scope begins just after the declarator), so the
+             * pervasive `T *p = xcalloc(1, sizeof *p)` resolves p. Add
+             * it before checking the initializer; a static local's
+             * global is wired onto this same entry below. */
+            if (scope_find_here(sc, s->name) >= 0)
+                diag_fatal(u->file, s->line,
+                           "'%s' is already declared in this block",
+                           s->name);
+            s->var_index = scope_add(sc, s->name, s->dty, NULL);
+            if (s->expr && s->dty->kind != TY_ARRAY &&
+                s->dty->kind != TY_STRUCT) {
                 check_expr(u, f, sc, s->expr);
                 if (s->dty->kind != TY_STRUCT)
                     need_scalar(u, s->expr, "an initializer");
@@ -1021,18 +1032,10 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 *gt = g;
                 s->sglob = g;
                 s->expr = NULL;   /* the data, not code, carries it */
-                if (scope_find_here(sc, s->name) >= 0)
-                    diag_fatal(u->file, s->line,
-                               "'%s' is already declared in this block",
-                               s->name);
-                s->var_index = scope_add(sc, s->name, s->dty, g);
+                sc->vars[s->var_index].g = g; /* wire the global onto the
+                                                 entry added above */
                 break;
             }
-            if (scope_find_here(sc, s->name) >= 0)
-                diag_fatal(u->file, s->line,
-                           "'%s' is already declared in this block",
-                           s->name);
-            s->var_index = scope_add(sc, s->name, s->dty, NULL);
             break;
         case STMT_RETURN:
             if (f->ret_ty->kind == TY_VOID) {
