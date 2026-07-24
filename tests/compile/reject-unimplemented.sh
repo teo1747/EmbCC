@@ -81,10 +81,6 @@ check compound-on-rvalue \
 check compound-ptr-mul \
     'int main(void) { int a[4]; int *p = a; p *= 2; return !p; }' \
     "only += and -= apply to a pointer"
-check too-many-reg-args \
-    'int f(int a, int b, int c, int d, int e, int g, int h);
-int main(void) { return f(1,2,3,4,5,6,7); }' \
-    "SysV has 6 and 8"
 check addr-of-rvalue \
     'int main(void) { int x = 1; return !&(x + 1); }' \
     "needs a variable"
@@ -108,9 +104,16 @@ check array-assign \
 check addr-of-array \
     'int main(void) { int a[3]; return !&a; }' \
     "already the address"
-check array-initializer \
+check array-scalar-init \
     'int main(void) { int a[3] = 0; return 0; }' \
-    "only string literals may initialize an array"
+    "brace initializer or a string"
+check too-many-initializers \
+    'int main(void) { int a[2] = {1,2,3}; return a[0]; }' \
+    "3 initializers for an array of 2"
+check designated-init \
+    'struct P { int x; int y; };
+int main(void) { struct P p = { .x = 1 }; return p.x; }' \
+    "designated initializers"
 check non-char-array-from-string \
     'int main(void) { int a[4] = "abc"; return a[0]; }' \
     "only a char array"
@@ -173,6 +176,10 @@ check missing-include \
     '#include "no/such/file.h"
 int main(void) { return 0; }' \
     "cannot find include"
+check struct-scalar-init \
+    'struct P { int x; };
+int main(void) { struct P p = 1; return p.x; }' \
+    "cannot convert"
 check struct-assign-mismatch \
     'struct P { int x; };
 struct Q { int x; };
@@ -284,9 +291,9 @@ check string-as-int \
 check decl-as-if-body \
     'int main(void) { if (1) int x = 1; return 0; }' \
     "wrap it in braces"
-check shadowing \
-    'int main(void) { int x = 1; { int x = 2; } return x; }' \
-    "already declared"
+check redeclare-same-block \
+    'int main(void) { int x = 1; int x = 2; return x; }' \
+    "already declared in this block"
 check assign-to-literal \
     'int main(void) { 5 = 6; return 0; }' \
     "assignment target must be a variable"

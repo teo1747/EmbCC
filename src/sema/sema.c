@@ -17,17 +17,33 @@ struct vardef {
     struct type *ty;
     struct global *g;   /* non-NULL for a static local: it lives in
                          * static storage, not the frame */
+    int active;         /* 0 once its block has closed */
 };
 
+/* Block scoping without giving up unique frame slots: entries are never
+ * removed — the index IS the variable's slot for the whole function —
+ * they are only deactivated when their block ends. Lookup runs backward
+ * so an inner declaration shadows an outer one. */
 struct scope {
     struct vardef *vars;
     int n, cap;
+    int block_start;    /* index where the innermost block began */
 };
 
 static int scope_find(struct scope *sc, const char *name)
 {
-    for (int i = 0; i < sc->n; i++)
-        if (strcmp(sc->vars[i].name, name) == 0)
+    for (int i = sc->n - 1; i >= 0; i--)
+        if (sc->vars[i].active && strcmp(sc->vars[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+/* A redeclaration is an error only within the SAME block; an inner
+ * block may shadow, exactly as C allows. */
+static int scope_find_here(struct scope *sc, const char *name)
+{
+    for (int i = sc->n - 1; i >= sc->block_start; i--)
+        if (sc->vars[i].active && strcmp(sc->vars[i].name, name) == 0)
             return i;
     return -1;
 }
@@ -42,6 +58,7 @@ static int scope_add(struct scope *sc, const char *name, struct type *ty,
     sc->vars[sc->n].name = name;
     sc->vars[sc->n].ty = ty;
     sc->vars[sc->n].g = g;
+    sc->vars[sc->n].active = 1;
     return sc->n++;
 }
 
@@ -383,6 +400,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         break;
     case EXPR_CAST:
         check_expr(u, f, sc, e->rhs);
+        if (e->cast_ty->kind == TY_VOID) {
+            /* (void)x — evaluate and discard, the standard way to say
+             * "yes, I meant to ignore this" */
+            e->ty = e->cast_ty;
+            break;
+        }
         need_scalar(u, e->rhs, "a cast");
         if (!ty_is_scalar(e->cast_ty))
             diag_fatal(u->file, e->line, "cannot cast to %s",
@@ -428,6 +451,8 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->lhs = mk_cast(e->lhs, b);
         } else if (a->kind == TY_VOID && b->kind == TY_VOID) {
             e->ty = a;
+        } else if (a->kind == TY_STRUCT && ty_equal(a, b)) {
+            e->ty = a; /* both arms are the same aggregate */
         } else {
             diag_fatal(u->file, e->line,
                        "'?:' branches have incompatible types "
@@ -435,6 +460,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         }
         break;
     }
+    case EXPR_INITLIST:
+        /* Only ever reached through flatten_init(), which knows the
+         * target type; a brace list has no type of its own. */
+        diag_fatal(u->file, e->line,
+                   "a brace initializer cannot appear here");
+        break;
     case EXPR_COMPOUND: {
         /* x op= y. The lvalue is evaluated once (irgen keeps its
          * address); the operation happens in the usual common type and
@@ -687,32 +718,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 e->args[i] = mk_cast(e->args[i],
                                      default_arg_promote(e->args[i]->ty));
         }
-        /* SysV provides six integer and eight vector argument
-         * registers. Stack passing exists for MEMORY-class aggregates
-         * only, so a call needing more REGISTERS than that is refused
-         * rather than quietly mis-placed. */
-        {
-            enum arg_class cls[2];
-            int ireg = 0, freg = 0;
-            if (ft->ret->kind == TY_STRUCT &&
-                ty_classify(ft->ret, cls) == 0)
-                ireg++; /* the hidden return pointer */
-            for (int i = 0; i < e->nargs; i++) {
-                int n = ty_classify(e->args[i]->ty, cls);
-                for (int q = 0; q < n; q++) {
-                    if (cls[q] == CLASS_SSE)
-                        freg++;
-                    else
-                        ireg++;
-                }
-            }
-            if (ireg > 6 || freg > 8)
-                diag_fatal(u->file, e->line,
-                           "this call needs %d integer and %d vector "
-                           "argument registers; SysV has 6 and 8, and "
-                           "stack passing of scalars is not implemented "
-                           "yet", ireg, freg);
-        }
         e->ty = ft->ret;
         break;
     }
@@ -776,6 +781,92 @@ struct stmt *switch_stmts(struct stmt *body)
     if (body && body->kind == STMT_BLOCK)
         return body->body;
     return body;
+}
+
+/* Flattens an initializer against its target type into (offset, type,
+ * value) triples. Nested braces recurse; a scalar initializer for an
+ * aggregate member is checked and converted like any assignment. C's
+ * rule that unlisted elements are zero is honoured by irgen, which
+ * clears the whole object first. */
+struct initbuf {
+    struct initelem *v;
+    int n, cap;
+};
+
+static void init_push(struct initbuf *b, int off, struct type *ty,
+                      struct expr *e)
+{
+    if (b->n == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 8;
+        b->v = xrealloc(b->v, (size_t)b->cap * sizeof *b->v);
+    }
+    b->v[b->n].off = off;
+    b->v[b->n].ty = ty;
+    b->v[b->n].e = e;
+    b->n++;
+}
+
+static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
+                         struct expr *init, struct type *ty, int off,
+                         struct initbuf *out)
+{
+    if (init->kind != EXPR_INITLIST) {
+        if (ty->kind == TY_ARRAY) {
+            /* char a[] = "..." — the literal's bytes ARE the object */
+            if (init->kind == EXPR_STR &&
+                ty->pointee->kind == TY_CHAR) {
+                int len = (int)init->num;
+                if (ty->count && ty->count < len - 1)
+                    diag_fatal(u->file, init->line,
+                               "initializer is longer than the array");
+                for (int i = 0; i < len && (!ty->count || i < ty->count);
+                     i++) {
+                    struct expr *ch = xcalloc(1, sizeof *ch);
+                    ch->kind = EXPR_NUM;
+                    ch->line = init->line;
+                    ch->num = (unsigned char)init->name[i];
+                    ch->ty = ty_base(TY_CHAR, 0);
+                    init_push(out, off + i, ty->pointee, ch);
+                }
+                return;
+            }
+            diag_fatal(u->file, init->line,
+                       "an array needs a brace initializer or a string");
+        }
+        check_expr(u, f, sc, init);
+        if (ty->kind != TY_STRUCT)
+            need_scalar(u, init, "an initializer");
+        init_push(out, off, ty,
+                  convert_assign(u, init, ty, "initialization"));
+        return;
+    }
+
+    if (ty->kind == TY_ARRAY) {
+        int esz = ty_size(ty->pointee);
+        if (ty->count && init->nelems > ty->count)
+            diag_fatal(u->file, init->line,
+                       "%d initializers for an array of %d",
+                       init->nelems, ty->count);
+        for (int i = 0; i < init->nelems; i++)
+            flatten_init(u, f, sc, init->elems[i], ty->pointee,
+                         off + i * esz, out);
+        return;
+    }
+    if (ty->kind == TY_STRUCT) {
+        if (init->nelems > ty->nmembers)
+            diag_fatal(u->file, init->line,
+                       "%d initializers for %s, which has %d members",
+                       init->nelems, ty_name(ty), ty->nmembers);
+        for (int i = 0; i < init->nelems; i++)
+            flatten_init(u, f, sc, init->elems[i], ty->members[i].ty,
+                         off + ty->members[i].off, out);
+        return;
+    }
+    /* a braced scalar: { x } */
+    if (init->nelems != 1)
+        diag_fatal(u->file, init->line,
+                   "a scalar takes exactly one initializer");
+    flatten_init(u, f, sc, init->elems[0], ty, off, out);
 }
 
 /* Declarations anywhere in the function share one flat scope, and
@@ -845,31 +936,57 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
         case STMT_DECL:
             if (s->expr && s->dty->kind == TY_ARRAY &&
                 s->expr->kind == EXPR_STR) {
-                /* char a[] = "..." : the literal's bytes ARE the
-                 * object, and an omitted size is the literal's. */
+                /* char a[] = "..." : an omitted size is the literal's */
                 if (s->dty->pointee->kind != TY_CHAR)
                     diag_fatal(u->file, s->line,
                                "only a char array can be initialized "
                                "from a string");
-                int len = (int)s->expr->num;
                 if (s->dty->count == 0)
-                    s->dty = ty_array(s->dty->pointee, len);
-                else if (s->dty->count < len - 1)
-                    diag_fatal(u->file, s->line,
-                               "initializer is longer than '%s'",
-                               s->name);
-            } else if (s->expr) {
+                    s->dty = ty_array(s->dty->pointee,
+                                      (int)s->expr->num);
+            } else if (s->expr && s->expr->kind == EXPR_INITLIST &&
+                       s->dty->kind == TY_ARRAY && s->dty->count == 0) {
+                /* an omitted array size is the element count */
+                s->dty = ty_array(s->dty->pointee, s->expr->nelems);
+            } else if (s->expr && s->dty->kind != TY_ARRAY &&
+                       s->dty->kind != TY_STRUCT) {
                 check_expr(u, f, sc, s->expr);
                 if (s->dty->kind != TY_STRUCT)
                     need_scalar(u, s->expr, "an initializer");
                 s->expr = convert_assign(u, s->expr, s->dty,
                                          "initialization");
             }
+            if (s->expr && (s->expr->kind == EXPR_INITLIST ||
+                            s->dty->kind == TY_ARRAY ||
+                            s->dty->kind == TY_STRUCT)) {
+                struct initbuf ib = { 0, 0, 0 };
+                flatten_init(u, f, sc, s->expr, s->dty, 0, &ib);
+                s->inits = ib.v;
+                s->ninits = ib.n;
+                s->expr = NULL;
+            }
             if (s->is_static) {
                 /* A static local has static STORAGE and internal
                  * linkage: it becomes a global of its own, named so it
                  * cannot collide with a file-scope name. */
                 long sval = 0;
+                if (s->ninits) {
+                    /* a static aggregate's bytes must be constant */
+                    char *bytes = xcalloc(1, (size_t)ty_size(s->dty));
+                    for (int k = 0; k < s->ninits; k++) {
+                        long cv;
+                        if (!const_fold(s->inits[k].e, &cv))
+                            diag_fatal(u->file, s->line,
+                                       "a static local needs constant "
+                                       "initializers");
+                        int sz = ty_size(s->inits[k].ty);
+                        for (int b = 0; b < sz; b++)
+                            bytes[s->inits[k].off + b] =
+                                (char)((unsigned long)cv >> (8 * b));
+                    }
+                    s->sbytes = bytes;
+                    s->ninits = 0;
+                }
                 if (s->expr && s->expr->kind != EXPR_STR &&
                     !const_fold(s->expr, &sval))
                     diag_fatal(u->file, s->line,
@@ -886,7 +1003,11 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 g->is_static = 1;
                 g->defined = 1;
                 g->used = 1;
-                if (s->expr && s->expr->kind == EXPR_STR) {
+                if (s->sbytes) {
+                    g->init_bytes = s->sbytes;
+                    g->init_len = ty_size(s->dty);
+                    g->has_init = 1;
+                } else if (s->expr && s->expr->kind == EXPR_STR) {
                     g->init_bytes = s->expr->name;
                     g->init_len = (int)s->expr->num;
                     g->has_init = 1;
@@ -900,18 +1021,17 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 *gt = g;
                 s->sglob = g;
                 s->expr = NULL;   /* the data, not code, carries it */
-                if (scope_find(sc, s->name) >= 0)
+                if (scope_find_here(sc, s->name) >= 0)
                     diag_fatal(u->file, s->line,
-                               "'%s' is already declared in '%s'",
-                               s->name, f->name);
+                               "'%s' is already declared in this block",
+                               s->name);
                 s->var_index = scope_add(sc, s->name, s->dty, g);
                 break;
             }
-            if (scope_find(sc, s->name) >= 0)
+            if (scope_find_here(sc, s->name) >= 0)
                 diag_fatal(u->file, s->line,
-                           "'%s' is already declared in '%s' (one flat "
-                           "scope per function for now — rename it)",
-                           s->name, f->name);
+                           "'%s' is already declared in this block",
+                           s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
             break;
         case STMT_RETURN:
@@ -946,7 +1066,11 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             need_scalar(u, s->cond, "'while'");
             check_stmt(u, f, sc, s->body, 1, in_switch, 0);
             break;
-        case STMT_FOR:
+        case STMT_FOR: {
+            /* `for (int i = ...)` scopes i to the loop, so sibling
+             * loops may each declare their own. */
+            int mark = sc->n, prev = sc->block_start;
+            sc->block_start = mark;
             if (s->initdecl)
                 check_stmt(u, f, sc, s->initdecl, in_loop, in_switch, 0);
             if (s->init)
@@ -958,19 +1082,53 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             if (s->step)
                 check_expr(u, f, sc, s->step);
             check_stmt(u, f, sc, s->body, 1, in_switch, 0);
+            for (int i = mark; i < sc->n; i++)
+                sc->vars[i].active = 0;
+            sc->block_start = prev;
             break;
-        case STMT_BLOCK:
+        }
+        case STMT_BLOCK: {
+            int mark = sc->n, prev = sc->block_start;
+            sc->block_start = mark;
             check_stmt(u, f, sc, s->body, in_loop, in_switch, 0);
+            for (int i = mark; i < sc->n; i++)
+                sc->vars[i].active = 0; /* the block closed */
+            sc->block_start = prev;
             break;
+        }
         }
     }
 }
 
-/* Conservative all-paths-return: a list returns if any statement in it
- * guarantees a return; if/else guarantees one only when both arms do;
- * loops never do. Refusing a maybe-missing return is honest —
- * miscompiling one is not (THE RULE). */
+/* Conservative all-paths-return. Refusing a maybe-missing return is
+ * honest; miscompiling one is not (THE RULE) — but "conservative" must
+ * not mean "wrong about ordinary code", so switch and infinite loops
+ * are analysed rather than assumed to fall through. */
 static int list_returns(struct stmt *s);
+
+/* Does a break leave THIS construct? Breaks inside a nested loop or
+ * switch belong to that one, so they do not count. */
+static int has_own_break(struct stmt *s)
+{
+    for (; s; s = s->next) {
+        switch (s->kind) {
+        case STMT_BREAK:
+            return 1;
+        case STMT_BLOCK:
+            if (has_own_break(s->body))
+                return 1;
+            break;
+        case STMT_IF:
+            if (has_own_break(s->thn) ||
+                (s->els && has_own_break(s->els)))
+                return 1;
+            break;
+        default:
+            break; /* a nested loop/switch captures its own breaks */
+        }
+    }
+    return 0;
+}
 
 static int stmt_returns(struct stmt *s)
 {
@@ -981,6 +1139,36 @@ static int stmt_returns(struct stmt *s)
         return list_returns(s->body);
     case STMT_IF:
         return s->els && stmt_returns(s->thn) && stmt_returns(s->els);
+    case STMT_SWITCH: {
+        /* Sound: with a default every value matches something, and with
+         * no break the only way out is falling off the end — which the
+         * last statement returning rules out. Anything reached earlier
+         * either returns or falls through toward it. */
+        struct stmt *list = switch_stmts(s->body);
+        int has_default = 0;
+        struct stmt *last = NULL;
+        for (struct stmt *a = list; a; a = a->next) {
+            if (a->kind == STMT_DEFAULT)
+                has_default = 1;
+            last = a;
+        }
+        if (!has_default || has_own_break(list) || !last)
+            return 0;
+        return stmt_returns(last);
+    }
+    case STMT_FOR:
+        /* `for (;;)` with no break of its own never exits normally. */
+        return !s->cond && !has_own_break(s->body);
+    case STMT_WHILE: {
+        long v;
+        return const_fold(s->cond, &v) && v != 0 &&
+               !has_own_break(s->body);
+    }
+    case STMT_DO: {
+        long v;
+        return (const_fold(s->cond, &v) && v != 0 &&
+                !has_own_break(s->body)) || stmt_returns(s->body);
+    }
     default:
         return 0;
     }
@@ -996,7 +1184,7 @@ static int list_returns(struct stmt *s)
 
 static void check_func(struct unit *u, struct func *f)
 {
-    struct scope sc = { 0, 0, 0 };
+    struct scope sc = { 0, 0, 0, 0 };
 
     for (int i = 0; i < f->nparams; i++) {
         if (scope_find(&sc, f->params[i]) >= 0)
@@ -1009,7 +1197,7 @@ static void check_func(struct unit *u, struct func *f)
     check_stmt(u, f, &sc, f->body, 0, 0, 0);
 
     if (f->ret_ty->kind != TY_VOID && !list_returns(f->body))
-        diag_fatal(u->file, f->line,
+        diag_fatal(f->file ? f->file : u->file, f->line,
                    "control may reach the end of '%s' — every path must "
                    "end in a return statement", f->name);
 

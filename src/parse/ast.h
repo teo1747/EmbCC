@@ -22,7 +22,7 @@ enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
-                 EXPR_COMPOUND };
+                 EXPR_COMPOUND, EXPR_INITLIST };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -65,6 +65,16 @@ struct expr {
     int nargs;
     struct func *callee;  /* EXPR_CALL: direct target (sema), or NULL
                            * for a call through a function pointer */
+    struct expr **elems;  /* EXPR_INITLIST */
+    int nelems;
+};
+
+/* An aggregate initializer, flattened by sema into (offset, type,
+ * value) triples so irgen never has to re-walk the type. */
+struct initelem {
+    int off;
+    struct type *ty;
+    struct expr *e;
 };
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
@@ -77,6 +87,9 @@ struct stmt {
     const char *name;     /* STMT_DECL */
     struct type *dty;     /* STMT_DECL: declared type */
     int is_static;        /* STMT_DECL: a static local -> its own global */
+    struct initelem *inits; /* STMT_DECL: flattened aggregate init */
+    int ninits;
+    const char *sbytes;   /* STMT_DECL: a static local's constant bytes */
     struct global *sglob; /* STMT_DECL: the global a static local became */
     int var_index;        /* STMT_DECL: set by sema */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
@@ -100,6 +113,8 @@ struct stmt {
  * program we accept means the same thing to gcc). */
 struct global {
     const char *name;
+    const char *file;     /* where THIS declaration was written — a
+                           * header, usually, and not the unit's name */
     int line;
     int seq;              /* source order, shared counter with funcs —
                            * enforces declare-before-use across kinds */
@@ -122,6 +137,7 @@ struct global {
 
 struct func {
     const char *name;
+    const char *file;     /* see struct global */
     int line;
     int seq;              /* source order (see struct global) */
     int is_static;

@@ -351,6 +351,20 @@ static void gen_func(struct ir_func *fn, struct code *text,
             }
             break;
         }
+        case IR_MEMZERO: {
+            x86_load_slot(text, sd[i->a], 8, 0, 8);
+            x86_mov_reg_reg(text, REG_RCX, REG_RAX);
+            x86_mov_eax_imm(text, 0, 8);
+            int off = 0;
+            while (off < i->size) {
+                int chunk = i->size - off;
+                chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4
+                      : chunk >= 2 ? 2 : 1;
+                x86_store_mem_reg(text, REG_RCX, off, REG_RAX, chunk);
+                off += chunk;
+            }
+            break;
+        }
         case IR_LABEL:
             label_off[i->label] = text->len;
             break;
@@ -383,19 +397,27 @@ static void gen_func(struct ir_func *fn, struct code *text,
             /* MEMORY-class aggregates go to the outgoing area first,
              * while rax/rcx/rdx are still free to copy with. */
             for (int k = 0; k < i->nargs; k++) {
-                if (!i->argv[k].is_struct || i->argv[k].nclass != 0)
+                struct ir_arg *a = &i->argv[k];
+                if (!a->on_stack)
                     continue;
-                x86_load_slot(text, sd[i->argv[k].vreg], 8, 0, 8);
+                if (!a->is_struct) {
+                    /* a scalar that ran out of registers: its slot
+                     * already holds the value, extended to 8 bytes */
+                    x86_load_slot(text, sd[a->vreg], 8, 0, 8);
+                    x86_store_mem_reg(text, REG_RSP, a->stk_off,
+                                      REG_RAX, 8);
+                    continue;
+                }
+                x86_load_slot(text, sd[a->vreg], 8, 0, 8);
                 x86_mov_reg_reg(text, REG_RDX, REG_RAX); /* src */
-                int sz = i->argv[k].size;
+                int sz = a->size;
                 for (int off = 0; off < sz; ) {
                     int chunk = sz - off;
                     chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4
                           : chunk >= 2 ? 2 : 1;
                     x86_load_reg_mem(text, REG_RAX, REG_RDX, off, chunk);
                     x86_store_mem_reg(text, REG_RSP,
-                                      i->argv[k].stk_off + off, REG_RAX,
-                                      chunk);
+                                      a->stk_off + off, REG_RAX, chunk);
                     off += chunk;
                 }
             }
@@ -408,9 +430,9 @@ static void gen_func(struct ir_func *fn, struct code *text,
             }
             for (int k = 0; k < i->nargs; k++) {
                 struct ir_arg *a = &i->argv[k];
+                if (a->on_stack)
+                    continue; /* placed above */
                 if (a->is_struct) {
-                    if (a->nclass == 0)
-                        continue; /* already on the stack */
                     x86_load_slot(text, sd[a->vreg], 8, 0, 8);
                     for (int q = 0; q < a->nclass; q++) {
                         if (a->cls[q] == CLASS_SSE)
@@ -533,6 +555,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
     }
+
+    /* Every function ends with an epilogue, whether or not its last
+     * statement was a return. A void function may legally fall off the
+     * end (sema only demands a return from value-returning ones), and
+     * without this it fell straight into the NEXT function's code —
+     * silently, since nothing crashes until a stray ret runs. A dead
+     * `leave; ret` after an explicit return costs two bytes. */
+    x86_epilogue(text);
 
     for (int n = 0; n < nbrs; n++) {
         int target = label_off[brs[n].label];

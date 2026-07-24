@@ -26,6 +26,15 @@ struct Small gcc_mk_small(int a, int b);
 struct Mixed gcc_mk_mixed(long n, double d);
 struct Big gcc_mk_big(long base);
 long gcc_offset(int p, double q, struct Mixed m, int r);
+/* more arguments than SysV has registers: the tail goes on the stack,
+   and the two register files run out independently */
+long gcc_many(long a, long b, long c, long d, long e, long f,
+              long g, long h, long i);
+double gcc_manyf(double a, double b, double c, double d, double e,
+                 double f, double g, double h, double i, double j);
+long gcc_mixed_overflow(long a, double b, long c, double d, long e,
+                        double f, long g, double h, long i, long j,
+                        struct Small s);
 EOF
 
 # --- the GCC half: it defines, EmbCC calls ---
@@ -43,6 +52,20 @@ struct Big gcc_mk_big(long base) {
 }
 long gcc_offset(int p, double q, struct Mixed m, int r) {
     return p + (long)q + m.n + (long)m.d + r;
+}
+long gcc_many(long a, long b, long c, long d, long e, long f,
+              long g, long h, long i) {
+    return a + b + c + d + e + f + g + h + i;
+}
+double gcc_manyf(double a, double b, double c, double d, double e,
+                 double f, double g, double h, double i, double j) {
+    return a + b + c + d + e + f + g + h + i + j;
+}
+long gcc_mixed_overflow(long a, double b, long c, double d, long e,
+                        double f, long g, double h, long i, long j,
+                        struct Small s) {
+    return a + (long)b + c + (long)d + e + (long)f + g + (long)h + i + j
+           + s.a + s.b;
 }
 EOF
 
@@ -76,6 +99,13 @@ int main(void) {
     /* and hand gcc's returned structs straight back to gcc */
     if (gcc_small(rs) != 42) return 10;
     if (gcc_big(rb) != 42) return 11;
+    /* stack arguments: nine integers (six fit, three spill) */
+    if (gcc_many(1,2,3,4,5,6,7,8,6) != 42) return 12;
+    /* ten doubles: eight fit in xmm0-7, two spill */
+    if (gcc_manyf(1,2,3,4,5,6,7,8,9,-3) != 42.0) return 13;
+    /* both files overflowing at once, with an aggregate last */
+    struct Small ss; ss.a = 1; ss.b = 2;
+    if (gcc_mixed_overflow(1,2,3,4,5,6,7,8,9,-6, ss) != 42) return 14;
     printf("cross-abi ok\n");
     return gcc_small(rs);
 }

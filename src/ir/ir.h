@@ -53,6 +53,7 @@ enum ir_op {
     IR_LABEL, /* label: (id in `label`) */
     IR_JMP,   /* goto label */
     IR_MEMCPY,/* copy `size` bytes: *(addr a) <- *(addr b) */
+    IR_MEMZERO,/* zero `size` bytes at (addr a) */
     IR_BRZ,   /* if (a == 0) goto label  (w) */
     IR_BRNZ   /* if (a != 0) goto label  (w) */
 };
@@ -82,7 +83,8 @@ struct ir_ins {
         int size;            /* struct size, or the scalar's width */
         int nclass;          /* eightbyte count; 0 = MEMORY (stack) */
         enum arg_class cls[2];
-        int stk_off;         /* MEMORY args: offset in the outgoing area */
+        int on_stack;        /* no registers left (or MEMORY class) */
+        int stk_off;         /* offset in the outgoing area */
     } argv[MAX_PARAMS];
     int nargs;
     /* IR_CALL returning a struct: its size, classification, and the

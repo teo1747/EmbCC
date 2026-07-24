@@ -292,15 +292,22 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
             return i->dst;
         }
         if (ty_is_float(to)) {
-            /* int -> float. The source slot already holds the value
-             * extended to 64 bits (loads extend), so converting from
-             * the 64-bit form is exact for every signed type AND for
-             * unsigned int — which is why only unsigned long needs the
-             * refusal sema issues. */
+            /* int -> float, and the source WIDTH matters: a 32-bit
+             * operation zero-extends its result into the 8-byte slot
+             * regardless of signedness, so a negative int read back as
+             * 64 bits is 2^32 too large. Read a signed 32-bit source as
+             * 32 bits and let cvtsi2sd interpret the sign; read an
+             * unsigned int as 64, where the zero extension IS the value
+             * (which is what makes it exact). unsigned long is refused
+             * by sema — SSE2 cannot do it. */
+            int srcw = 4;
+            if (ty_wide(from) ||
+                (from->is_unsigned && ty_size(from) == 4))
+                srcw = 8;
             i = emit(fn);
             i->op = IR_I2F;
             i->a = v;
-            i->size = 8;
+            i->size = srcw;
             i->sign = 1;
             i->w = tsize;
             i->dst = new_temp(fn);
@@ -493,6 +500,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return gen_addr(fn, e->rhs);
     case EXPR_CAST: {
         int v = gen_expr(fn, e->rhs);
+        if (e->ty->kind == TY_VOID)
+            return v; /* evaluated for its effect; the value is dropped */
         return gen_convert(fn, v, e->rhs->ty, e->ty);
     }
     case EXPR_SIZEOF:
@@ -631,6 +640,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     case EXPR_COMMA:
         gen_expr(fn, e->lhs); /* for side effects */
         return gen_expr(fn, e->rhs);
+    case EXPR_INITLIST:
+        break; /* consumed by sema's flattening; never evaluated */
     case EXPR_COMPOUND: {
         /* the address is computed ONCE — the whole reason this is not
          * desugared to `x = x op y` */
@@ -712,17 +723,42 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
          * are assigned offsets in this call's outgoing area, and the
          * function's frame reserves the widest such area. */
         int stk = 0;
+        int ireg = 0, freg = 0;
+        /* a hidden return pointer consumes rdi before anything else */
+        if (e->ty->kind == TY_STRUCT) {
+            enum arg_class rc[2];
+            if (ty_classify(e->ty, rc) == 0)
+                ireg = 1;
+        }
         for (int k = 0; k < e->nargs; k++) {
             struct type *at = e->args[k]->ty;
-            i->argv[k].vreg = args[k];
-            i->argv[k].is_struct = at->kind == TY_STRUCT;
-            i->argv[k].size = ty_size(at);
-            i->argv[k].nclass = ty_classify(at, i->argv[k].cls);
-            i->argv[k].stk_off = 0;
-            if (i->argv[k].nclass == 0) { /* MEMORY: goes on the stack */
+            struct ir_arg *ar = &i->argv[k];
+            ar->vreg = args[k];
+            ar->is_struct = at->kind == TY_STRUCT;
+            ar->size = ty_size(at);
+            ar->nclass = ty_classify(at, ar->cls);
+            ar->stk_off = 0;
+            ar->on_stack = 0;
+
+            /* SysV: an argument goes on the stack when its class has no
+             * registers left for ALL of its eightbytes — the decision is
+             * made here so codegen only follows it, and the two cannot
+             * drift apart. */
+            int ni = 0, nf = 0;
+            for (int q = 0; q < ar->nclass; q++) {
+                if (ar->cls[q] == CLASS_SSE)
+                    nf++;
+                else
+                    ni++;
+            }
+            if (ar->nclass == 0 || ireg + ni > 6 || freg + nf > 8) {
+                ar->on_stack = 1;
                 stk = (stk + 7) & ~7;
-                i->argv[k].stk_off = stk;
-                stk += (ty_size(at) + 7) & ~7;
+                ar->stk_off = stk;
+                stk += (ar->size + 7) & ~7;
+            } else {
+                ireg += ni;
+                freg += nf;
             }
         }
         if (stk > fn->outgoing_bytes)
@@ -764,6 +800,38 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
         case STMT_DECL:
             if (s->sglob)
                 break; /* a static local IS its global; no code here */
+            if (s->ninits) {
+                /* C zero-fills whatever the initializer does not
+                 * mention, so clear the object first and then place
+                 * the listed values. */
+                struct ir_ins *ad = emit(fn);
+                ad->op = IR_ADDR;
+                ad->a = s->var_index;
+                ad->dst = new_temp(fn);
+                int base = ad->dst;
+                struct ir_ins *z = emit(fn);
+                z->op = IR_MEMZERO;
+                z->a = base;
+                z->size = ty_size(s->dty);
+                for (int k = 0; k < s->ninits; k++) {
+                    int v = gen_expr(fn, s->inits[k].e);
+                    int at = base;
+                    if (s->inits[k].off) {
+                        int o = emit_const(fn, s->inits[k].off, 8);
+                        at = emit_bin(fn, IR_ADD, base, o, 8, 1);
+                    }
+                    if (s->inits[k].ty->kind == TY_STRUCT) {
+                        struct ir_ins *m = emit(fn);
+                        m->op = IR_MEMCPY;
+                        m->a = at;
+                        m->b = v;
+                        m->size = ty_size(s->inits[k].ty);
+                    } else {
+                        emit_store(fn, at, v, s->inits[k].ty);
+                    }
+                }
+                break;
+            }
             if (s->expr) {
                 int v = gen_expr(fn, s->expr);
                 if (s->dty->kind == TY_STRUCT) {

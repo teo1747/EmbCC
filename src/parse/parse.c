@@ -939,6 +939,37 @@ static struct stmt *new_stmt(enum stmt_kind kind, int line)
 
 static struct stmt *parse_stmt(struct parser *ps, int allow_decl);
 
+/* An initializer: either an ordinary expression or a brace list, which
+ * may nest. Sema matches it against the target type. */
+static struct expr *parse_initializer(struct parser *ps)
+{
+    if (cur(ps)->kind != TOK_LBRACE)
+        return parse_expr(ps);
+
+    struct expr *e = new_expr(EXPR_INITLIST, cur(ps)->line);
+    int cap = 0;
+    advance(ps);
+    while (cur(ps)->kind != TOK_RBRACE) {
+        if (cur(ps)->kind == TOK_EOF)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "unterminated initializer");
+        if (cur(ps)->kind == TOK_DOT || cur(ps)->kind == TOK_LBRACKET)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "designated initializers are not supported yet");
+        if (e->nelems == cap) {
+            cap = cap ? cap * 2 : 8;
+            e->elems = xrealloc(e->elems,
+                                (size_t)cap * sizeof *e->elems);
+        }
+        e->elems[e->nelems++] = parse_initializer(ps);
+        if (cur(ps)->kind != TOK_COMMA)
+            break;
+        advance(ps); /* a trailing comma before '}' is legal C */
+    }
+    expect(ps, TOK_RBRACE, "'}'");
+    return e;
+}
+
 /* The statement controlled by if/while/for: C99 does not allow a bare
  * declaration there, and neither do we — that keeps the subset strict. */
 static struct stmt *parse_controlled(struct parser *ps)
@@ -998,24 +1029,16 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             s->name = dname;
             s->is_static = local_static;
             int was_array = s->dty->kind == TY_ARRAY;
-            if (was_array && cur(ps)->kind == TOK_ASSIGN) {
-                /* the one array initializer that matters here:
-                 * char buf[] = "..." (and char buf[N] = "...") */
-                advance(ps);
-                if (cur(ps)->kind != TOK_STR)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
-                               "only string literals may initialize an "
-                               "array");
-                s->expr = parse_primary(ps);
-            }
+            (void)was_array;
             if (cur(ps)->kind == TOK_ASSIGN) {
                 advance(ps);
-                s->expr = parse_expr(ps);
+                s->expr = parse_initializer(ps);
             }
             /* checked AFTER the initializer, because `char a[] = "..."`
              * takes its size from the literal */
-            if (ty_size(s->dty) == 0 &&
-                !(s->expr && s->expr->kind == EXPR_STR))
+            /* an omitted array size is filled in by sema from the
+             * initializer, so only an UNINITIALIZED one is incomplete */
+            if (ty_size(s->dty) == 0 && !s->expr)
                 diag_fatal(ps->lx.file, s->line,
                            "'%s' has incomplete type %s", s->name,
                            ty_name(s->dty));
@@ -1163,6 +1186,7 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
 {
     struct global *g = xcalloc(1, sizeof *g);
     g->name = name;
+    g->file = ps->lx.file;
     g->line = line;
     g->is_static = is_static;
     g->is_extern = is_extern;
@@ -1306,6 +1330,7 @@ static void parse_top(struct parser *ps, struct unit *u,
     f->is_static = is_static;
     f->ret_ty = ty;
     f->name = name;
+    f->file = ps->lx.file;
     f->line = line;
     f->seq = seq;
     advance(ps); /* '(' */
