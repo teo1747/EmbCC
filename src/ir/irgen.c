@@ -856,6 +856,121 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     return -1; /* unreachable; every kind returns above */
 }
 
+/* Assemble an extended-asm template into machine bytes, now that every
+ * operand has a register (opregs[N] is the register of %N — outputs first,
+ * then inputs, as gcc numbers them). EmbCC has no general text assembler,
+ * only the small vocabulary real low-level userland C needs: `int $imm`
+ * (the syscall trap), `cpuid`, `rdrand %N`, and `setc %N`. Anything else is
+ * refused loudly (THE RULE). */
+static void asm_assemble(struct ir_func *fn, struct stmt *s,
+                         const int *opregs, int nops, struct ir_asm *ia)
+{
+    const char *file = fn->src->file;
+    int line = s->line;
+    const char *tmpl = s->asm_s->tmpl;
+    unsigned char *code = NULL;
+    int n = 0, cap = 0;
+    const char *p = tmpl;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
+               *p == ';')
+            p++;
+        if (!*p)
+            break;
+        const char *m = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+               *p != ';')
+            p++;
+        int mlen = (int)(p - m);
+        while (*p == ' ' || *p == '\t')
+            p++;
+
+        /* one operand reg for the instructions that take a %N */
+        int reg = -1;
+        if (*p == '%' && p[1] >= '0' && p[1] <= '9') {
+            p++;
+            int idx = 0;
+            while (*p >= '0' && *p <= '9')
+                idx = idx * 10 + (*p++ - '0');
+            if (idx >= nops)
+                diag_fatal(file, line,
+                           "asm operand %%%d out of range in \"%s\"",
+                           idx, tmpl);
+            reg = opregs[idx];
+        }
+
+        if (n + 4 > cap) {
+            cap = cap ? cap * 2 : 16;
+            code = xrealloc(code, (size_t)cap);
+        }
+        if (mlen == 3 && strncmp(m, "int", 3) == 0) {
+            if (*p != '$')
+                diag_fatal(file, line, "asm 'int' wants $vector: \"%s\"",
+                           tmpl);
+            p++;
+            long imm = 0;
+            int base = 10;
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+                base = 16;
+                p += 2;
+            }
+            for (; ; p++) {
+                int d;
+                if (*p >= '0' && *p <= '9') d = *p - '0';
+                else if (base == 16 && *p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+                else if (base == 16 && *p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+                else break;
+                imm = imm * base + d;
+            }
+            if (imm < 0 || imm > 255)
+                diag_fatal(file, line, "asm 'int' vector %ld out of range",
+                           imm);
+            code[n++] = 0xcd;
+            code[n++] = (unsigned char)imm;
+        } else if (mlen == 5 && strncmp(m, "cpuid", 5) == 0) {
+            code[n++] = 0x0f;
+            code[n++] = 0xa2;
+        } else if (mlen == 6 && strncmp(m, "rdrand", 6) == 0) {
+            if (reg < 0)
+                diag_fatal(file, line, "asm 'rdrand' wants %%N: \"%s\"", tmpl);
+            code[n++] = (unsigned char)(0x48 | (reg >= 8 ? 1 : 0)); /* REX.W(.B) */
+            code[n++] = 0x0f;
+            code[n++] = 0xc7;
+            code[n++] = (unsigned char)(0xf0 | (reg & 7));          /* /6 */
+        } else if (mlen == 4 && strncmp(m, "setc", 4) == 0) {
+            if (reg < 0)
+                diag_fatal(file, line, "asm 'setc' wants %%N: \"%s\"", tmpl);
+            if (reg >= 4)  /* REX to name spl/bpl/sil/dil or r8b.. as a byte */
+                code[n++] = (unsigned char)(0x40 | (reg >= 8 ? 1 : 0));
+            code[n++] = 0x0f;
+            code[n++] = 0x92;
+            code[n++] = (unsigned char)(0xc0 | (reg & 7));          /* /0 */
+        } else {
+            diag_fatal(file, line,
+                       "asm instruction \"%.*s\" not supported "
+                       "(EmbCC assembles int/cpuid/rdrand/setc)", mlen, m);
+        }
+    }
+    ia->code = code;
+    ia->codelen = n;
+}
+
+/* Assign a free register to an operand whose constraint is allocatable
+ * (reg == -2). The pool prefers the low, byte-addressable registers so a
+ * setc destination needs no REX. */
+static int asm_alloc_reg(int *used, const char *file, int line)
+{
+    static const int pool[] = { 0, 1, 2, 3, 6, 7, 8, 9, 10, 11 };
+    for (unsigned i = 0; i < sizeof pool / sizeof pool[0]; i++)
+        if (!used[pool[i]]) {
+            used[pool[i]] = 1;
+            return pool[i];
+        }
+    diag_fatal(file, line, "asm: out of registers for the operands");
+    return -1;
+}
+
 /* Innermost enclosing loop's exit and continue targets; sema already
  * rejected break/continue outside any loop. */
 struct loopctx {
@@ -933,22 +1048,42 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
         case STMT_ASM: {
             struct asm_stmt *a = s->asm_s;
             struct ir_asm *ia = xcalloc(1, sizeof *ia);
-            ia->code = a->code;
-            ia->codelen = a->codelen;
             ia->nin = a->nin;
             ia->nout = a->nout;
             ia->in = xcalloc((size_t)(a->nin ? a->nin : 1), sizeof *ia->in);
             ia->out = xcalloc((size_t)(a->nout ? a->nout : 1),
                               sizeof *ia->out);
-            /* An input carries its VALUE; an output the ADDRESS of its
-             * lvalue. Registers were resolved by sema. */
+            /* Assign registers: fixed ones (from sema) reserve their slot;
+             * allocatable ones (-2) get a free register. Then %N substitution
+             * numbers outputs first, then inputs, exactly as gcc does. */
+            int used[16] = { 0 };
+            for (int i = 0; i < a->nout; i++)
+                if (a->out[i].reg >= 0) used[a->out[i].reg] = 1;
+            for (int i = 0; i < a->nin; i++)
+                if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
+            int opregs[2 * MAX_PARAMS], nops = 0;
+            for (int i = 0; i < a->nout; i++) {
+                int r = a->out[i].reg;
+                if (r == -2)
+                    r = asm_alloc_reg(used, fn->src->file, s->line);
+                ia->out[i].reg = r;
+                opregs[nops++] = r;
+            }
             for (int i = 0; i < a->nin; i++) {
-                ia->in[i].reg = a->in[i].reg;
+                int r = a->in[i].reg;
+                if (r == -2)
+                    r = asm_alloc_reg(used, fn->src->file, s->line);
+                ia->in[i].reg = r;
+                opregs[nops++] = r;
+            }
+            asm_assemble(fn, s, opregs, nops, ia);
+            /* An input carries its VALUE; an output the ADDRESS of its
+             * lvalue. */
+            for (int i = 0; i < a->nin; i++) {
                 ia->in[i].temp = gen_expr(fn, a->in[i].expr);
                 ia->in[i].size = 8;
             }
             for (int i = 0; i < a->nout; i++) {
-                ia->out[i].reg = a->out[i].reg;
                 ia->out[i].temp = gen_addr(fn, a->out[i].expr);
                 ia->out[i].size = ty_size(a->out[i].expr->ty);
             }

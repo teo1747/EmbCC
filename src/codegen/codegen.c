@@ -570,11 +570,23 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                  sd[ia->in[k].temp], 8);
             for (int k = 0; k < ia->codelen; k++)
                 code_byte(text, ia->code[k]);
+            /* The address scratch must not be an OUTPUT register, or loading
+             * it would clobber a result before it is stored (e.g. cpuid's
+             * four a/b/c/d outputs). Pick one free of every operand. */
+            int used16[16] = { 0 };
+            for (int k = 0; k < ia->nin; k++)
+                used16[ia->in[k].reg] = 1;
+            for (int k = 0; k < ia->nout; k++)
+                used16[ia->out[k].reg] = 1;
+            int scr = -1;
+            static const int scr_pool[] = { REG_RCX, REG_RDX, REG_RSI,
+                                            REG_RDI, 8, 9, 10, 11 };
+            for (unsigned p = 0; p < sizeof scr_pool / sizeof scr_pool[0]; p++)
+                if (!used16[scr_pool[p]]) { scr = scr_pool[p]; break; }
             for (int k = 0; k < ia->nout; k++) {
-                int scratch = ia->out[k].reg == REG_RCX ? REG_RDX : REG_RCX;
-                x86_load_reg_mem(text, scratch, REG_RBP,
+                x86_load_reg_mem(text, scr, REG_RBP,
                                  sd[ia->out[k].temp], 8);
-                x86_store_mem_reg(text, scratch, 0, ia->out[k].reg,
+                x86_store_mem_reg(text, scr, 0, ia->out[k].reg,
                                   ia->out[k].size);
             }
             break;

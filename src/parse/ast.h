@@ -121,8 +121,6 @@ struct asm_stmt {
     struct asm_operand *in;
     int nin;
     int is_volatile;
-    unsigned char code[16]; /* the assembled template bytes (sema) */
-    int codelen;
 };
 
 struct stmt {

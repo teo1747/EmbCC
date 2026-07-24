@@ -60,3 +60,25 @@ echo "$sd" | grep -q 'e8 00 00 00 00'       || { echo "MISSING: call rel32 (e8 0
 echo "$sr" | grep -qE 'R_X86_64_PLT32 +start_c' || { echo "MISSING: PLT32 to start_c"; f2=1; }
 echo "$sd" | grep -q 'e9 fb ff ff ff'       || { echo "MISSING: jmp 1b (e9 fb ff ff ff)"; f2=1; }
 [ "$f2" -eq 0 ] && echo "file-scope asm: _start stub correct" || exit 1
+
+# Advanced inline asm: cpuid (fixed a/b/c/d), and rdrand/setc with %-operand
+# substitution + general 'r'/'qm' register allocation (syscalls.c's RNG path).
+cat > "$out/adv.c" <<'CEOF'
+typedef unsigned int u32;
+typedef unsigned long u64;
+void cid(u32 *a, u32 *b, u32 *c, u32 *d) {
+    __asm__ volatile("cpuid" : "=a"(*a),"=b"(*b),"=c"(*c),"=d"(*d)
+                             : "a"(1u),"c"(0u));
+}
+int rd(u64 *o) { unsigned char ok;
+    __asm__ volatile("rdrand %0; setc %1" : "=r"(*o),"=qm"(ok) :: "cc");
+    return ok;
+}
+CEOF
+"$EMBCC" -c "$out/adv.c" -o "$out/adv.o" || { echo "embcc failed on adv asm"; exit 1; }
+ad=$(objdump -d "$out/adv.o" 2>/dev/null)
+f3=0
+echo "$ad" | grep -q '0f a2'          || { echo "MISSING: cpuid (0f a2)"; f3=1; }
+echo "$ad" | grep -q '48 0f c7 f0'    || { echo "MISSING: rdrand %rax (48 0f c7 f0)"; f3=1; }
+echo "$ad" | grep -q '0f 92 c1'       || { echo "MISSING: setc %cl (0f 92 c1)"; f3=1; }
+[ "$f3" -eq 0 ] && echo "advanced asm: cpuid/rdrand/setc + %-subst correct" || exit 1

@@ -1035,12 +1035,25 @@ static int asm_reg_by_name(const char *n)
     return -1;
 }
 
-/* The fixed register a constraint pins its operand to (0-15). Output
- * constraints carry a leading '=' (write) or '+' (read-write); '&'
- * (earlyclobber) is accepted and ignored. EmbCC supports the fixed-register
- * letters a/b/c/d/S/D and 'r' bound through a register-asm variable
- * (`register T x __asm__("r10")`) — enough for the int-$0x80 syscall stubs;
- * general 'r' allocation is a seam left open. */
+/* Map a fixed-register constraint letter to its register (0-15), else -1. */
+static int asm_fixed_letter(char c)
+{
+    switch (c) {
+    case 'a': return 0;
+    case 'b': return 3;
+    case 'c': return 1;
+    case 'd': return 2;
+    case 'S': return 6;
+    case 'D': return 7;
+    }
+    return -1;
+}
+
+/* The register a constraint pins its operand to: a fixed one for a/b/c/d/S/D,
+ * the bound register of a `register T x __asm__("r10")` variable, or the
+ * sentinel -2 for an allocatable class (r/q/g/m/R) that irgen assigns from a
+ * free register. Output constraints carry a leading '=' or '+'; '&' is
+ * accepted and ignored. */
 static int asm_resolve_reg(struct unit *u, struct stmt *s,
                            struct asm_operand *op, int is_out)
 {
@@ -1051,73 +1064,24 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
                    "(got \"%s\")", op->constraint);
     while (*c == '=' || *c == '+' || *c == '&')
         c++;
-    switch (*c) {
-    case 'a': return 0;
-    case 'b': return 3;
-    case 'c': return 1;
-    case 'd': return 2;
-    case 'S': return 6;
-    case 'D': return 7;
-    case 'r': {
-        /* 'r' must name a register-asm variable so EmbCC knows WHICH
-         * register — it does no general register allocation. */
-        if (op->expr->kind == EXPR_VAR && op->expr->asm_reg) {
-            int r = asm_reg_by_name(op->expr->asm_reg);
-            if (r >= 0)
-                return r;
-        }
-        diag_fatal(u->file, s->line,
-                   "asm 'r' constraint needs a register-asm variable "
-                   "(register T x __asm__(\"r10\")) — EmbCC does no general "
-                   "register allocation");
-        return -1;
+    for (const char *p = c; *p; p++) {           /* a fixed register wins */
+        int r = asm_fixed_letter(*p);
+        if (r >= 0)
+            return r;
     }
-    default:
-        diag_fatal(u->file, s->line,
-                   "asm constraint \"%s\" is not supported "
-                   "(EmbCC handles a/b/c/d/S/D and 'r' via a register-asm "
-                   "variable)", op->constraint);
-        return -1;
+    if (op->expr->kind == EXPR_VAR && op->expr->asm_reg) {
+        int r = asm_reg_by_name(op->expr->asm_reg);
+        if (r >= 0)
+            return r;
     }
-}
-
-/* Assemble the asm template into machine bytes. EmbCC has no general
- * text assembler; it recognizes the fixed vocabulary real low-level C
- * needs — today just `int $imm`, the EmbLinkOS syscall trap — and refuses
- * anything else loudly (THE RULE). Templates that need %0/%1 operand
- * substitution are not accepted; the syscall stubs bind operands through
- * constraints, so their template is operand-free. */
-static void asm_assemble_template(struct unit *u, struct stmt *s)
-{
-    const char *p = s->asm_s->tmpl;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-        p++;
-    if (p[0] == 'i' && p[1] == 'n' && p[2] == 't' &&
-        (p[3] == ' ' || p[3] == '\t')) {
-        p += 3;
-        while (*p == ' ' || *p == '\t')
-            p++;
-        if (*p == '$') {
-            char *end;
-            long imm = strtol(p + 1, &end, 0);
-            p = end;
-            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-                p++;
-            if (*p == '\0') {
-                if (imm < 0 || imm > 255)
-                    diag_fatal(u->file, s->line,
-                               "asm 'int' vector %ld out of range [0,255]",
-                               imm);
-                s->asm_s->code[0] = 0xcd;
-                s->asm_s->code[1] = (unsigned char)imm;
-                s->asm_s->codelen = 2;
-                return;
-            }
-        }
-    }
+    for (const char *p = c; *p; p++)             /* else allocate a register */
+        if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R')
+            return -2;
     diag_fatal(u->file, s->line,
-               "asm template instruction not supported: \"%s\" "
-               "(EmbCC assembles only 'int $imm')", s->asm_s->tmpl);
+               "asm constraint \"%s\" is not supported "
+               "(EmbCC handles a/b/c/d/S/D, 'r'/'q'/'g'/'m', and a "
+               "register-asm variable)", op->constraint);
+    return -1;
 }
 
 /* Declarations anywhere in the function share one flat scope, and
@@ -1309,7 +1273,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 check_expr(u, f, sc, a->in[i].expr);
                 a->in[i].reg = asm_resolve_reg(u, s, &a->in[i], 0);
             }
-            asm_assemble_template(u, s);
+            /* the template is assembled in irgen, once -2 (allocatable)
+             * operands have been assigned registers */
             break;
         }
         case STMT_IF:

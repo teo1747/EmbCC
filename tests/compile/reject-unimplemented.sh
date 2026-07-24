@@ -302,14 +302,11 @@ echo "$err" | grep -q "linker is M3" || {
     echo "case nolink: wrong diagnostic:"; echo "$err"; exit 1; }
 echo "case nolink: refused with a diagnostic"
 check asm-bad-constraint \
-    'int main(void) { int x; __asm__("int $0x80" : "=q"(x)); return x; }' \
+    'int main(void) { int x; __asm__("int $0x80" : "=x"(x)); return x; }' \
     "is not supported"
 check asm-bad-template \
     'int main(void) { __asm__("nop"); return 0; }' \
     "not supported"
-check asm-r-needs-regvar \
-    'int main(void) { int x = 1; __asm__("int $0x80" : : "r"(x)); return 0; }' \
-    "register-asm variable"
 check asm-out-not-lvalue \
     'int main(void) { __asm__("int $0x80" : "=a"(1 + 2)); return 0; }' \
     "must be an lvalue"
