@@ -455,6 +455,8 @@ static void cmd_lines(struct img *m)
     }
 }
 
+static void print_source(const char *path, int line, int ctx);
+
 static void print_frame(struct img *m, unsigned long addr)
 {
     const struct func *f = func_at(m, addr);
@@ -506,10 +508,46 @@ static void cmd_where(struct img *m, int argc, char **argv)
     printf("0x%lx  ", addr);
     print_frame(m, addr);
     printf("\n");
+    const struct row *r = line_at(m, addr);
+    if (r) print_source(file_name(m, r->file), r->line, 2);
     const struct dfunc *d = dfunc_at(m, addr);
     if (!d) { printf("    (no scope info here)\n"); return; }
     printf("  in %s — %d variable(s) in scope:\n", d->name, d->nvars);
     list_vars(m, d);
+}
+
+/* Print a window of source around `line`, the current line marked. The path
+ * is DW_AT_name as EmbCC recorded it (the path given on its command line);
+ * open it relative to the cwd, and say so plainly if it is not reachable. */
+static void print_source(const char *path, int line, int ctx)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { printf("    (source '%s' not reachable from here)\n", path); return; }
+    char buf[1024];
+    int ln = 0;
+    while (fgets(buf, sizeof buf, f)) {
+        ln++;
+        if (ln > line + ctx) break;
+        if (ln >= line - ctx) {
+            buf[strcspn(buf, "\n")] = 0;
+            printf("  %s %4d | %s\n", ln == line ? "->" : "  ", ln, buf);
+        }
+    }
+    fclose(f);
+}
+
+/* Source-context view: symbolize the address, then show the source lines
+ * around it with the current line marked — the modern "you are here". */
+static void cmd_list(struct img *m, int argc, char **argv)
+{
+    if (argc < 1) die("list needs an address");
+    unsigned long addr = strtoul(argv[0], NULL, 0);
+    printf("0x%lx  ", addr);
+    print_frame(m, addr);
+    printf("\n");
+    const struct row *r = line_at(m, addr);
+    if (r) print_source(file_name(m, r->file), r->line, 2);
+    else   printf("    (no line info)\n");
 }
 
 static void cmd_info(struct img *m, int argc, char **argv)
@@ -535,7 +573,8 @@ int main(int argc, char **argv)
             "       embdbg FILE lines               the address->file:line table\n"
             "       embdbg FILE symbolize ADDR...   addr -> func+off  file:line\n"
             "       embdbg FILE backtrace ADDR...   symbolize a caller chain\n"
-            "       embdbg FILE where ADDR          addr + the locals in scope\n"
+            "       embdbg FILE where ADDR          source context + locals in scope\n"
+            "       embdbg FILE list ADDR           source lines around addr\n"
             "       embdbg FILE info FUNC           a function's params/locals\n");
         return 1;
     }
@@ -552,6 +591,7 @@ int main(int argc, char **argv)
     else if (strcmp(cmd, "symbolize") == 0) cmd_symbolize(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "backtrace") == 0) cmd_backtrace(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "where") == 0)     cmd_where(&m, argc - 3, argv + 3);
+    else if (strcmp(cmd, "list") == 0)      cmd_list(&m, argc - 3, argv + 3);
     else if (strcmp(cmd, "info") == 0)      cmd_info(&m, argc - 3, argv + 3);
     else { fprintf(stderr, "embdbg: unknown command '%s'\n", cmd); return 1; }
     return 0;

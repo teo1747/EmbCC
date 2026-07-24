@@ -35,6 +35,9 @@ if [ -n "$la" ]; then
     whr=$("$EMBDBG" "$out/w.o" where "$la")
     echo "$whr" | grep -qE "compute.*w\.c:3" || { echo "where didn't symbolize: $whr"; fail=1; }
     echo "$whr" | grep -qE "sum +@ rbp"      || { echo "where didn't list locals"; fail=1; }
+    # source-context view: the current line marked with -> and its actual text
+    echo "$whr" | grep -qE "\->.*int sum = a \+ b" \
+        || { echo "where didn't show marked source context"; fail=1; }
     echo "embdbg where $la:"; echo "$whr" | sed 's/^/  /'
 else
     echo "no line row for w.c:3"; fail=1
