@@ -1,13 +1,14 @@
 #!/bin/sh
-# The IR optimizer (src/opt). Three properties, each load-bearing:
+# The optimizer at -O1: the IR passes (src/opt) AND codegen's RAX residency
+# cache that elides redundant reloads. Three properties, each load-bearing:
 #
 #  1. -O0 is byte-for-byte the no-flag output. The self-host fixed point
 #     rests on this, so it is asserted here directly, not just assumed.
 #  2. -O1 preserves semantics. Every tests/exec program is recompiled at
 #     -O1 and must still produce its `// expect-exit` value — the same
 #     differential net the -O0 suite is, now over the optimized path.
-#  3. -O1 actually optimizes: a program full of foldable/dead/copy work
-#     compiles to a strictly smaller object than at -O0.
+#  3. -O1 actually optimizes: a program full of foldable/dead/copy work,
+#     plus store/reload traffic, compiles to a strictly smaller object.
 set -u
 echo "TEST-MARKER optimizer"
 
