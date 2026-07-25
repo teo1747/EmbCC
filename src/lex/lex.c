@@ -126,6 +126,16 @@ void lex_next(struct lexer *lx)
                          isdigit((unsigned char)scan[2])))) {
                 looks_float = 1;
             }
+        } else {
+            /* A hex float REQUIRES a binary exponent 'p'/'P' (C99 6.4.4.2):
+             * scan past the hex digits + an optional '.' and look for it, so
+             * 0x1.8p3 / 0x1p-4 lex as floats while 0x10 stays an integer.
+             * strtod below parses the hex-float form directly. */
+            scan = lx->p + 2;               /* past "0x" */
+            while (isxdigit((unsigned char)*scan) || *scan == '.')
+                scan++;
+            if (*scan == 'p' || *scan == 'P')
+                looks_float = 1;
         }
         if (looks_float) {
             char *fend;

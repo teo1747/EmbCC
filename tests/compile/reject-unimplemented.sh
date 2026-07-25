@@ -323,13 +323,6 @@ check topasm-global-no-label \
     '__asm__(".global ghost\n  ret\n");
 int main(void) { return 0; }' \
     "has no label"
-check va-arg-float \
-    'typedef char *va_list;
-int f(int n, ...) { va_list ap; __builtin_va_start(ap, n);
-     double d = __builtin_va_arg(ap, double); __builtin_va_end(ap);
-     return (int)d; }
-int main(void) { return f(1, 2.0); }' \
-    "floating type is not supported"
 check va-arg-struct \
     'typedef char *va_list;
 struct P { int x; int y; };

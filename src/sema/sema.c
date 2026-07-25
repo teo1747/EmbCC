@@ -575,10 +575,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "va_arg of a struct passed by value is not "
                        "supported yet");
-        if (ty_is_float(e->cast_ty))
-            diag_fatal(u->file, e->line,
-                       "va_arg of a floating type is not supported yet "
-                       "(EmbCC reads integer and pointer varargs)");
         e->ty = e->cast_ty;
         break;
     case EXPR_BINOP: {
@@ -821,6 +817,50 @@ static int const_fold(const struct expr *e, long *out)
     }
 }
 
+/* Fold a FLOATING constant expression to a double, for static initializers of
+ * float/double storage (`double g = 1.0/3.0;`). Integer leaves promote to
+ * double; a cast to an integer type truncates (C semantics), a cast to float
+ * rounds to single precision. Returns 0 (not constant) if it can't reduce. */
+static int const_fold_f(const struct expr *e, double *out)
+{
+    double a, b; long iv;
+    switch (e->kind) {
+    case EXPR_FNUM:
+        *out = e->fnum;
+        return 1;
+    case EXPR_NUM:
+        *out = (double)e->num;      /* an integer constant used where a float is wanted */
+        return 1;
+    case EXPR_CAST:
+        if (ty_is_float(e->ty)) {
+            if (!const_fold_f(e->rhs, &a)) return 0;
+            *out = (e->ty->kind == TY_FLOAT) ? (double)(float)a : a;
+            return 1;
+        }
+        if (ty_is_integer(e->ty)) {   /* (int)f : evaluate then truncate toward zero */
+            if (const_fold_f(e->rhs, &a)) { *out = (double)(long)a; return 1; }
+            if (const_fold(e->rhs, &iv)) { *out = (double)iv; return 1; }
+        }
+        return 0;
+    case EXPR_NEG:
+        if (!const_fold_f(e->rhs, &a)) return 0;
+        *out = -a;
+        return 1;
+    case EXPR_BINOP:
+        if (!const_fold_f(e->lhs, &a) || !const_fold_f(e->rhs, &b))
+            return 0;
+        switch (e->op) {
+        case B_ADD: *out = a + b; return 1;
+        case B_SUB: *out = a - b; return 1;
+        case B_MUL: *out = a * b; return 1;
+        case B_DIV: *out = a / b; return 1;   /* x/0.0 is inf/nan -- valid float result */
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
 /* The statement list a switch dispatches over: its body, unwrapped when
  * it is the usual brace block. Case markers must live at THIS level. */
 struct stmt *switch_stmts(struct stmt *body)
@@ -980,12 +1020,31 @@ static void lower_static_bytes(struct unit *u, int line, int size,
             nrel++;
             continue;
         }
+        int sz = ty_size(v[k].ty);
+        /* A float/double slot: fold to the value, store its IEEE-754 bit
+         * pattern (4 bytes for float, 8 for double), little-endian. */
+        if (ty_is_float(v[k].ty)) {
+            double dv;
+            if (!const_fold_f(v[k].e, &dv))
+                diag_fatal(u->file, line,
+                           "a static float initializer must be a constant "
+                           "expression");
+            unsigned long ubits;
+            if (v[k].ty->kind == TY_FLOAT) {
+                float fv = (float)dv; unsigned int u32;
+                memcpy(&u32, &fv, 4); ubits = u32;
+            } else {
+                memcpy(&ubits, &dv, 8);
+            }
+            for (int b = 0; b < sz; b++)
+                bytes[v[k].off + b] = (char)(ubits >> (8 * b));
+            continue;
+        }
         long cv;
         if (!const_fold(v[k].e, &cv))
             diag_fatal(u->file, line,
                        "a static initializer must be a constant, a "
                        "string literal, or the address of a global");
-        int sz = ty_size(v[k].ty);
         for (int b = 0; b < sz; b++)
             bytes[v[k].off + b] = (char)((unsigned long)cv >> (8 * b));
     }

@@ -827,6 +827,11 @@ static struct expr *parse_unary(struct parser *ps)
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
+    case TOK_PLUS:
+        /* unary plus: identity on an arithmetic operand (the surrounding
+         * context applies the usual promotions). Just yield the operand. */
+        advance(ps);
+        return parse_unary(ps);
     case TOK_MINUS:
         e = new_expr(EXPR_NEG, t->line);
         advance(ps);

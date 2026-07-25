@@ -229,6 +229,42 @@ static int gen_va_arg(struct ir_func *fn, struct expr *e)
 
     int a_ova = emit_bin(fn, IR_ADD, ap, emit_const(fn, 8, 8), 8, 1);
     int a_rsa = emit_bin(fn, IR_ADD, ap, emit_const(fn, 16, 8), 8, 1);
+
+    /* SSE class (float/double): the SysV register save area lays the eight xmm
+     * regs AFTER the six GP regs, so fp_offset (at ap+4) runs 48..176 in strides
+     * of 16 (each xmm slot is 16 bytes, of which we read the low 8 = a double).
+     * A variadic float arg is promoted to double, so the overflow slot is 8. */
+    if (ty_is_float(rt)) {
+        struct type *dbl = ty_base(TY_DOUBLE, 0);
+        int a_fp = emit_bin(fn, IR_ADD, ap, emit_const(fn, 4, 8), 8, 1);
+        int fp = emit_load(fn, a_fp, u32);      /* fp_offset (at ap+4) */
+        int in_reg = emit_cmp(fn, B_LT, fp, emit_const(fn, 176, 4), 4, 0);
+        int addr = new_temp(fn);
+        int l_over = new_label(fn), l_done = new_label(fn);
+        emit_brz(fn, in_reg, 4, l_over);        /* fp_offset >= 176 -> overflow */
+        /* register save area: addr = reg_save_area + fp_offset; fp_offset += 16 */
+        int rsa = emit_load(fn, a_rsa, ptr);
+        emit_mov(fn, addr, emit_bin(fn, IR_ADD, rsa, fp, 8, 1));
+        emit_store(fn, a_fp,
+                   emit_bin(fn, IR_ADD, fp, emit_const(fn, 16, 4), 4, 0), u32);
+        emit_jmp(fn, l_done);
+        /* overflow area: addr = overflow_arg_area; advance it by 8 */
+        emit_label(fn, l_over);
+        int ova = emit_load(fn, a_ova, ptr);
+        emit_mov(fn, addr, ova);
+        emit_store(fn, a_ova,
+                   emit_bin(fn, IR_ADD, ova, emit_const(fn, 8, 8), 8, 1), ptr);
+        emit_label(fn, l_done);
+        int v = emit_load(fn, addr, dbl);       /* the value is a promoted double */
+        if (rt->kind == TY_FLOAT) {             /* va_arg(ap,float): narrow it */
+            struct ir_ins *cv = emit(fn);
+            cv->op = IR_F2F; cv->a = v; cv->size = 8; cv->w = 4;
+            cv->dst = new_temp(fn);
+            return cv->dst;
+        }
+        return v;
+    }
+
     int gp = emit_load(fn, ap, u32);        /* gp_offset (at ap+0) */
     int in_reg = emit_cmp(fn, B_LT, gp, emit_const(fn, 48, 4), 4, 0);
 
