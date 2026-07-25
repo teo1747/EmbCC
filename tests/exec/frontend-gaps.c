@@ -80,5 +80,12 @@ int main(void)
     double v = 6.25;
     if (+v != 6.25) return 11;
 
+    /* an enum defined in the same declaration is in scope in the initializer,
+     * and an enumerator is an integer constant usable as an array size */
+    enum { LOW = 10, HIGH = 20 } level = HIGH;
+    if (level != 20 || LOW != 10) return 12;
+    int sized[HIGH - LOW];              /* array size from enum constants */
+    if (sizeof(sized) != 10 * sizeof(int)) return 13;
+
     return 42;
 }

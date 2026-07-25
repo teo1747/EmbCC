@@ -402,6 +402,10 @@ static struct type *parse_stars(struct parser *ps, struct type *t)
  * `__fds_bits[_howmany(FD_SETSIZE, _NFDBITS)]`, and _NFDBITS expands to
  * ((int)sizeof(__fd_mask) * 8). Anything it cannot evaluate (an
  * identifier, sizeof of an expression) is refused by name. */
+/* The unit being parsed, so size_fold can resolve enum constants (which are
+ * compile-time integer constants) in constant expressions like array sizes. */
+static struct unit *g_fold_unit;
+
 static int size_fold(const struct expr *e, long *out)
 {
     long a, b;
@@ -410,6 +414,15 @@ static int size_fold(const struct expr *e, long *out)
     case EXPR_NUM:
         *out = e->num;
         return 1;
+    case EXPR_VAR:
+        /* an enumerator is an integer constant expression: `int a[N];` */
+        for (struct econst *ec = g_fold_unit ? g_fold_unit->econsts : NULL;
+             ec; ec = ec->next)
+            if (strcmp(ec->name, e->name) == 0) {
+                *out = ec->val;
+                return 1;
+            }
+        return 0;
     case EXPR_SIZEOF:
         if (!e->cast_ty)
             return 0; /* sizeof(expr) needs types this pass lacks */
@@ -1776,6 +1789,7 @@ struct unit *parse_unit(const char *file, const char *src)
     u->file = file;
 
     ps.unit = u;
+    g_fold_unit = u;          /* size_fold resolves this unit's enum constants */
     ps.tags = NULL;
     ps.typedefs = NULL;
     ps.econst_tail = &u->econsts;

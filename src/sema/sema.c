@@ -286,7 +286,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             for (; ec; ec = ec->next)
                 if (strcmp(ec->name, e->name) == 0)
                     break;
-            if (ec && ec->seq < cur_body_seq) {
+            /* '<=' not '<': an enum is COMPLETE before the declarator that
+             * uses it in the same declaration (`enum { A, B } g = B;`), so a
+             * same-item (same seq) reference is legal -- the same reasoning the
+             * global self-reference below uses. A truly earlier use (a lower
+             * seq than the enum's) is still rejected. */
+            if (ec && ec->seq <= cur_body_seq) {
                 e->kind = EXPR_NUM;
                 e->num = ec->val;
                 e->ty = ty_base(TY_INT, 0);
