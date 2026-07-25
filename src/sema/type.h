@@ -15,7 +15,7 @@
 #ifndef EMBCC_SEMA_TYPE_H
 #define EMBCC_SEMA_TYPE_H
 
-enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
+enum ty_kind { TY_VOID, TY_BOOL, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
                TY_FLOAT, TY_DOUBLE, TY_PTR,
                TY_ARRAY, TY_STRUCT, TY_FUNC };
 

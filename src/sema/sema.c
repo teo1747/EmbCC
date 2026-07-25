@@ -207,6 +207,11 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                        ctx, ty_name(rhs->ty), ty_name(to));
         return rhs; /* same struct type: passed/returned as its bytes */
     }
+    /* Any scalar converts to _Bool implicitly (C99 6.3.1.2): the result is
+     * 0 or 1. This includes pointers, which otherwise need an explicit cast
+     * to an integer type. */
+    if (to->kind == TY_BOOL && ty_is_scalar(rhs->ty))
+        return mk_cast(rhs, to);
     if (ty_is_arith(to) && ty_is_arith(rhs->ty))
         return mk_cast(rhs, to);
     if (to->kind == TY_PTR) {

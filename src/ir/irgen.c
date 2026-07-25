@@ -446,6 +446,29 @@ static int emit_isz(struct ir_func *fn, int v, int w)
     return i->dst;
 }
 
+/* Convert any scalar to _Bool: the result is (v != 0), a 0/1 int. C says a
+ * store to _Bool normalizes this way, and a float 0.5 must become 1 (so it
+ * compares the float directly, not a truncation). */
+static int emit_tobool(struct ir_func *fn, int v, const struct type *from)
+{
+    int flt = ty_is_float(from);
+    /* the zero operand MUST be emitted before the compare that reads it —
+     * the IR is lowered in order, so an operand emitted after would be
+     * materialized after the cmp already ran (a real bug, once). */
+    int zero = flt ? emit_fconst(fn, 0.0, ty_size(from))
+                   : emit_const(fn, 0, ty_w(from));
+    struct ir_ins *i = emit(fn);
+    i->op = IR_CMP;
+    i->pred = B_NE;
+    i->a = v;
+    i->b = zero;
+    i->sign = 0;
+    i->flt = flt;
+    i->w = flt ? ty_size(from) : ty_w(from);
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
 /* An I2F/F2I instruction, spelled out because unsigned-64 conversions build
  * several by hand. `a` is the source vreg. */
 static int emit_i2f(struct ir_func *fn, int a, int srcw, int dstw)
@@ -518,6 +541,10 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
 {
     int fsize = ty_size(from), tsize = ty_size(to);
     int fw = ty_w(from), tw = ty_w(to);
+
+    /* To _Bool is a normalize-to-0/1, not a truncation. */
+    if (to->kind == TY_BOOL && from->kind != TY_BOOL)
+        return emit_tobool(fn, v, from);
 
     /* Floating conversions are real instructions, not reinterpretations
      * — the bit patterns have nothing in common. */

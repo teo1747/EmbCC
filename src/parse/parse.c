@@ -88,7 +88,7 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_SIGNED || k == TOK_KW_VOID ||
            k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM ||
            k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
-           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE;
+           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL;
 }
 
 /* const/volatile/restrict are accepted and IGNORED: EmbCC does not
@@ -339,11 +339,12 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     /* base specifiers in any order: unsigned long int, long unsigned... */
     int uns = -1, nlong = 0, nshort = 0, nchar = 0, nint = 0, nvoid = 0;
-    int nfloat = 0, ndouble = 0;
+    int nfloat = 0, ndouble = 0, nbool = 0;
     int any = 0;
     for (;;) {
         enum tok_kind k = cur(ps)->kind;
         if (k == TOK_KW_FLOAT) nfloat++;
+        else if (k == TOK_KW_BOOL) nbool++;
         else if (k == TOK_KW_DOUBLE) ndouble++;
         else if (k == TOK_KW_UNSIGNED) uns = 1;
         else if (k == TOK_KW_SIGNED) uns = 0;
@@ -360,6 +361,12 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     if (!any)
         return NULL;
+    if (nbool) {
+        if (any > 1)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "_Bool cannot combine with other specifiers");
+        return ty_base(TY_BOOL, 0);
+    }
     if (nfloat || ndouble) {
         if (uns != -1 || nchar || nshort || nint || nvoid ||
             (nfloat && ndouble))
