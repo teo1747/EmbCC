@@ -9,7 +9,7 @@ OS_BUILD=${OS_BUILD:-/home/motsou/myos/build}
 LIBC=${LIBC:-/home/motsou/cross/newlib-c99/x86_64-elf/lib/libc.a}
 INCS="-I include -I $NEWLIB_INC"
 SRCS="src/driver/main.c src/driver/util.c src/lex/lex.c src/parse/parse.c
-      src/sema/sema.c src/sema/type.c src/ir/irgen.c src/codegen/codegen.c src/debug/dwarf.c
+      src/sema/sema.c src/sema/type.c src/ir/irgen.c src/opt/opt.c src/codegen/codegen.c src/debug/dwarf.c
       src/asm/emit.c src/asm/topasm.c src/cpp/predef.c src/cpp/cpp.c src/elf/write.c"
 rm -rf ref; mkdir -p ref
 for f in $SRCS; do
