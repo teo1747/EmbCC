@@ -47,6 +47,7 @@ enum tok_kind {
     TOK_KW_FOR,
     TOK_KW_BREAK,
     TOK_KW_CONTINUE,
+    TOK_KW_GOTO,
     TOK_KW_DO,
     TOK_KW_SWITCH,
     TOK_KW_CASE,

@@ -206,9 +206,6 @@ check tag-redefinition \
 struct P { int y; };
 int main(void) { return 0; }' \
     "redefinition of 'P'"
-check block-scope-struct \
-    'int main(void) { struct L { int x; }; return 0; }' \
-    "file scope"
 check bitfield \
     'struct B { int f : 3; };
 int main(void) { return 0; }' \
@@ -302,7 +299,7 @@ echo "$err" | grep -q "linker is M3" || {
     echo "case nolink: wrong diagnostic:"; echo "$err"; exit 1; }
 echo "case nolink: refused with a diagnostic"
 check asm-bad-constraint \
-    'int main(void) { int x; __asm__("int $0x80" : "=x"(x)); return x; }' \
+    'int main(void) { int x; __asm__("int $0x80" : "=t"(x)); return x; }' \
     "is not supported"
 check asm-bad-template \
     'int main(void) { __asm__("nop"); return 0; }' \

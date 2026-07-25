@@ -86,6 +86,7 @@ static const struct {
     { "for", TOK_KW_FOR },
     { "break", TOK_KW_BREAK },
     { "continue", TOK_KW_CONTINUE },
+    { "goto", TOK_KW_GOTO },
     { "do", TOK_KW_DO },
     { "switch", TOK_KW_SWITCH },
     { "case", TOK_KW_CASE },
@@ -470,6 +471,7 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_FOR: return "'for'";
     case TOK_KW_BREAK: return "'break'";
     case TOK_KW_CONTINUE: return "'continue'";
+    case TOK_KW_GOTO: return "'goto'";
     case TOK_KW_DO: return "'do'";
     case TOK_KW_SWITCH: return "'switch'";
     case TOK_KW_CASE: return "'case'";

@@ -93,6 +93,22 @@ static int is_null_const(const struct expr *e)
     return e->kind == EXPR_NUM && e->num == 0;
 }
 
+/* IEEE-754 +infinity / quiet-NaN as doubles, built from their bit patterns so
+ * the value is exact regardless of the host EmbCC runs on. Used to lower the
+ * __builtin_inf/huge_val/nan family to a float constant. */
+static double ieee_inf(void)
+{
+    union { unsigned long u; double d; } v;
+    v.u = 0x7ff0000000000000UL;
+    return v.d;
+}
+static double ieee_nan(void)
+{
+    union { unsigned long u; double d; } v;
+    v.u = 0x7ff8000000000000UL;
+    return v.d;
+}
+
 /* Wrap in an implicit cast node unless already exactly that type. */
 static struct expr *mk_cast(struct expr *inner, struct type *to)
 {
@@ -716,6 +732,32 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->ty = ty_base(TY_VOID, 0);
             break;
         }
+        /* Compiler builtins for the floating specials: lower directly to a
+         * constant with the right bit pattern (HUGE_VAL/INFINITY/NAN expand to
+         * these). The `f` variants are single precision; nan's string arg is
+         * evaluated for side effects only (there are none) and ignored. */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            strncmp(e->lhs->name, "__builtin_", 10) == 0) {
+            const char *bn = e->lhs->name + 10;
+            int is_inf = strcmp(bn, "inf") == 0 || strcmp(bn, "huge_val") == 0;
+            int is_inff = strcmp(bn, "inff") == 0 || strcmp(bn, "huge_valf") == 0;
+            int is_nan = strcmp(bn, "nan") == 0;
+            int is_nanf = strcmp(bn, "nanf") == 0;
+            if (is_inf || is_inff || is_nan || is_nanf) {
+                for (int i = 0; i < e->nargs; i++)
+                    check_expr(u, f, sc, e->args[i]);
+                e->kind = EXPR_FNUM;
+                e->fnum = (is_nan || is_nanf) ? ieee_nan() : ieee_inf();
+                e->ty = ty_base((is_inff || is_nanf) ? TY_FLOAT : TY_DOUBLE, 0);
+                break;
+            }
+            /* __builtin_memcpy/memmove/memset are the libc functions under a
+             * reserved name -- rename and let the ordinary call path resolve
+             * them (the program must declare/provide them). */
+            if (strcmp(bn, "memcpy") == 0 || strcmp(bn, "memmove") == 0 ||
+                strcmp(bn, "memset") == 0)
+                e->lhs->name = bn;   /* fall through to normal call handling */
+        }
         /* Direct when the callee is a name that is not a variable in
          * scope and names a function; otherwise a call through a
          * function-pointer value. */
@@ -1136,9 +1178,12 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
     for (const char *p = c; *p; p++)             /* else allocate a register */
         if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R')
             return -2;
+    for (const char *p = c; *p; p++)             /* an SSE/XMM ('x') operand */
+        if (*p == 'x')
+            return -3;                            /* irgen allocates an xmm */
     diag_fatal(u->file, s->line,
                "asm constraint \"%s\" is not supported "
-               "(EmbCC handles a/b/c/d/S/D, 'r'/'q'/'g'/'m', and a "
+               "(EmbCC handles a/b/c/d/S/D, 'r'/'q'/'g'/'m', 'x', and a "
                "register-asm variable)", op->constraint);
     return -1;
 }
@@ -1378,6 +1423,13 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             sc->block_start = prev;
             break;
         }
+        case STMT_LABEL:
+            /* the labeled statement is checked in the label's own context */
+            check_stmt(u, f, sc, s->body, in_loop, in_switch, 0);
+            break;
+        case STMT_GOTO:
+            /* target existence is validated function-wide at codegen */
+            break;
         }
     }
 }
@@ -1473,6 +1525,12 @@ static int stmt_returns(struct stmt *s)
         return (const_fold(s->cond, &v) && v != 0 &&
                 !has_own_break(s->body)) || stmt_returns(s->body);
     }
+    case STMT_GOTO:
+        /* an unconditional jump: control leaves here, it does not fall off
+         * the end of the function at this point. */
+        return 1;
+    case STMT_LABEL:
+        return stmt_returns(s->body);
     default:
         return 0;
     }

@@ -1229,7 +1229,12 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             diag_fatal(ps->lx.file, t->line,
                        "a declaration cannot be the body of if/while/for "
                        "(C99 forbids it too); wrap it in braces");
-        struct type *base = parse_type_spec(ps, 0);
+        /* allow_body=1: a block-scope struct/union/enum DEFINITION is legal C
+         * (`union { double d; uint64_t u; } v;` inside a function). Tags share
+         * the one flat tag namespace EmbCC keeps -- fine for the anonymous
+         * types real code uses here; a same-named tag in two scopes is the
+         * documented limitation, not a miscompile. */
+        struct type *base = parse_type_spec(ps, 1);
         struct stmt *head = NULL, **dtail = &head;
         for (;;) {
             s = new_stmt(STMT_DECL, t->line);
@@ -1279,7 +1284,39 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         return head;
     }
 
+    /* A label: `IDENT ':'` prefixes a statement (a goto target). Peek one
+     * token past the identifier; if it is ':' this is a label, else restore
+     * and fall through to the expression-statement path. */
+    if (t->kind == TOK_IDENT) {
+        const char *lname = t->text;
+        int lline = t->line;
+        struct lexer save = ps->lx;
+        advance(ps);
+        if (cur(ps)->kind == TOK_COLON) {
+            advance(ps);                       /* consume ':' */
+            s = new_stmt(STMT_LABEL, lline);
+            s->name = lname;
+            s->body = parse_stmt(ps, allow_decl);
+            return s;
+        }
+        ps->lx = save;                         /* not a label */
+    }
+
     switch (t->kind) {
+    case TOK_SEMI:                             /* the null statement */
+        s = new_stmt(STMT_BLOCK, t->line);     /* an empty block does nothing */
+        advance(ps);
+        return s;
+    case TOK_KW_GOTO:
+        s = new_stmt(STMT_GOTO, t->line);
+        advance(ps);
+        if (cur(ps)->kind != TOK_IDENT)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a label name after 'goto'");
+        s->name = cur(ps)->text;
+        advance(ps);
+        expect(ps, TOK_SEMI, "';'");
+        return s;
     case TOK_LBRACE:
         return parse_block(ps);
     case TOK_KW_RETURN:
@@ -1664,6 +1701,56 @@ static void parse_top(struct parser *ps, struct unit *u,
 
     if (cur(ps)->kind == TOK_SEMI) {
         advance(ps); /* prototype */
+    } else if (cur(ps)->kind == TOK_COMMA) {
+        /* The first declarator was a function PROTOTYPE and more declarators
+         * share the same base type: `extern double f(double), g(double), x;`.
+         * A comma can only follow a prototype, never a definition. */
+        **ftail = f;
+        *ftail = &f->next;
+        while (cur(ps)->kind == TOK_COMMA) {
+            advance(ps);
+            struct type *dty = parse_stars(ps, base);
+            if (cur(ps)->kind != TOK_IDENT)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a name before %s", tok_describe(cur(ps)));
+            const char *dname = cur(ps)->text;
+            int dline = cur(ps)->line;
+            advance(ps);
+            if (cur(ps)->kind == TOK_LPAREN) {
+                /* a sibling function prototype: `g(double)` */
+                struct type *fty = parse_fn_params(ps, dty);
+                struct func *g = xcalloc(1, sizeof *g);
+                g->is_static = is_static;
+                g->ret_ty = fty->ret;
+                g->name = dname;
+                g->file = ps->lx.file;
+                g->line = dline;
+                g->seq = seq;
+                g->nparams = fty->nptypes;
+                for (int i = 0; i < fty->nptypes; i++) {
+                    g->param_tys[i] = fty->ptypes[i];
+                    g->params[i] = NULL;  /* unnamed prototype parameters */
+                }
+                g->is_varargs = fty->is_varargs;
+                **ftail = g;
+                *ftail = &g->next;
+            } else {
+                /* a sibling variable: `x`, `*p`, `a[10]`, with optional init */
+                struct type *vty = parse_array_dims(ps, dty);
+                parse_attributes(ps, &at);
+                struct global *g = parse_global(ps, vty, dname, dline,
+                                                is_static, is_extern);
+                parse_attributes(ps, &at);
+                g->is_weak = at.weak;
+                g->seq = seq;
+                g->def_seq = seq;
+                **gtail = g;
+                *gtail = &g->next;
+            }
+        }
+        expect(ps, TOK_SEMI, "';'");
+        (void)u;
+        return;
     } else {
         if (cur(ps)->kind != TOK_LBRACE)
             diag_fatal(ps->lx.file, cur(ps)->line,

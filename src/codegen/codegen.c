@@ -601,29 +601,43 @@ static void gen_func(struct ir_func *fn, struct code *text,
              * asm. A scratch that avoids the output register carries the
              * address so the result register survives the store. */
             struct ir_asm *ia = i->asm_ir;
+            /* Inputs carry their VALUE: a GPR ('r'/fixed) operand loads from its
+             * slot into the register; an xmm ('x', reg 16..23) uses movss/movsd
+             * into the xmm register instead. */
             for (int k = 0; k < ia->nin; k++)
-                x86_load_reg_mem(text, ia->in[k].reg, REG_RBP,
-                                 sd[ia->in[k].temp], 8);
+                if (ia->in[k].reg >= 16)
+                    x86_movs_load(text, ia->in[k].reg - 16,
+                                  sd[ia->in[k].temp], ia->in[k].size);
+                else
+                    x86_load_reg_mem(text, ia->in[k].reg, REG_RBP,
+                                     sd[ia->in[k].temp], 8);
             for (int k = 0; k < ia->codelen; k++)
                 code_byte(text, ia->code[k]);
             /* The address scratch must not be an OUTPUT register, or loading
              * it would clobber a result before it is stored (e.g. cpuid's
-             * four a/b/c/d outputs). Pick one free of every operand. */
+             * four a/b/c/d outputs). Pick one free of every operand. Only GPR
+             * operands (reg < 16) can collide with a GPR scratch. */
             int used16[16] = { 0 };
             for (int k = 0; k < ia->nin; k++)
-                used16[ia->in[k].reg] = 1;
+                if (ia->in[k].reg < 16) used16[ia->in[k].reg] = 1;
             for (int k = 0; k < ia->nout; k++)
-                used16[ia->out[k].reg] = 1;
+                if (ia->out[k].reg < 16) used16[ia->out[k].reg] = 1;
             int scr = -1;
             static const int scr_pool[] = { REG_RCX, REG_RDX, REG_RSI,
                                             REG_RDI, 8, 9, 10, 11 };
             for (unsigned p = 0; p < sizeof scr_pool / sizeof scr_pool[0]; p++)
                 if (!used16[scr_pool[p]]) { scr = scr_pool[p]; break; }
+            /* Outputs store the result register THROUGH the lvalue address
+             * (held in the operand's slot). xmm results go out via movss/movsd. */
             for (int k = 0; k < ia->nout; k++) {
                 x86_load_reg_mem(text, scr, REG_RBP,
                                  sd[ia->out[k].temp], 8);
-                x86_store_mem_reg(text, scr, 0, ia->out[k].reg,
-                                  ia->out[k].size);
+                if (ia->out[k].reg >= 16)
+                    x86_movs_store_base(text, scr, 0, ia->out[k].reg - 16,
+                                        ia->out[k].size);
+                else
+                    x86_store_mem_reg(text, scr, 0, ia->out[k].reg,
+                                      ia->out[k].size);
             }
             break;
         }

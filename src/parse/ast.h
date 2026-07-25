@@ -96,7 +96,8 @@ struct greloc {
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
                  STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE,
-                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT, STMT_ASM };
+                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT, STMT_ASM,
+                 STMT_LABEL, STMT_GOTO };
 
 /* One operand of an extended-asm statement: a constraint string and the C
  * expression it binds. Output constraints begin with '=' (or '+') and name

@@ -59,6 +59,29 @@ static void emit_jmp(struct ir_func *fn, int label)
     i->label = label;
 }
 
+/* goto/label resolution. Labels are function-scoped and forward-referable, so a
+ * name gets its IR label the first time EITHER a `goto` or the label itself is
+ * seen. gen_func resets this table; after the body it errors on any label that
+ * was referenced by a goto but never defined. */
+#define IRGEN_MAX_LABELS 256
+static struct { const char *name; int label; int defined; int line; }
+    g_labels[IRGEN_MAX_LABELS];
+static int g_nlabels_used;
+
+static int label_idx(struct ir_func *fn, const char *name, int line)
+{
+    for (int i = 0; i < g_nlabels_used; i++)
+        if (strcmp(g_labels[i].name, name) == 0)
+            return i;
+    if (g_nlabels_used >= IRGEN_MAX_LABELS)
+        diag_fatal(fn->src->file, line, "too many labels in one function");
+    g_labels[g_nlabels_used].name = name;
+    g_labels[g_nlabels_used].label = new_label(fn);
+    g_labels[g_nlabels_used].defined = 0;
+    g_labels[g_nlabels_used].line = line;
+    return g_nlabels_used++;
+}
+
 static void emit_brz(struct ir_func *fn, int v, int w, int label)
 {
     struct ir_ins *i = emit(fn);
@@ -945,7 +968,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             reg = opregs[idx];
         }
 
-        if (n + 4 > cap) {
+        if (n + 8 > cap) {
             cap = cap ? cap * 2 : 16;
             code = xrealloc(code, (size_t)cap);
         }
@@ -991,6 +1014,45 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             code[n++] = 0x0f;
             code[n++] = 0x92;
             code[n++] = (unsigned char)(0xc0 | (reg & 7));          /* /0 */
+        } else if (mlen == 6 && strncmp(m, "sqrts", 5) == 0 &&
+                   (m[5] == 'd' || m[5] == 's')) {
+            /* sqrtsd/sqrtss %src,%dst (AT&T order): F2/F3 0F 51 /r, both xmm.
+             * `reg` already holds the FIRST operand (%src); parse `,%dst`. */
+            int is_sd = m[5] == 'd';
+            if (reg < 16)
+                diag_fatal(file, line,
+                           "asm '%.*s' operands must be 'x' (xmm): \"%s\"",
+                           mlen, m, tmpl);
+            int src = reg;
+            if (*p != ',')
+                diag_fatal(file, line,
+                           "asm '%.*s' wants %%src,%%dst: \"%s\"", mlen, m, tmpl);
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '%' || !(p[1] >= '0' && p[1] <= '9'))
+                diag_fatal(file, line,
+                           "asm '%.*s' destination must be %%N: \"%s\"",
+                           mlen, m, tmpl);
+            p++;
+            int idx2 = 0;
+            while (*p >= '0' && *p <= '9')
+                idx2 = idx2 * 10 + (*p++ - '0');
+            if (idx2 >= nops)
+                diag_fatal(file, line,
+                           "asm operand %%%d out of range in \"%s\"", idx2, tmpl);
+            int dst = opregs[idx2];
+            if (dst < 16)
+                diag_fatal(file, line,
+                           "asm '%.*s' destination must be 'x' (xmm): \"%s\"",
+                           mlen, m, tmpl);
+            int s = src - 16, d = dst - 16;
+            code[n++] = (unsigned char)(is_sd ? 0xf2 : 0xf3);
+            if (d >= 8 || s >= 8)     /* REX.R names dst>=8, REX.B names src>=8 */
+                code[n++] = (unsigned char)(0x40 | (d >= 8 ? 4 : 0) |
+                                            (s >= 8 ? 1 : 0));
+            code[n++] = 0x0f;
+            code[n++] = 0x51;
+            code[n++] = (unsigned char)(0xc0 | ((d & 7) << 3) | (s & 7));
         } else {
             diag_fatal(file, line,
                        "asm instruction \"%.*s\" not supported "
@@ -1016,6 +1078,17 @@ static int asm_alloc_reg(int *used, const char *file, int line)
     return -1;
 }
 
+/* Assign a free XMM register to an 'x' (SSE) asm operand. XMM registers are
+ * encoded as 16 + n (0..7 -> 16..23) so they share one operand-register space
+ * with the GPRs (0..15); codegen and asm_assemble decode reg >= 16 as xmm. */
+static int asm_alloc_xmm(int *xused, const char *file, int line)
+{
+    for (int i = 0; i < 8; i++)
+        if (!xused[i]) { xused[i] = 1; return 16 + i; }
+    diag_fatal(file, line, "asm: out of xmm registers for the operands");
+    return -1;
+}
+
 /* Innermost enclosing loop's exit and continue targets; sema already
  * rejected break/continue outside any loop. */
 struct loopctx {
@@ -1034,6 +1107,19 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             break;
         case STMT_CONTINUE:
             emit_jmp(fn, loop->cont);
+            break;
+        case STMT_LABEL: {
+            int ix = label_idx(fn, s->name, s->line);
+            if (g_labels[ix].defined)
+                diag_fatal(fn->src->file, s->line, "duplicate label '%s'",
+                           s->name);
+            g_labels[ix].defined = 1;
+            emit_label(fn, g_labels[ix].label);
+            gen_stmt(fn, s->body, loop);   /* the labeled statement */
+            break;
+        }
+        case STMT_GOTO:
+            emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
             break;
         case STMT_DECL:
             if (s->sglob)
@@ -1104,31 +1190,38 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
              * allocatable ones (-2) get a free register. Then %N substitution
              * numbers outputs first, then inputs, exactly as gcc does. */
             int used[16] = { 0 };
-            for (int i = 0; i < a->nout; i++)
-                if (a->out[i].reg >= 0) used[a->out[i].reg] = 1;
-            for (int i = 0; i < a->nin; i++)
-                if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
+            int xused[8] = { 0 };   /* xmm operands (reg 16..23) */
+            for (int i = 0; i < a->nout; i++) {
+                if (a->out[i].reg >= 16) xused[a->out[i].reg - 16] = 1;
+                else if (a->out[i].reg >= 0) used[a->out[i].reg] = 1;
+            }
+            for (int i = 0; i < a->nin; i++) {
+                if (a->in[i].reg >= 16) xused[a->in[i].reg - 16] = 1;
+                else if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
+            }
             int opregs[2 * MAX_PARAMS], nops = 0;
             for (int i = 0; i < a->nout; i++) {
                 int r = a->out[i].reg;
-                if (r == -2)
-                    r = asm_alloc_reg(used, fn->src->file, s->line);
+                if (r == -2)      r = asm_alloc_reg(used, fn->src->file, s->line);
+                else if (r == -3) r = asm_alloc_xmm(xused, fn->src->file, s->line);
                 ia->out[i].reg = r;
                 opregs[nops++] = r;
             }
             for (int i = 0; i < a->nin; i++) {
                 int r = a->in[i].reg;
-                if (r == -2)
-                    r = asm_alloc_reg(used, fn->src->file, s->line);
+                if (r == -2)      r = asm_alloc_reg(used, fn->src->file, s->line);
+                else if (r == -3) r = asm_alloc_xmm(xused, fn->src->file, s->line);
                 ia->in[i].reg = r;
                 opregs[nops++] = r;
             }
             asm_assemble(fn, s, opregs, nops, ia);
             /* An input carries its VALUE; an output the ADDRESS of its
-             * lvalue. */
+             * lvalue. An xmm ('x') input is moved with movss/movsd, so its
+             * size is the operand's own float width. */
             for (int i = 0; i < a->nin; i++) {
                 ia->in[i].temp = gen_expr(fn, a->in[i].expr);
-                ia->in[i].size = 8;
+                ia->in[i].size = ia->in[i].reg >= 16
+                               ? ty_size(a->in[i].expr->ty) : 8;
             }
             for (int i = 0; i < a->nout; i++) {
                 ia->out[i].temp = gen_addr(fn, a->out[i].expr);
@@ -1337,7 +1430,12 @@ static void gen_func(struct ir_func *fn, struct func *f)
     for (int i = 0; i < f->nparams; i++)
         add_dbgvar(fn, f->params[i], i, 1, f->param_tys[i]);
     collect_locals(fn, f->body);
+    g_nlabels_used = 0;                 /* labels are per-function */
     gen_stmt(fn, f->body, NULL);
+    for (int i = 0; i < g_nlabels_used; i++)
+        if (!g_labels[i].defined)
+            diag_fatal(fn->src->file, g_labels[i].line,
+                       "label '%s' used but not defined", g_labels[i].name);
 }
 
 struct ir_unit *irgen(struct unit *u)
