@@ -17,6 +17,7 @@
 #include "../cpp/predef.h"
 #include "../elf/write.h"
 #include "../ir/ir.h"
+#include "../opt/opt.h"
 #include "../parse/parse.h"
 #include "../sema/sema.h"
 #include "util.h"
@@ -115,6 +116,10 @@ static int nincdirs;
  * (self-host builds without -g). */
 static int want_debug;
 
+/* -O level. 0 (the default) runs no optimizer, so output is byte-for-byte
+ * as before — the property the self-host fixed point rests on. */
+static int opt_level;
+
 static int compile(const char *in, const char *out, int pp_only)
 {
     char *src = read_file(in);
@@ -145,6 +150,7 @@ static int compile(const char *in, const char *out, int pp_only)
     }
 
     struct ir_unit *iu = irgen(u);
+    opt_run(iu, opt_level);
 
     struct code text = { 0, 0, 0 };
     struct extcall *ext;
@@ -473,6 +479,19 @@ int main(int argc, char **argv)
             pp_only = 1;
         } else if (strcmp(argv[i], "-g") == 0) {
             want_debug = 1;
+        } else if (strncmp(argv[i], "-O", 2) == 0) {
+            /* -O / -O1 / -O2 / -O3 enable the optimizer (one level for now);
+             * -O0 turns it off. Anything else after -O is an error. */
+            const char *lvl = argv[i] + 2;
+            if (lvl[0] == '\0')
+                opt_level = 1;
+            else if (lvl[1] == '\0' && lvl[0] >= '0' && lvl[0] <= '9')
+                opt_level = lvl[0] - '0';
+            else {
+                fprintf(stderr, "embcc: unknown optimization flag '%s'\n",
+                        argv[i]);
+                return 1;
+            }
         } else if (strncmp(argv[i], "-I", 2) == 0) {
             const char *dir = argv[i][2] ? argv[i] + 2
                                          : (i + 1 < argc ? argv[++i] : 0);

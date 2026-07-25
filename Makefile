@@ -19,6 +19,7 @@ SRCS := \
 	src/sema/sema.c \
 	src/sema/type.c \
 	src/ir/irgen.c \
+	src/opt/opt.c \
 	src/codegen/codegen.c \
 	src/debug/dwarf.c \
 	src/asm/emit.c \
