@@ -222,6 +222,58 @@ static void emit_mov(struct ir_func *fn, int dst, int src)
     i->a = src;
 }
 
+/* ---- bitfield access (little-endian, gcc-compatible) ----
+ * A bitfield occupies bits [bit_off, bit_off+width) of the storage unit at
+ * `addr` (a load/store of the field's declared type). Reading shifts the
+ * field to the top of the value class then back down — arithmetic for a
+ * signed field so its sign bit fills — the classic two-shift extraction,
+ * immune to neighbouring fields packed into the same unit. */
+static int bf_load(struct ir_func *fn, int addr, const struct member *m)
+{
+    const struct type *bt = m->ty;
+    int w = ty_wide(bt) ? 8 : 4;          /* value-class width, bytes */
+    int vb = w * 8;
+    /* load the raw storage unit UNSIGNED, so no stray sign extension */
+    int v = emit_load(fn, addr, ty_base(bt->kind, 1));
+    int lsh = vb - m->bit_off - m->bit_width;
+    if (lsh)
+        v = emit_bin(fn, IR_SHL, v, emit_const(fn, lsh, 4), w, 0);
+    int rsh = vb - m->bit_width;
+    if (rsh)
+        v = emit_bin(fn, IR_SHR, v, emit_const(fn, rsh, 4), w,
+                     ty_signed_int(bt));
+    return v;
+}
+
+/* Store `val` into a bitfield: read the storage unit, clear the field's
+ * bits, OR in the low `width` bits of the value, write it back. Returns the
+ * field re-read, which is the assignment expression's (truncated) value. */
+static int bf_store(struct ir_func *fn, int addr, const struct member *m,
+                    int val)
+{
+    const struct type *bt = m->ty;
+    int w = ty_wide(bt) ? 8 : 4;
+    struct type *ut = ty_base(bt->kind, 1);
+    unsigned long fmask = m->bit_width >= 64
+                        ? ~0UL : (((unsigned long)1 << m->bit_width) - 1);
+    unsigned long placed = fmask << m->bit_off;
+    int old = emit_load(fn, addr, ut);
+    int cleared = emit_bin(fn, IR_AND, old,
+                           emit_const(fn, (long)~placed, w), w, 0);
+    int low = emit_bin(fn, IR_AND, val,
+                       emit_const(fn, (long)fmask, w), w, 0);
+    if (m->bit_off)
+        low = emit_bin(fn, IR_SHL, low, emit_const(fn, m->bit_off, 4), w, 0);
+    int merged = emit_bin(fn, IR_OR, cleared, low, w, 0);
+    emit_store(fn, addr, merged, ut);
+    return bf_load(fn, addr, m);
+}
+
+static int expr_is_bitfield(const struct expr *e)
+{
+    return e->kind == EXPR_MEMBER && e->memb && e->memb->is_bitfield;
+}
+
 static int emit_cmp(struct ir_func *fn, enum binop pred, int a, int b,
                     int w, int sign)
 {
@@ -592,6 +644,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return emit_ldvar(fn, e->var_index, e->ty);
     case EXPR_MEMBER: {
         int addr = gen_addr(fn, e);
+        if (e->memb->is_bitfield)
+            return bf_load(fn, addr, e->memb);
         if (e->undecayed || e->ty->kind == TY_STRUCT)
             return addr; /* array member decays; nested struct is addr */
         return emit_load(fn, addr, e->ty);
@@ -616,6 +670,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         /* global, *p, or member: a store through an address */
         int addr = gen_addr(fn, e->lhs);
         int v = gen_expr(fn, e->rhs);
+        if (expr_is_bitfield(e->lhs))
+            return bf_store(fn, addr, e->lhs->memb, v);
         emit_store(fn, addr, v, e->ty);
         return v;
     }
@@ -624,8 +680,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         int scale = t->kind == TY_PTR ? ty_size(t->pointee) : 1;
         int w = ty_w(t);
         int local = e->lhs->kind == EXPR_VAR && !e->lhs->gref;
+        int is_bf = expr_is_bitfield(e->lhs);
         int addr = local ? -1 : gen_addr(fn, e->lhs);
         int cur = local ? emit_ldvar(fn, e->lhs->var_index, t)
+                : is_bf ? bf_load(fn, addr, e->lhs->memb)
                         : emit_load(fn, addr, t);
         int old = -1;
         if (e->is_post) {
@@ -636,7 +694,7 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         int d = emit_const(fn, (long)e->delta * scale, w);
         int sum = emit_bin(fn, IR_ADD, cur, d, w, 1);
-        if (ty_size(t) <= 2) {
+        if (ty_size(t) <= 2 && !is_bf) {
             /* ++c on a char must wrap like a char, in the value too */
             struct ir_ins *i = emit(fn);
             i->op = IR_EXT;
@@ -649,6 +707,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         if (local)
             emit_stvar(fn, e->lhs->var_index, sum, t);
+        else if (is_bf)
+            sum = bf_store(fn, addr, e->lhs->memb, sum);
         else
             emit_store(fn, addr, sum, t);
         return e->is_post ? old : sum;
@@ -850,8 +910,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
          * desugared to `x = x op y` */
         struct type *lt = e->lhs->ty;
         int local = e->lhs->kind == EXPR_VAR && !e->lhs->gref;
+        int is_bf = expr_is_bitfield(e->lhs);
         int addr = local ? -1 : gen_addr(fn, e->lhs);
         int cur = local ? emit_ldvar(fn, e->lhs->var_index, lt)
+                : is_bf ? bf_load(fn, addr, e->lhs->memb)
                         : emit_load(fn, addr, lt);
         int rv = gen_expr(fn, e->rhs);
         int res;
@@ -880,6 +942,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         if (local)
             emit_stvar(fn, e->lhs->var_index, res, lt);
+        else if (is_bf)
+            return bf_store(fn, addr, e->lhs->memb, res);
         else
             emit_store(fn, addr, res, lt);
         return res;

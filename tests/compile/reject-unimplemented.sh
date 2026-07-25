@@ -206,10 +206,6 @@ check tag-redefinition \
 struct P { int y; };
 int main(void) { return 0; }' \
     "redefinition of 'P'"
-check bitfield \
-    'struct B { int f : 3; };
-int main(void) { return 0; }' \
-    "before ':'"
 check empty-struct \
     'struct E { };
 int main(void) { return 0; }' \

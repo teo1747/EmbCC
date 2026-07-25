@@ -406,6 +406,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "'&' on an array is not supported yet (its name "
                        "is already the address of the first element)");
+        if (e->rhs->kind == EXPR_MEMBER && e->rhs->memb &&
+            e->rhs->memb->is_bitfield)
+            diag_fatal(u->file, e->line,
+                       "cannot take the address of bitfield '%s'",
+                       e->rhs->memb->name);
         e->ty = ty_ptr(e->rhs->ty);
         break;
     case EXPR_CAST:
@@ -989,6 +994,18 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                 diag_fatal(u->file, init->line,
                            "too many initializers for %s, which has %d "
                            "members", ty_name(ty), ty->nmembers);
+            /* A braced initializer for a bitfield would need bit-masked
+             * merging into its shared storage unit (both the static byte
+             * image and local stores) — not yet plumbed. Refuse rather than
+             * write clobbering full-width values. Seam: carry (bit_off,
+             * bit_width) on initelem and merge in both lowerings. */
+            if (ty->members[mi].is_bitfield)
+                diag_fatal(u->file, init->line,
+                           "initializing bitfield '%s' in a braced "
+                           "initializer is not supported yet — assign it "
+                           "in a statement instead",
+                           ty->members[mi].name ? ty->members[mi].name
+                                                : "<anonymous>");
             flatten_init(u, f, sc, el, ty->members[mi].ty,
                          off + ty->members[mi].off, out);
             mi++;

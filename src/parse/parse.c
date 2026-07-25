@@ -575,6 +575,32 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
             int mline = cur(ps)->line;
             const char *mname;
             struct type *mty = parse_declarator(ps, spec, &mname);
+            /* A bitfield: `T name : width` or an anonymous `T : width`
+             * (padding) / `T : 0` (a separator forcing the next field to a
+             * storage-unit boundary). Only integer types may be bitfields. */
+            int is_bf = 0, bit_width = 0;
+            if (cur(ps)->kind == TOK_COLON) {
+                advance(ps);
+                if (!ty_is_integer(mty))
+                    diag_fatal(ps->lx.file, mline,
+                               "a bitfield must have integer type, not %s",
+                               ty_name(mty));
+                struct expr *we = parse_cond(ps);
+                long wv;
+                if (!size_fold(we, &wv) || wv < 0)
+                    diag_fatal(ps->lx.file, mline,
+                               "a bitfield width must be a constant >= 0");
+                if (wv > 8 * (long)ty_size(mty))
+                    diag_fatal(ps->lx.file, mline,
+                               "bitfield '%s' width %ld exceeds its type %s",
+                               mname ? mname : "<anon>", wv, ty_name(mty));
+                if (wv == 0 && mname)
+                    diag_fatal(ps->lx.file, mline,
+                               "a named bitfield '%s' cannot have width 0",
+                               mname);
+                is_bf = 1;
+                bit_width = (int)wv;
+            }
             if (mty->kind == TY_VOID)
                 diag_fatal(ps->lx.file, mline,
                            "a member cannot have type void");
@@ -582,18 +608,19 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
                 diag_fatal(ps->lx.file, mline,
                            "a member cannot be a function — use a "
                            "function pointer");
-            if (!mname)
+            if (!mname && !is_bf)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
-            if (ty_size(mty) == 0)
+            if (!is_bf && ty_size(mty) == 0)
                 diag_fatal(ps->lx.file, mline,
                            "member '%s' has incomplete type %s",
                            mname, ty_name(mty));
-            for (int i = 0; i < n; i++)
-                if (strcmp(ms[i].name, mname) == 0)
-                    diag_fatal(ps->lx.file, mline,
-                               "duplicate member '%s'", mname);
+            if (mname)
+                for (int i = 0; i < n; i++)
+                    if (ms[i].name && strcmp(ms[i].name, mname) == 0)
+                        diag_fatal(ps->lx.file, mline,
+                                   "duplicate member '%s'", mname);
             if (n == cap) {
                 cap = cap ? cap * 2 : 8;
                 ms = xrealloc(ms, (size_t)cap * sizeof *ms);
@@ -602,6 +629,9 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
             ms[n].name = mname;
             ms[n].ty = mty;
             ms[n].off = 0;
+            ms[n].is_bitfield = is_bf;
+            ms[n].bit_off = 0;
+            ms[n].bit_width = bit_width;
             n++;
             if (cur(ps)->kind == TOK_COMMA) {
                 advance(ps);

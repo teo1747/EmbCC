@@ -45,10 +45,16 @@ stopping. Full suite 74/74; self-host fixed point holds.*
 
 Lower corpus frequency only because Tier-1 fails hit first; each is real C.
 
-- [ ] **3. Bitfields.** `struct F { unsigned a:3, b:5; };`
-  Error: `expected ';' before ':'`. The biggest missing *language* feature —
-  hardware registers and packed on-disk formats need it. Layout + load/store
-  masking across the whole struct machinery.
+- [x] **3. Bitfields.** `struct F { unsigned a:3, b:5; };` — DONE.
+  Little-endian gcc-compatible layout (fields don't cross a storage-unit
+  boundary; anonymous padding fields; `:0` separators; `packed`), signed and
+  unsigned extraction via the two-shift trick, read/assign/`+=`/`++`, access
+  through pointers, and `long` (>32-bit) fields. Verified against gcc for
+  values, `sizeof` layout, and by-value SysV ABI (incl. a cross-ABI
+  embcc→gcc link). `&bitfield` is refused. *Known gap (seam left):* a braced
+  initializer that targets a bitfield is refused loudly (not miscompiled) —
+  needs bit-masked merge on `initelem` in both the static-byte and local
+  lowerings; assign in a statement meanwhile.
 - [ ] **4. Designated ARRAY initializers.** `int a[5] = { [2]=9, [4]=1 };`
   Error: `array [index] designators are not supported`. (The `.field` form
   already works.) Dispatch/lookup tables use these.

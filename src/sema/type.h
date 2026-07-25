@@ -20,9 +20,12 @@ enum ty_kind { TY_VOID, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
                TY_ARRAY, TY_STRUCT, TY_FUNC };
 
 struct member {
-    const char *name;
+    const char *name;     /* NULL for an anonymous (padding) bitfield */
     struct type *ty;
-    int off;
+    int off;              /* byte offset; for a bitfield, of its storage unit */
+    int is_bitfield;
+    int bit_off;          /* bitfield: bit position within the storage unit */
+    int bit_width;        /* bitfield: width in bits (0 = zero-width separator) */
 };
 
 struct type {

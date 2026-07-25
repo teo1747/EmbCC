@@ -67,36 +67,70 @@ struct type *ty_struct(const char *tag, int is_union)
 void ty_struct_layout(struct type *t, struct member *members, int n,
                       int packed, int user_align)
 {
-    int off = 0, align = 1;
+    int align = 1;
+    /* Non-bitfields track a byte offset; bitfields a bit position. The two
+     * share one running cursor kept in bits (bitpos), rounded up to a byte
+     * when a plain member intervenes — this is the little-endian gcc layout
+     * (a field never crosses a boundary of its declared type). */
+    int bitpos = 0;   /* bits from the struct start; unions ignore it */
+    int umax = 0;     /* union: largest member extent, in bytes */
 
     for (int i = 0; i < n; i++) {
-        int ma = packed ? 1 : ty_align(members[i].ty);
-        int ms = ty_size(members[i].ty);
-        if (t->is_union) {
-            members[i].off = 0;
-            if (ms > off)
-                off = ms;
+        struct member *m = &members[i];
+        int ma = packed ? 1 : ty_align(m->ty);
+
+        if (m->is_bitfield) {
+            int unit = 8 * ty_size(m->ty);   /* storage-unit width, bits */
+            if (t->is_union) {
+                m->off = 0;
+                m->bit_off = 0;
+                int ext = (m->bit_width + 7) / 8;
+                if (ext > umax) umax = ext;
+            } else if (m->bit_width == 0) {
+                /* a zero-width field rounds up to the next unit boundary and
+                 * names nothing — a separator, never stored or accessed. */
+                if (!packed)
+                    bitpos = (bitpos + unit - 1) / unit * unit;
+                m->off = bitpos / 8;
+                m->bit_off = 0;
+            } else {
+                /* keep the field within one storage unit of its type */
+                if (!packed &&
+                    bitpos / unit != (bitpos + m->bit_width - 1) / unit)
+                    bitpos = (bitpos + unit - 1) / unit * unit;
+                m->off = (bitpos / unit) * ty_size(m->ty);
+                m->bit_off = bitpos - m->off * 8;
+                bitpos += m->bit_width;
+            }
         } else {
-            off = (off + ma - 1) & ~(ma - 1);
-            members[i].off = off;
-            off += ms;
+            int ms = ty_size(m->ty);
+            if (t->is_union) {
+                m->off = 0;
+                if (ms > umax) umax = ms;
+            } else {
+                int bytepos = (bitpos + 7) / 8;      /* leave any open unit */
+                bytepos = (bytepos + ma - 1) & ~(ma - 1);
+                m->off = bytepos;
+                bitpos = (bytepos + ms) * 8;
+            }
         }
         if (ma > align)
             align = ma;
     }
     if (user_align > align)
         align = user_align;
+    int bytes = t->is_union ? umax : (bitpos + 7) / 8;
     t->members = members;
     t->nmembers = n;
     t->align = align;
-    t->size = (off + align - 1) & ~(align - 1);
+    t->size = (bytes + align - 1) & ~(align - 1);
     t->complete = 1;
 }
 
 struct member *ty_find_member(struct type *t, const char *name)
 {
     for (int i = 0; i < t->nmembers; i++)
-        if (strcmp(t->members[i].name, name) == 0)
+        if (t->members[i].name && strcmp(t->members[i].name, name) == 0)
             return &t->members[i];
     return NULL;
 }
