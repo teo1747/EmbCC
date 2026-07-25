@@ -22,7 +22,7 @@ enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
-                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG };
+                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -67,6 +67,11 @@ struct expr {
                            * for a call through a function pointer */
     struct expr **elems;  /* EXPR_INITLIST */
     int nelems;
+    /* EXPR_COMPLIT: `(type){ init }`. cast_ty is the type, lhs the
+     * EXPR_INITLIST; sema allocates var_index (a synthesized local) and
+     * flattens the initializer into inits/ninits for irgen to place. */
+    struct initelem *inits;
+    int ninits;
     const char *desig_field; /* an initlist element's .field designator,
                               * NULL when it is positional */
     int desig_index;         /* an initlist element's [index] designator,

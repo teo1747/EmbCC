@@ -119,6 +119,7 @@ static int size_fold(const struct expr *e, long *out);
 static struct type *parse_array_dims(struct parser *ps, struct type *t);
 static struct type *parse_type_spec(struct parser *ps, int allow_body);
 static void parse_static_assert(struct parser *ps);
+static struct expr *parse_initializer(struct parser *ps);
 
 /* Declarator over a base type: leading stars, then either the function-
  * pointer form '( * [*...] [name] [dims] ) ( params )' or a plain
@@ -812,9 +813,11 @@ static struct expr *incdec(struct parser *ps, struct expr *target,
     return e;
 }
 
-static struct expr *parse_postfix(struct parser *ps)
+/* Applies postfix operators (call, [], ., ->, ++/--) to an already-parsed
+ * primary/compound-literal seed. Split out so a compound literal can take
+ * postfix too: `(struct P){...}.x`, `(int[]){1,2,3}[0]`. */
+static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
 {
-    struct expr *e = parse_primary(ps);
     for (;;) {
         if (cur(ps)->kind == TOK_LPAREN) {
             /* a call — through a name or any pointer-valued expression */
@@ -873,6 +876,11 @@ static struct expr *parse_postfix(struct parser *ps)
             return e;
         }
     }
+}
+
+static struct expr *parse_postfix(struct parser *ps)
+{
+    return parse_postfix_ops(ps, parse_primary(ps));
 }
 
 static struct expr *parse_unary(struct parser *ps)
@@ -942,6 +950,14 @@ static struct expr *parse_unary(struct parser *ps)
         if (at_type_start(ps)) {
             struct type *ct = parse_type_name(ps, parse_type_spec(ps, 0));
             expect(ps, TOK_RPAREN, "')'");
+            /* `(type){ ... }` is a compound literal (an unnamed object),
+             * not a cast — it can even take postfix operators. */
+            if (cur(ps)->kind == TOK_LBRACE) {
+                e = new_expr(EXPR_COMPLIT, t->line);
+                e->cast_ty = ct;
+                e->lhs = parse_initializer(ps);
+                return parse_postfix_ops(ps, e);
+            }
             e = new_expr(EXPR_CAST, t->line);
             e->cast_ty = ct;
             e->rhs = parse_unary(ps);

@@ -289,6 +289,7 @@ static int emit_cmp(struct ir_func *fn, enum binop pred, int a, int b,
 }
 
 static int gen_expr(struct ir_func *fn, struct expr *e);
+static int gen_complit(struct ir_func *fn, struct expr *e);
 
 /* va_arg(ap, T) for an INTEGER-class T (SysV). ap's value is a pointer to
  * a __va_list_tag { gp_offset u32, fp_offset u32, overflow_arg_area ptr,
@@ -391,6 +392,8 @@ static int gen_addr(struct ir_func *fn, struct expr *e)
         int off = emit_const(fn, e->memb->off, 8);
         return emit_bin(fn, IR_ADD, base, off, 8, 1);
     }
+    case EXPR_COMPLIT:
+        return gen_complit(fn, e);
     default:
         fprintf(stderr, "embcc: internal: address of a non-lvalue\n");
         exit(1);
@@ -398,6 +401,42 @@ static int gen_addr(struct ir_func *fn, struct expr *e)
 }
 
 static int gen_expr(struct ir_func *fn, struct expr *e);
+
+/* A compound literal `(type){ init }`: clear its synthesized slot, place the
+ * flattened initializer leaves (zero-fill + last-write-wins, like a declared
+ * aggregate), and return the object's address. */
+static int gen_complit(struct ir_func *fn, struct expr *e)
+{
+    struct ir_ins *ad = emit(fn);
+    ad->op = IR_ADDR;
+    ad->a = e->var_index;
+    ad->dst = new_temp(fn);
+    int base = ad->dst;
+    struct ir_ins *z = emit(fn);
+    z->op = IR_MEMZERO;
+    z->a = base;
+    /* e->ty is the decayed pointer for an array literal; the OBJECT's size
+     * is the undecayed array (or the type itself for struct/scalar). */
+    z->size = ty_size(e->undecayed ? e->undecayed : e->ty);
+    for (int k = 0; k < e->ninits; k++) {
+        int v = gen_expr(fn, e->inits[k].e);
+        int at = base;
+        if (e->inits[k].off) {
+            int o = emit_const(fn, e->inits[k].off, 8);
+            at = emit_bin(fn, IR_ADD, base, o, 8, 1);
+        }
+        if (e->inits[k].ty->kind == TY_STRUCT) {
+            struct ir_ins *m = emit(fn);
+            m->op = IR_MEMCPY;
+            m->a = at;
+            m->b = v;
+            m->size = ty_size(e->inits[k].ty);
+        } else {
+            emit_store(fn, at, v, e->inits[k].ty);
+        }
+    }
+    return base;
+}
 
 /* The unit being generated — for the string table. One compilation per
  * process, so a file-scope current-unit pointer is honest. */
@@ -675,6 +714,12 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             return bf_load(fn, addr, e->memb);
         if (e->undecayed || e->ty->kind == TY_STRUCT)
             return addr; /* array member decays; nested struct is addr */
+        return emit_load(fn, addr, e->ty);
+    }
+    case EXPR_COMPLIT: {
+        int addr = gen_complit(fn, e);
+        if (e->undecayed || e->ty->kind == TY_STRUCT)
+            return addr; /* an array decays; a struct is carried by address */
         return emit_load(fn, addr, e->ty);
     }
     case EXPR_ASSIGN: {

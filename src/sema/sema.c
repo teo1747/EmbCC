@@ -240,10 +240,21 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
 static int is_lvalue(const struct expr *e)
 {
     return e->kind == EXPR_VAR || e->kind == EXPR_DEREF ||
-           e->kind == EXPR_MEMBER;
+           e->kind == EXPR_MEMBER || e->kind == EXPR_COMPLIT;
 }
 
 static int const_fold(const struct expr *e, long *out);
+
+/* A growing (offset, type, value) list of flattened initializer leaves —
+ * defined here so both check_expr (compound literals) and check_stmt
+ * (declarations) can build one. */
+struct initbuf {
+    struct initelem *v;
+    int n, cap;
+};
+static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
+                         struct expr *init, struct type *ty, int off,
+                         struct initbuf *out);
 
 /* ---- expression checking ---- */
 
@@ -418,6 +429,41 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        e->rhs->memb->name);
         e->ty = ty_ptr(e->rhs->ty);
         break;
+    case EXPR_COMPLIT: {
+        /* `(type){ init }` — an unnamed object with automatic storage in
+         * this block. Give it a synthesized local slot and flatten the
+         * initializer into it exactly like a declared aggregate; the
+         * literal is an lvalue of that type (an array decays, a struct is
+         * carried by address, a scalar is loaded). */
+        struct type *ty = e->cast_ty;
+        if (ty->kind == TY_VOID || ty->kind == TY_FUNC)
+            diag_fatal(u->file, e->line,
+                       "a compound literal cannot have type %s",
+                       ty_name(ty));
+        if (ty->kind == TY_STRUCT && !ty->complete)
+            diag_fatal(u->file, e->line,
+                       "compound literal of incomplete type %s",
+                       ty_name(ty));
+        /* `(int[]){...}` takes its size from the initializer, as `int a[]`
+         * does. */
+        if (ty->kind == TY_ARRAY && ty->count == 0 &&
+            e->lhs->kind == EXPR_INITLIST)
+            ty = ty_array(ty->pointee, initlist_array_count(e->lhs));
+        e->cast_ty = ty;
+        e->var_index = scope_add(sc, "<compound literal>", ty, NULL);
+        struct initbuf ib = { 0, 0, 0 };
+        flatten_init(u, f, sc, e->lhs, ty, 0, &ib);
+        e->inits = ib.v;
+        e->ninits = ib.n;
+        e->lhs = NULL;
+        if (ty->kind == TY_ARRAY) {
+            e->undecayed = ty;   /* the object; e->ty is the decayed pointer */
+            e->ty = ty_ptr(ty->pointee);
+        } else {
+            e->ty = ty;
+        }
+        break;
+    }
     case EXPR_CAST:
         check_expr(u, f, sc, e->rhs);
         if (e->cast_ty->kind == TY_VOID) {
@@ -912,11 +958,6 @@ struct stmt *switch_stmts(struct stmt *body)
  * aggregate member is checked and converted like any assignment. C's
  * rule that unlisted elements are zero is honoured by irgen, which
  * clears the whole object first. */
-struct initbuf {
-    struct initelem *v;
-    int n, cap;
-};
-
 static void init_push(struct initbuf *b, int off, struct type *ty,
                       struct expr *e)
 {

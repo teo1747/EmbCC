@@ -60,8 +60,13 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
   reached, gaps zero-filled, a `[i]=` designator repositions the running
   index with positional elements continuing after it, later writes to a slot
   win. Verified against gcc; index-past-end is refused.
-- [ ] **5. Compound literals.** `&(struct P){ .x = 5 }`.
-  Error: `expected an expression, got '{'`.
+- [x] **5. Compound literals.** `&(struct P){ .x = 5 }` — DONE. `(type){init}`
+  becomes an unnamed object with automatic storage (a synthesized local slot),
+  initialized like a declared aggregate (zero-fill, designators, last-write-
+  wins). It is an lvalue: address-of, member access, array decay + indexing,
+  by-value passing, scalar literals, and initializing a local all work and
+  match gcc. *Seam:* a file-scope (static-storage) compound literal is refused
+  loudly, not lowered — it needs a synthesized static global.
 - [x] **6. A real `_Bool` type.** DONE. `_Bool` is a keyword and a distinct
   1-byte unsigned type (TY_BOOL); a store normalizes any nonzero scalar
   (integer, pointer, or float) to 1. `<stdbool.h>` now maps `bool` to it, so
