@@ -702,6 +702,7 @@ static struct expr *new_expr(enum expr_kind kind, int line)
     struct expr *e = xcalloc(1, sizeof *e);
     e->kind = kind;
     e->line = line;
+    e->desig_index = -1;      /* positional unless a [i] designator sets it */
     return e;
 }
 
@@ -1089,6 +1090,22 @@ static struct stmt *new_stmt(enum stmt_kind kind, int line)
 
 static struct stmt *parse_stmt(struct parser *ps, int allow_decl);
 
+/* The element count an initializer list implies for an unsized array:
+ * the highest index reached, where a `[i] =` designator repositions the
+ * running index and each element then advances it by one. */
+int initlist_array_count(const struct expr *il)
+{
+    int idx = 0, max = 0;
+    for (int i = 0; i < il->nelems; i++) {
+        if (il->elems[i]->desig_index >= 0)
+            idx = il->elems[i]->desig_index;
+        idx++;
+        if (idx > max)
+            max = idx;
+    }
+    return max;
+}
+
 /* An initializer: either an ordinary expression or a brace list, which
  * may nest. Sema matches it against the target type. */
 static struct expr *parse_initializer(struct parser *ps)
@@ -1103,13 +1120,21 @@ static struct expr *parse_initializer(struct parser *ps)
         if (cur(ps)->kind == TOK_EOF)
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "unterminated initializer");
-        /* A struct field designator `.name =`; array `[i] =` is a future
-         * seam (EmbCC's own source needs only the field form). */
+        /* A designator: struct field `.name =` or array element `[i] =`.
+         * One level only (no `[i].f =` chains — no EmbCC source needs it). */
         const char *field = NULL;
-        if (cur(ps)->kind == TOK_LBRACKET)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "array [index] designators are not supported yet");
-        if (cur(ps)->kind == TOK_DOT) {
+        long index = -1;
+        if (cur(ps)->kind == TOK_LBRACKET) {
+            int iline = cur(ps)->line;
+            advance(ps);
+            struct expr *ie = parse_cond(ps);
+            if (!size_fold(ie, &index) || index < 0)
+                diag_fatal(ps->lx.file, iline,
+                           "an array designator [index] must be a constant "
+                           ">= 0");
+            expect(ps, TOK_RBRACKET, "']'");
+            expect(ps, TOK_ASSIGN, "'=' after an array designator");
+        } else if (cur(ps)->kind == TOK_DOT) {
             advance(ps);
             if (cur(ps)->kind != TOK_IDENT)
                 diag_fatal(ps->lx.file, cur(ps)->line,
@@ -1125,6 +1150,7 @@ static struct expr *parse_initializer(struct parser *ps)
         }
         struct expr *el = parse_initializer(ps);
         el->desig_field = field;
+        el->desig_index = index >= 0 ? (int)index : -1;
         e->elems[e->nelems++] = el;
         if (cur(ps)->kind != TOK_COMMA)
             break;
@@ -1587,7 +1613,8 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
                     g->ty->pointee->kind == TY_CHAR)
                     g->ty = ty_array(g->ty->pointee, (int)ie->num);
                 else if (ie->kind == EXPR_INITLIST)
-                    g->ty = ty_array(g->ty->pointee, ie->nelems);
+                    g->ty = ty_array(g->ty->pointee,
+                                     initlist_array_count(ie));
                 else
                     diag_fatal(ps->lx.file, cur(ps)->line,
                                "'%s' needs a brace or string initializer "

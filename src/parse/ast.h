@@ -69,6 +69,8 @@ struct expr {
     int nelems;
     const char *desig_field; /* an initlist element's .field designator,
                               * NULL when it is positional */
+    int desig_index;         /* an initlist element's [index] designator,
+                              * -1 when it is positional */
     const char *asm_reg;  /* EXPR_VAR: a register-asm binding propagated
                            * from the variable's declaration, else NULL */
 };
@@ -264,5 +266,9 @@ struct unit {
     struct econst *econsts;
     struct topasm *topasm;
 };
+
+/* Element count an EXPR_INITLIST implies for an unsized array, honoring
+ * `[i] =` designators (defined in parse.c, used there and in sema). */
+int initlist_array_count(const struct expr *il);
 
 #endif

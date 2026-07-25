@@ -962,17 +962,24 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
 
     if (ty->kind == TY_ARRAY) {
         int esz = ty_size(ty->pointee);
-        if (ty->count && init->nelems > ty->count)
-            diag_fatal(u->file, init->line,
-                       "%d initializers for an array of %d",
-                       init->nelems, ty->count);
+        /* Positional by default; a `[i] =` designator repositions the
+         * running index and initialization continues positionally after it
+         * (later writes to the same slot win, matching C). */
+        int ai = 0;
         for (int i = 0; i < init->nelems; i++) {
-            if (init->elems[i]->desig_field)
-                diag_fatal(u->file, init->elems[i]->line,
+            struct expr *el = init->elems[i];
+            if (el->desig_field)
+                diag_fatal(u->file, el->line,
                            "field designator '.%s' in an array initializer",
-                           init->elems[i]->desig_field);
-            flatten_init(u, f, sc, init->elems[i], ty->pointee,
-                         off + i * esz, out);
+                           el->desig_field);
+            if (el->desig_index >= 0)
+                ai = el->desig_index;
+            if (ty->count && ai >= ty->count)
+                diag_fatal(u->file, el->line,
+                           "initializer index %d is past the end of an "
+                           "array of %d", ai, ty->count);
+            flatten_init(u, f, sc, el, ty->pointee, off + ai * esz, out);
+            ai++;
         }
         return;
     }
@@ -1304,8 +1311,9 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                                       (int)s->expr->num);
             } else if (s->expr && s->expr->kind == EXPR_INITLIST &&
                        s->dty->kind == TY_ARRAY && s->dty->count == 0) {
-                /* an omitted array size is the element count */
-                s->dty = ty_array(s->dty->pointee, s->expr->nelems);
+                /* an omitted array size is the highest index reached */
+                s->dty = ty_array(s->dty->pointee,
+                                  initlist_array_count(s->expr));
             }
             /* The name is in scope WITHIN its own initializer (C11
              * 6.2.1p7: scope begins just after the declarator), so the

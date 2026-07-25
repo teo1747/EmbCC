@@ -109,13 +109,14 @@ check array-scalar-init \
     "brace initializer or a string"
 check too-many-initializers \
     'int main(void) { int a[2] = {1,2,3}; return a[0]; }' \
-    "3 initializers for an array of 2"
+    "past the end of an array of 2"
 check non-char-array-from-string \
     'int main(void) { int a[4] = "abc"; return a[0]; }' \
     "only a char array"
-check array-index-designator \
-    'int main(void) { int a[3] = { [1] = 5 }; return a[1]; }' \
-    "\[index\] designators are not supported"
+check array-index-past-end \
+    'int a[3] = { [5] = 1 };
+int main(void) { return 0; }' \
+    "past the end"
 check field-designator-in-array \
     'int main(void) { int a[2] = { .x = 1 }; return a[0]; }' \
     "field designator '.x' in an array"

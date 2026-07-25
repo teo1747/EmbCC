@@ -55,9 +55,11 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
   initializer that targets a bitfield is refused loudly (not miscompiled) —
   needs bit-masked merge on `initelem` in both the static-byte and local
   lowerings; assign in a statement meanwhile.
-- [ ] **4. Designated ARRAY initializers.** `int a[5] = { [2]=9, [4]=1 };`
-  Error: `array [index] designators are not supported`. (The `.field` form
-  already works.) Dispatch/lookup tables use these.
+- [x] **4. Designated ARRAY initializers.** `int a[5] = { [2]=9, [4]=1 };` —
+  DONE. File-scope and local, unsized arrays sized to the highest index
+  reached, gaps zero-filled, a `[i]=` designator repositions the running
+  index with positional elements continuing after it, later writes to a slot
+  win. Verified against gcc; index-past-end is refused.
 - [ ] **5. Compound literals.** `&(struct P){ .x = 5 }`.
   Error: `expected an expression, got '{'`.
 - [ ] **6. A real `_Bool` type.** Today `bool` is a `#define` for `int`, so
