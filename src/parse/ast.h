@@ -22,7 +22,8 @@ enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
-                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT };
+                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT,
+                 EXPR_GENERIC };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -72,6 +73,12 @@ struct expr {
      * flattens the initializer into inits/ninits for irgen to place. */
     struct initelem *inits;
     int ninits;
+    /* EXPR_GENERIC: `_Generic(lhs, T1: e1, ..., default: eN)`. gtypes[i] is
+     * an association's type (NULL for the `default` case) and gexprs[i] its
+     * expression; sema picks the one matching lhs's type and becomes it. */
+    struct type **gtypes;
+    struct expr **gexprs;
+    int ngen;
     const char *desig_field; /* an initlist element's .field designator,
                               * NULL when it is positional */
     int desig_index;         /* an initlist element's [index] designator,

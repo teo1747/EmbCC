@@ -977,6 +977,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return gen_expr(fn, e->rhs);
     case EXPR_INITLIST:
         break; /* consumed by sema's flattening; never evaluated */
+    case EXPR_GENERIC:
+        break; /* sema replaced it with the selected expression */
     case EXPR_COMPOUND: {
         /* the address is computed ONCE — the whole reason this is not
          * desugared to `x = x op y` */

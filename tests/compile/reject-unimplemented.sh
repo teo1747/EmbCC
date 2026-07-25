@@ -326,3 +326,6 @@ check static-assert-false \
     '_Static_assert(sizeof(int) == 8, "int is not eight bytes");
 int main(void) { return 0; }' \
     "static assertion failed: int is not eight bytes"
+check generic-no-match \
+    'int main(void) { double d = 0; return _Generic(d, int: 1, long: 2); }' \
+    "no _Generic association matches"

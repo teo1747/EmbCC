@@ -71,13 +71,18 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
   1-byte unsigned type (TY_BOOL); a store normalizes any nonzero scalar
   (integer, pointer, or float) to 1. `<stdbool.h>` now maps `bool` to it, so
   `sizeof(bool)==1`. Verified against gcc.
-- [~] **7. C11 niceties.**
-  - [x] `_Static_assert(expr, "msg")` — DONE. Evaluated at parse time; legal
-    at file scope, in a struct/union body, and in a block; the message is
-    optional (C23). A false assertion is a fatal error naming the message.
-    (`size_fold` also learned `&&`/`||`, so constant asserts like
-    `sizeof(long)==8 && sizeof(void*)==8` fold.)
-  - [ ] `_Generic`, anonymous struct/union members. Still niche/pending.
+- [x] **7. C11 niceties.** All DONE.
+  - [x] `_Static_assert(expr, "msg")` — evaluated at parse time; legal at file
+    scope, in a struct/union body, and in a block; the message is optional
+    (C23). A false assertion is a fatal error naming the message.
+    (`size_fold` also learned `&&`/`||`.)
+  - [x] `_Generic(ctrl, T: e, ..., default: e)` — the arm whose type matches
+    the controlling expression (after its lvalue conversion) is selected at
+    compile time; the controlling expression is not evaluated; no match and
+    no default is an error. Verified against gcc.
+  - [x] Anonymous struct/union members — a nameless `struct{...};`/`union{...};`
+    member's fields are reached through the enclosing object (member lookup
+    descends into them with cumulative offsets). Verified against gcc.
 
 ## Tier 3 — integration / ergonomics (NOT compiler gaps)
 

@@ -60,6 +60,7 @@ static const struct {
     { "double", TOK_KW_DOUBLE },
     { "_Bool", TOK_KW_BOOL },
     { "_Static_assert", TOK_KW_STATIC_ASSERT },
+    { "_Generic", TOK_KW_GENERIC },
     { "unsigned", TOK_KW_UNSIGNED },
     { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
@@ -450,6 +451,7 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_DOUBLE: return "'double'";
     case TOK_KW_BOOL: return "'_Bool'";
     case TOK_KW_STATIC_ASSERT: return "'_Static_assert'";
+    case TOK_KW_GENERIC: return "'_Generic'";
     case TOK_KW_UNSIGNED: return "'unsigned'";
     case TOK_KW_SIGNED: return "'signed'";
     case TOK_KW_SIZEOF: return "'sizeof'";

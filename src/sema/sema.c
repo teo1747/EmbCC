@@ -256,6 +256,27 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                          struct expr *init, struct type *ty, int off,
                          struct initbuf *out);
 
+/* Resolve `name` as a member of `base`, descending into any anonymous
+ * struct/union members (C11 6.7.2.1p13: their members are reached as if
+ * they belonged to the enclosing type). On success fills *out with the leaf
+ * member — a copy, its offset made cumulative from `base` — and returns 1. */
+static int find_member_deep(struct type *base, const char *name,
+                            struct member *out, int base_off)
+{
+    for (int i = 0; i < base->nmembers; i++) {
+        struct member *m = &base->members[i];
+        if (m->name && strcmp(m->name, name) == 0) {
+            *out = *m;
+            out->off += base_off;
+            return 1;
+        }
+        if (!m->name && !m->is_bitfield && m->ty->kind == TY_STRUCT &&
+            find_member_deep(m->ty, name, out, base_off + m->off))
+            return 1;
+    }
+    return 0;
+}
+
 /* ---- expression checking ---- */
 
 static void check_expr(struct unit *u, struct func *f, struct scope *sc,
@@ -464,6 +485,31 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         }
         break;
     }
+    case EXPR_GENERIC: {
+        /* Pick the association whose type matches the controlling
+         * expression's (after its lvalue conversion — an array/function
+         * operand already carries its decayed type here), else `default`.
+         * The controlling expression is not evaluated (C11 6.5.1.1); the
+         * node simply becomes the selected expression. */
+        check_expr(u, f, sc, e->lhs);
+        struct expr *chosen = NULL, *deflt = NULL;
+        for (int i = 0; i < e->ngen; i++) {
+            if (!e->gtypes[i]) { deflt = e->gexprs[i]; continue; }
+            if (ty_equal(e->lhs->ty, e->gtypes[i])) {
+                chosen = e->gexprs[i];
+                break;
+            }
+        }
+        if (!chosen)
+            chosen = deflt;
+        if (!chosen)
+            diag_fatal(u->file, e->line,
+                       "no _Generic association matches type %s",
+                       ty_name(e->lhs->ty));
+        check_expr(u, f, sc, chosen);
+        *e = *chosen;   /* become the selected expression */
+        break;
+    }
     case EXPR_CAST:
         check_expr(u, f, sc, e->rhs);
         if (e->cast_ty->kind == TY_VOID) {
@@ -588,10 +634,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "%s is incomplete here (its body comes later "
                        "or never)", ty_name(base));
-        e->memb = ty_find_member(base, e->name);
-        if (!e->memb)
+        struct member *mm = xcalloc(1, sizeof *mm);
+        if (!find_member_deep(base, e->name, mm, 0))
             diag_fatal(u->file, e->line, "%s has no member '%s'",
                        ty_name(base), e->name);
+        e->memb = mm;
         e->ty = e->memb->ty;
         if (e->ty->kind == TY_ARRAY) {
             e->undecayed = e->ty;

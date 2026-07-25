@@ -624,7 +624,11 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
                 diag_fatal(ps->lx.file, mline,
                            "a member cannot be a function — use a "
                            "function pointer");
-            if (!mname && !is_bf)
+            /* An anonymous struct/union member (`struct { ... };` with no
+             * declarator) is legal C11 — its members are reached as if they
+             * belonged to the enclosing type. A nameless non-aggregate is
+             * still an error. */
+            if (!mname && !is_bf && mty->kind != TY_STRUCT)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
@@ -734,6 +738,35 @@ static struct expr *parse_primary(struct parser *ps)
     struct expr *e;
 
     switch (t->kind) {
+    case TOK_KW_GENERIC: {
+        /* _Generic(controlling, T1: e1, ..., default: eN) — a compile-time
+         * type-directed selection; sema picks the matching arm. */
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after _Generic");
+        e = new_expr(EXPR_GENERIC, t->line);
+        e->lhs = parse_expr(ps);          /* the controlling expression */
+        int cap = 0;
+        while (cur(ps)->kind == TOK_COMMA) {
+            advance(ps);
+            struct type *at = NULL;
+            if (cur(ps)->kind == TOK_KW_DEFAULT)
+                advance(ps);              /* the default association */
+            else
+                at = parse_type_name(ps, parse_type_spec(ps, 0));
+            expect(ps, TOK_COLON, "':' in a _Generic association");
+            struct expr *ae = parse_expr(ps);
+            if (e->ngen == cap) {
+                cap = cap ? cap * 2 : 4;
+                e->gtypes = xrealloc(e->gtypes, (size_t)cap * sizeof *e->gtypes);
+                e->gexprs = xrealloc(e->gexprs, (size_t)cap * sizeof *e->gexprs);
+            }
+            e->gtypes[e->ngen] = at;
+            e->gexprs[e->ngen] = ae;
+            e->ngen++;
+        }
+        expect(ps, TOK_RPAREN, "')' to close _Generic");
+        return e;
+    }
     case TOK_NUM:
         e = new_expr(EXPR_NUM, t->line);
         e->num = t->num;
