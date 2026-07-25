@@ -86,8 +86,9 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
 
 ## Tier 3 — integration / ergonomics (NOT compiler gaps)
 
-- [ ] **8. Accept `-isystem`** (today only `-I`). Trivial; helps drive real
-  builds whose scripts pass `-isystem`.
+- [x] **8. Accept `-isystem`** — DONE. `-isystem DIR` and `-isystemDIR` are
+  accepted as an include directory (EmbCC keeps one search path), so build
+  scripts that pass it work.
 - **"cannot find include file"** = a missing/inconsistent libc header set on the
   path — an integration matter, not a language gap.
 - **Implicit-declaration errors** = CORRECT C99 strictness; the fix is prototypes,
@@ -105,3 +106,12 @@ static/hex float, u64<->double, weak undefined refs.
 
 Tier 1 both land + a corpus re-run shows real C getting materially further before
 hitting a Tier-2 feature; full test suite + self-host fixed point stay green.
+
+## Status
+
+All of Tier 1, Tier 2, and the Tier-3 `-isystem` item are DONE — each landed
+with a gcc-refereed exec test, the full suite green (80/80), and the self-host
+fixed point holding. Remaining open seams, each refused loudly rather than
+miscompiled: (a) a braced initializer targeting a **bitfield**, and (b) a
+**file-scope compound literal** (static storage). The other Tier-3 entries are
+integration notes, not compiler work.

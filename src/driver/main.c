@@ -485,6 +485,21 @@ int main(int argc, char **argv)
                 return 1;
             }
             incdirs[nincdirs++] = dir;
+        } else if (strncmp(argv[i], "-isystem", 8) == 0) {
+            /* A system-include directory. EmbCC keeps one search path, so
+             * -isystem DIR is accepted as an -I DIR — enough to drive real
+             * build scripts that pass it. */
+            const char *dir = argv[i][8] ? argv[i] + 8
+                                         : (i + 1 < argc ? argv[++i] : 0);
+            if (!dir) {
+                fprintf(stderr, "embcc: -isystem needs a directory\n");
+                return 1;
+            }
+            if (nincdirs >= MAX_INCDIRS) {
+                fprintf(stderr, "embcc: too many include directories\n");
+                return 1;
+            }
+            incdirs[nincdirs++] = dir;
         } else if (strcmp(argv[i], "-o") == 0) {
             if (i + 1 == argc) {
                 fprintf(stderr, "embcc: -o needs a FILE\n");
