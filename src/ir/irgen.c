@@ -394,6 +394,70 @@ static int emit_isz(struct ir_func *fn, int v, int w)
     return i->dst;
 }
 
+/* An I2F/F2I instruction, spelled out because unsigned-64 conversions build
+ * several by hand. `a` is the source vreg. */
+static int emit_i2f(struct ir_func *fn, int a, int srcw, int dstw)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_I2F; i->a = a; i->size = srcw; i->sign = 1; i->w = dstw;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+static int emit_f2i(struct ir_func *fn, int a, int srcw, int dstw)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_F2I; i->a = a; i->size = srcw; i->sign = 1; i->w = dstw;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
+/* unsigned-64 -> floating. SSE2's cvtsi2sd is SIGNED, so a u64 with its top bit
+ * set would convert as a huge negative. Split into two 32-bit halves -- each is
+ * positive and < 2^32, so cvtsi2sd is exact -- then hi*2^32 + lo. Both partials
+ * are exact doubles, so the single add rounds the true u64 once (correctly
+ * rounded). For a float target do it in double first (exact) then narrow, which
+ * avoids a double rounding. */
+static int gen_u64_to_float(struct ir_func *fn, int v, int tsize)
+{
+    int hi = emit_bin(fn, IR_SHR, v, emit_const(fn, 32, 4), 8, 0);      /* v >> 32 */
+    int lo = emit_bin(fn, IR_AND, v, emit_const(fn, 0xffffffffL, 8), 8, 1);
+    int hd = emit_i2f(fn, hi, 8, 8);
+    int ld = emit_i2f(fn, lo, 8, 8);
+    int hs = emit_fbin(fn, IR_MUL, hd, emit_fconst(fn, 4294967296.0, 8), 8);
+    int res = emit_fbin(fn, IR_ADD, hs, ld, 8);
+    if (tsize == 4) {   /* narrow the exact double to float: one rounding */
+        struct ir_ins *nf = emit(fn);
+        nf->op = IR_F2F; nf->a = res; nf->size = 8; nf->w = 4;
+        nf->dst = new_temp(fn);
+        return nf->dst;
+    }
+    return res;
+}
+
+/* floating -> unsigned-64. cvttsd2si is SIGNED: exact for v < 2^63, but v in
+ * [2^63, 2^64) overflows it. For those, convert (v - 2^63) and set the top bit
+ * back. Branch on v >= 2^63. */
+static int gen_float_to_u64(struct ir_func *fn, int v, int fsize)
+{
+    int two63 = emit_fconst(fn, 9223372036854775808.0, fsize);   /* 2^63 */
+    struct ir_ins *cmp = emit(fn);                               /* c = v >= 2^63 */
+    cmp->op = IR_CMP; cmp->pred = B_GE; cmp->a = v; cmp->b = two63;
+    cmp->w = fsize; cmp->flt = 1; cmp->dst = new_temp(fn);
+    int res = new_temp(fn);
+    int l_small = new_label(fn), l_done = new_label(fn);
+    emit_brz(fn, cmp->dst, 4, l_small);                          /* v < 2^63 -> direct */
+    /* v >= 2^63: (u64)(v - 2^63) with the sign bit flipped back on */
+    int vm = emit_fbin(fn, IR_SUB, v, two63, fsize);
+    int big = emit_bin(fn, IR_XOR, emit_f2i(fn, vm, fsize, 8),
+                       emit_const(fn, (long)1 << 63, 8), 8, 0);
+    emit_mov(fn, res, big);
+    emit_jmp(fn, l_done);
+    emit_label(fn, l_small);
+    emit_mov(fn, res, emit_f2i(fn, v, fsize, 8));
+    emit_label(fn, l_done);
+    return res;
+}
+
 /* Change a temp's representation between type classes: truncating to a
  * narrow type re-extends from its low bytes; widening extends per the
  * SOURCE's signedness. Free conversions return the same temp. */
@@ -419,14 +483,17 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
             return i->dst;
         }
         if (ty_is_float(to)) {
+            /* unsigned 64-bit -> float needs the split-and-add fixup; every
+             * other integer source goes straight through signed cvtsi2sd. */
+            if (from->is_unsigned && ty_size(from) == 8)
+                return gen_u64_to_float(fn, v, tsize);
             /* int -> float, and the source WIDTH matters: a 32-bit
              * operation zero-extends its result into the 8-byte slot
              * regardless of signedness, so a negative int read back as
              * 64 bits is 2^32 too large. Read a signed 32-bit source as
              * 32 bits and let cvtsi2sd interpret the sign; read an
              * unsigned int as 64, where the zero extension IS the value
-             * (which is what makes it exact). unsigned long is refused
-             * by sema — SSE2 cannot do it. */
+             * (which is what makes it exact). */
             int srcw = 4;
             if (ty_wide(from) ||
                 (from->is_unsigned && ty_size(from) == 4))
@@ -440,6 +507,10 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
             i->dst = new_temp(fn);
             return i->dst;
         }
+        /* float -> unsigned 64-bit needs the 2^63 bias fixup (cvttsd2si is
+         * signed); other targets use the signed convert-then-narrow below. */
+        if (to->is_unsigned && ty_size(to) == 8)
+            return gen_float_to_u64(fn, v, fsize);
         /* float -> int: truncates toward zero, as C requires. Convert
          * to the 64-bit form then narrow, so unsigned int lands right. */
         i = emit(fn);

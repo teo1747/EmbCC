@@ -18,7 +18,7 @@ INC="-I ../myos/user/emlibc/include -I include -I ../myos/user/lib"
 
 ---
 
-- [ ] **1. Weak UNDEFINED references** (`__attribute__((weak))` on an `extern`).
+- [x] **1. Weak UNDEFINED references** (`__attribute__((weak))` on an `extern`).
   `stdlib.c`: `extern void emlibc_stdio_flush_all(void) __attribute__((weak));`
   then `if (emlibc_stdio_flush_all) emlibc_stdio_flush_all();`.
   gcc emits the symbol as `w` (weak undef) → EmbLD resolves an unresolved weak to
@@ -30,7 +30,7 @@ INC="-I ../myos/user/emlibc/include -I include -I ../myos/user/lib"
   *Sidestep now:* the flush hook stays weak (helps the gcc build) but the on-OS
   self-host just includes `stdio.o` in the link so the symbol is defined.
 
-- [ ] **2. Unsigned 64-bit ↔ `double` conversion.**
+- [x] **2. Unsigned 64-bit ↔ `double` conversion.**
   `stdio.c` `%f` formatter did `unsigned long long ip = (unsigned long long)v;`
   and `(double)ip`.
   Error: `converting between unsigned long and double is not supported yet

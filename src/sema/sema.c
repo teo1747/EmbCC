@@ -198,21 +198,6 @@ static void need_arith(struct unit *u, struct expr *e, const char *what)
  * refuses instead of quietly producing the wrong number (THE RULE).
  * Every other combination is exact: narrower integers are converted
  * through their 64-bit form. */
-static void check_u64_float(struct unit *u, int line, struct type *a,
-                            struct type *b)
-{
-    struct type *i = ty_is_float(a) ? b : a;
-    struct type *fp = ty_is_float(a) ? a : b;
-    if (!ty_is_float(fp) || !ty_is_integer(i))
-        return;
-    if (i->kind == TY_LONG && i->is_unsigned)
-        diag_fatal(u->file, line,
-                   "converting between unsigned long and %s is not "
-                   "supported yet (SSE2 has no unsigned 64-bit "
-                   "conversion; cast through a signed long if the value "
-                   "fits)", ty_name(fp));
-}
-
 static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                                    struct type *to, const char *ctx)
 {
@@ -222,10 +207,8 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                        ctx, ty_name(rhs->ty), ty_name(to));
         return rhs; /* same struct type: passed/returned as its bytes */
     }
-    if (ty_is_arith(to) && ty_is_arith(rhs->ty)) {
-        check_u64_float(u, rhs->line, to, rhs->ty);
+    if (ty_is_arith(to) && ty_is_arith(rhs->ty))
         return mk_cast(rhs, to);
-    }
     if (to->kind == TY_PTR) {
         if (rhs->ty->kind == TY_PTR &&
             (ty_equal(rhs->ty, to) || to->pointee->kind == TY_VOID ||
@@ -442,8 +425,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "cannot convert between %s and %s",
                        ty_name(e->rhs->ty), ty_name(e->cast_ty));
-        if (ty_is_arith(e->cast_ty) && ty_is_arith(e->rhs->ty))
-            check_u64_float(u, e->line, e->cast_ty, e->rhs->ty);
         e->ty = e->cast_ty;
         break;
     case EXPR_COMMA:
@@ -529,7 +510,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             need_integer(u, e->rhs, "this operator");
         }
         e->cast_ty = arith_common(e->lhs->ty, e->rhs->ty);
-        check_u64_float(u, e->line, e->cast_ty, e->rhs->ty);
         e->rhs = mk_cast(e->rhs, e->cast_ty);
         e->ty = e->lhs->ty;
         break;

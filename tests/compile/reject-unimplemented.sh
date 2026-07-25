@@ -223,9 +223,6 @@ check angle-include-no-path \
     '#include <stdio.h>
 int main(void) { return 0; }' \
     "cannot find include file"
-check u64-to-double \
-    'int main(void) { unsigned long u = 1; double d = u; return (int)d; }' \
-    "unsigned 64-bit conversion"
 check float-modulo \
     'int main(void) { double a = 5.0; double b = 2.0; return (int)(a % b); }' \
     "needs an integer"

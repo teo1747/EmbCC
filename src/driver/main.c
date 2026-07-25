@@ -337,7 +337,9 @@ static int compile(const char *in, const char *out, int pp_only)
         if (!callee->sym_ndx)
             callee->sym_ndx =
                 elfw_add_symbol(w, callee->name, 0, 0,
-                                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE),
+                                ELF64_ST_INFO(callee->is_weak ? STB_WEAK
+                                                              : STB_GLOBAL,
+                                              STT_NOTYPE),
                                 SHN_UNDEF);
         elfw_add_rela(w, text_ndx, (Elf64_Addr)ext[i].patch_off,
                       callee->sym_ndx, R_X86_64_PLT32, -4);
@@ -405,7 +407,8 @@ static int compile(const char *in, const char *out, int pp_only)
         if (!tf->sym_ndx)
             tf->sym_ndx = elfw_add_symbol(
                 w, tf->name, 0, 0,
-                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE), SHN_UNDEF);
+                ELF64_ST_INFO(tf->is_weak ? STB_WEAK : STB_GLOBAL,
+                              STT_NOTYPE), SHN_UNDEF);
         elfw_add_rela(w, text_ndx, (Elf64_Addr)fs[i].patch_off,
                       tf->sym_ndx, R_X86_64_PC32, -4);
     }
