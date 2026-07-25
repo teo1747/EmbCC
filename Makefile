@@ -19,6 +19,7 @@ SRCS := \
 	src/sema/sema.c \
 	src/sema/type.c \
 	src/ir/irgen.c \
+	src/opt/opt.c \
 	src/codegen/codegen.c \
 	src/debug/dwarf.c \
 	src/asm/emit.c \
@@ -41,10 +42,11 @@ embcc: $(OBJS)
 # so the linker can emit a native .embdbg at link time through the SAME format
 # writer the embdbg tool uses — one implementation, not two.
 embld: tools/embld/embld.c src/link/link.c src/driver/util.c \
-       src/link/link.h src/elf/elf.h tools/embdbg/embdbg.c tools/embdbg/embdbg_core.h
+       src/link/link.h src/elf/elf.h src/embx/embx.c src/embx/embx.h \
+       tools/embdbg/embdbg.c tools/embdbg/embdbg_core.h
 	$(CC) $(CFLAGS) -DEMBDBG_NO_MAIN -Wno-unused-function -o $@ \
 	    tools/embld/embld.c src/link/link.c \
-	    src/driver/util.c tools/embdbg/embdbg.c
+	    src/driver/util.c src/embx/embx.c tools/embdbg/embdbg.c
 
 # embread — the EMBX dumper/verifier (EMBX spec §9). A separate binary,
 # not part of embcc: it reads images, it does not compile. The EMBX

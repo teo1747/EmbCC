@@ -28,9 +28,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
-#include <unistd.h>
-#include <termios.h>
-#include <sys/ioctl.h>
+#ifndef EMBDBG_NO_MAIN
+#include <unistd.h>       /* isatty/read  — interactive TUI only */
+#include <termios.h>      /* raw terminal mode */
+#include <sys/ioctl.h>    /* TIOCGWINSZ */
+#endif
 
 #include "../../src/elf/elf.h"
 
@@ -1137,6 +1139,13 @@ static void sha256(const unsigned char *data, long n, unsigned char out[32])
     }
 }
 
+/* Exposed for EmbLD's EMBX emitter (embdbg_core.h): the same SHA-256 that
+ * stamps a .embdbg build_id stamps an EMBX build_id — one hash, one discipline. */
+void embdbg_sha256(const unsigned char *data, long n, unsigned char out[32])
+{
+    sha256(data, n, out);
+}
+
 /* --- little-endian output buffer --- */
 struct ob { unsigned char *p; long n, cap; };
 static void ob_need(struct ob *b, long k) {
@@ -1515,6 +1524,9 @@ static void tui_plain(struct img *m)
     }
 }
 
+#ifndef EMBDBG_NO_MAIN   /* interactive TUI — raw mode, needs termios/ioctl.
+                            Excluded when embdbg.c is linked into embld as the
+                            link-time .embdbg emitter (embdbg_emit_objects). */
 static struct termios g_oldt;
 static int g_raw = 0;
 static void raw_off(void)
@@ -1816,6 +1828,7 @@ static void cmd_tui(struct img *m, int argc, char **argv)
     if (isatty(0) && isatty(1)) tui_interactive(m, have ? &c : NULL, have);
     else tui_plain(m);            /* piped/non-tty: a scriptable full dump */
 }
+#endif /* EMBDBG_NO_MAIN — interactive TUI */
 
 /* Parse one relocatable object's DWARF into a fresh model, biasing every code
  * address by `bias` (its final .text vaddr) so a .o's .text-relative addresses

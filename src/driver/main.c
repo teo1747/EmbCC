@@ -17,6 +17,7 @@
 #include "../cpp/predef.h"
 #include "../elf/write.h"
 #include "../ir/ir.h"
+#include "../opt/opt.h"
 #include "../parse/parse.h"
 #include "../sema/sema.h"
 #include "util.h"
@@ -115,6 +116,10 @@ static int nincdirs;
  * (self-host builds without -g). */
 static int want_debug;
 
+/* -O level. 0 (the default) runs no optimizer, so output is byte-for-byte
+ * as before — the property the self-host fixed point rests on. */
+static int opt_level;
+
 static int compile(const char *in, const char *out, int pp_only)
 {
     char *src = read_file(in);
@@ -145,6 +150,7 @@ static int compile(const char *in, const char *out, int pp_only)
     }
 
     struct ir_unit *iu = irgen(u);
+    opt_run(iu, opt_level);
 
     struct code text = { 0, 0, 0 };
     struct extcall *ext;
@@ -153,7 +159,7 @@ static int compile(const char *in, const char *out, int pp_only)
     struct fsite *fs;
     int next, nstrs, ngs, nfs;
     codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
-                 &fs, &nfs, want_debug);
+                 &fs, &nfs, want_debug, opt_level >= 1);
 
     /* Lay out the defined globals: initialized -> .data, zero -> .bss,
      * each aligned to its (element) size. */
@@ -337,7 +343,9 @@ static int compile(const char *in, const char *out, int pp_only)
         if (!callee->sym_ndx)
             callee->sym_ndx =
                 elfw_add_symbol(w, callee->name, 0, 0,
-                                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE),
+                                ELF64_ST_INFO(callee->is_weak ? STB_WEAK
+                                                              : STB_GLOBAL,
+                                              STT_NOTYPE),
                                 SHN_UNDEF);
         elfw_add_rela(w, text_ndx, (Elf64_Addr)ext[i].patch_off,
                       callee->sym_ndx, R_X86_64_PLT32, -4);
@@ -405,7 +413,8 @@ static int compile(const char *in, const char *out, int pp_only)
         if (!tf->sym_ndx)
             tf->sym_ndx = elfw_add_symbol(
                 w, tf->name, 0, 0,
-                ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE), SHN_UNDEF);
+                ELF64_ST_INFO(tf->is_weak ? STB_WEAK : STB_GLOBAL,
+                              STT_NOTYPE), SHN_UNDEF);
         elfw_add_rela(w, text_ndx, (Elf64_Addr)fs[i].patch_off,
                       tf->sym_ndx, R_X86_64_PC32, -4);
     }
@@ -470,6 +479,19 @@ int main(int argc, char **argv)
             pp_only = 1;
         } else if (strcmp(argv[i], "-g") == 0) {
             want_debug = 1;
+        } else if (strncmp(argv[i], "-O", 2) == 0) {
+            /* -O / -O1 / -O2 / -O3 enable the optimizer (one level for now);
+             * -O0 turns it off. Anything else after -O is an error. */
+            const char *lvl = argv[i] + 2;
+            if (lvl[0] == '\0')
+                opt_level = 1;
+            else if (lvl[1] == '\0' && lvl[0] >= '0' && lvl[0] <= '9')
+                opt_level = lvl[0] - '0';
+            else {
+                fprintf(stderr, "embcc: unknown optimization flag '%s'\n",
+                        argv[i]);
+                return 1;
+            }
         } else if (strncmp(argv[i], "-I", 2) == 0) {
             const char *dir = argv[i][2] ? argv[i] + 2
                                          : (i + 1 < argc ? argv[++i] : 0);
@@ -479,6 +501,21 @@ int main(int argc, char **argv)
             }
             if (nincdirs >= MAX_INCDIRS) {
                 fprintf(stderr, "embcc: too many -I directories\n");
+                return 1;
+            }
+            incdirs[nincdirs++] = dir;
+        } else if (strncmp(argv[i], "-isystem", 8) == 0) {
+            /* A system-include directory. EmbCC keeps one search path, so
+             * -isystem DIR is accepted as an -I DIR — enough to drive real
+             * build scripts that pass it. */
+            const char *dir = argv[i][8] ? argv[i] + 8
+                                         : (i + 1 < argc ? argv[++i] : 0);
+            if (!dir) {
+                fprintf(stderr, "embcc: -isystem needs a directory\n");
+                return 1;
+            }
+            if (nincdirs >= MAX_INCDIRS) {
+                fprintf(stderr, "embcc: too many include directories\n");
                 return 1;
             }
             incdirs[nincdirs++] = dir;

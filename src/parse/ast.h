@@ -22,7 +22,8 @@ enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
-                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG };
+                 EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT,
+                 EXPR_GENERIC };
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -67,18 +68,35 @@ struct expr {
                            * for a call through a function pointer */
     struct expr **elems;  /* EXPR_INITLIST */
     int nelems;
+    /* EXPR_COMPLIT: `(type){ init }`. cast_ty is the type, lhs the
+     * EXPR_INITLIST; sema allocates var_index (a synthesized local) and
+     * flattens the initializer into inits/ninits for irgen to place. */
+    struct initelem *inits;
+    int ninits;
+    /* EXPR_GENERIC: `_Generic(lhs, T1: e1, ..., default: eN)`. gtypes[i] is
+     * an association's type (NULL for the `default` case) and gexprs[i] its
+     * expression; sema picks the one matching lhs's type and becomes it. */
+    struct type **gtypes;
+    struct expr **gexprs;
+    int ngen;
     const char *desig_field; /* an initlist element's .field designator,
                               * NULL when it is positional */
+    int desig_index;         /* an initlist element's [index] designator,
+                              * -1 when it is positional */
     const char *asm_reg;  /* EXPR_VAR: a register-asm binding propagated
                            * from the variable's declaration, else NULL */
 };
 
 /* An aggregate initializer, flattened by sema into (offset, type,
- * value) triples so irgen never has to re-walk the type. */
+ * value) triples so irgen never has to re-walk the type. A bitfield leaf
+ * additionally carries its position within the storage unit at `off`
+ * (bit_width 0 means an ordinary, non-bitfield leaf). */
 struct initelem {
     int off;
     struct type *ty;
     struct expr *e;
+    int bit_off;
+    int bit_width;
 };
 
 /* A relocation inside a static object's byte image: a pointer-typed slot
@@ -96,7 +114,8 @@ struct greloc {
 
 enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
                  STMT_FOR, STMT_BLOCK, STMT_BREAK, STMT_CONTINUE,
-                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT, STMT_ASM };
+                 STMT_DO, STMT_SWITCH, STMT_CASE, STMT_DEFAULT, STMT_ASM,
+                 STMT_LABEL, STMT_GOTO };
 
 /* One operand of an extended-asm statement: a constraint string and the C
  * expression it binds. Output constraints begin with '=' (or '+') and name
@@ -129,6 +148,7 @@ struct stmt {
     const char *name;     /* STMT_DECL */
     struct type *dty;     /* STMT_DECL: declared type */
     int is_static;        /* STMT_DECL: a static local -> its own global */
+    int is_extern;        /* STMT_DECL: block-scope extern -> a unit global/func */
     struct initelem *inits; /* STMT_DECL: flattened aggregate init */
     int ninits;
     struct global *sglob; /* STMT_DECL: the global a static local became */
@@ -262,5 +282,9 @@ struct unit {
     struct econst *econsts;
     struct topasm *topasm;
 };
+
+/* Element count an EXPR_INITLIST implies for an unsized array, honoring
+ * `[i] =` designators (defined in parse.c, used there and in sema). */
+int initlist_array_count(const struct expr *il);
 
 #endif

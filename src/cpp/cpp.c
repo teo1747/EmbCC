@@ -76,6 +76,17 @@ static void cerr(struct src *s, const char *msg, const char *arg)
     diag_fatal(s->file, s->line, "%s", msg);
 }
 
+/* A non-fatal preprocessor diagnostic (the compile continues). */
+static void cwarn(struct src *s, const char *msg, const char *arg)
+{
+    fprintf(stderr, "embcc: %s:%d: warning: ", s->file, s->line);
+    if (arg)
+        fprintf(stderr, msg, arg);
+    else
+        fprintf(stderr, "%s", msg);
+    fprintf(stderr, "\n");
+}
+
 static struct macro *find_macro(struct cpp *cpp, const char *name, size_t n)
 {
     for (struct macro *m = cpp->macros; m; m = m->next)
@@ -866,9 +877,16 @@ static void define_macro(struct src *s, const char *line)
         undef_macro(s->cpp, m->name, strlen(m->name));
     } else if (old) {
         if (strcmp(old->body, m->body) != 0 ||
-            old->is_func != m->is_func || old->nparams != m->nparams)
-            cerr(s, "macro '%s' redefined differently", m->name);
-        return; /* identical redefinition is legal */
+            old->is_func != m->is_func || old->nparams != m->nparams) {
+            /* gcc warns and installs the new definition rather than refusing;
+             * real headers redefine macros (and a -D can clash with a header
+             * default), so match that and keep the LAST definition. */
+            cwarn(s, "macro '%s' redefined", m->name);
+            undef_macro(s->cpp, m->name, strlen(m->name));
+            /* fall through to install the new definition */
+        } else {
+            return; /* identical redefinition is legal */
+        }
     }
     m->builtin = defining_builtins;
     m->next = s->cpp->macros;

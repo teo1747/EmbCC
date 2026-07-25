@@ -109,13 +109,14 @@ check array-scalar-init \
     "brace initializer or a string"
 check too-many-initializers \
     'int main(void) { int a[2] = {1,2,3}; return a[0]; }' \
-    "3 initializers for an array of 2"
+    "past the end of an array of 2"
 check non-char-array-from-string \
     'int main(void) { int a[4] = "abc"; return a[0]; }' \
     "only a char array"
-check array-index-designator \
-    'int main(void) { int a[3] = { [1] = 5 }; return a[1]; }' \
-    "\[index\] designators are not supported"
+check array-index-past-end \
+    'int a[3] = { [5] = 1 };
+int main(void) { return 0; }' \
+    "past the end"
 check field-designator-in-array \
     'int main(void) { int a[2] = { .x = 1 }; return a[0]; }' \
     "field designator '.x' in an array"
@@ -206,13 +207,6 @@ check tag-redefinition \
 struct P { int y; };
 int main(void) { return 0; }' \
     "redefinition of 'P'"
-check block-scope-struct \
-    'int main(void) { struct L { int x; }; return 0; }' \
-    "file scope"
-check bitfield \
-    'struct B { int f : 3; };
-int main(void) { return 0; }' \
-    "before ':'"
 check empty-struct \
     'struct E { };
 int main(void) { return 0; }' \
@@ -226,9 +220,6 @@ check angle-include-no-path \
     '#include <stdio.h>
 int main(void) { return 0; }' \
     "cannot find include file"
-check u64-to-double \
-    'int main(void) { unsigned long u = 1; double d = u; return (int)d; }' \
-    "unsigned 64-bit conversion"
 check float-modulo \
     'int main(void) { double a = 5.0; double b = 2.0; return (int)(a % b); }' \
     "needs an integer"
@@ -302,7 +293,7 @@ echo "$err" | grep -q "linker is M3" || {
     echo "case nolink: wrong diagnostic:"; echo "$err"; exit 1; }
 echo "case nolink: refused with a diagnostic"
 check asm-bad-constraint \
-    'int main(void) { int x; __asm__("int $0x80" : "=x"(x)); return x; }' \
+    'int main(void) { int x; __asm__("int $0x80" : "=t"(x)); return x; }' \
     "is not supported"
 check asm-bad-template \
     'int main(void) { __asm__("nop"); return 0; }' \
@@ -323,13 +314,6 @@ check topasm-global-no-label \
     '__asm__(".global ghost\n  ret\n");
 int main(void) { return 0; }' \
     "has no label"
-check va-arg-float \
-    'typedef char *va_list;
-int f(int n, ...) { va_list ap; __builtin_va_start(ap, n);
-     double d = __builtin_va_arg(ap, double); __builtin_va_end(ap);
-     return (int)d; }
-int main(void) { return f(1, 2.0); }' \
-    "floating type is not supported"
 check va-arg-struct \
     'typedef char *va_list;
 struct P { int x; int y; };
@@ -338,3 +322,10 @@ int f(int n, ...) { va_list ap; __builtin_va_start(ap, n);
      return p.x; }
 int main(void) { return 0; }' \
     "struct passed by value"
+check static-assert-false \
+    '_Static_assert(sizeof(int) == 8, "int is not eight bytes");
+int main(void) { return 0; }' \
+    "static assertion failed: int is not eight bytes"
+check generic-no-match \
+    'int main(void) { double d = 0; return _Generic(d, int: 1, long: 2); }' \
+    "no _Generic association matches"

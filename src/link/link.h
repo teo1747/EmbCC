@@ -16,8 +16,10 @@
 #define EMBCC_LINK_LINK_H
 
 struct link_opts {
-    const char *entry;    /* entry symbol; NULL = "_start" */
-    unsigned long base;   /* text load address; 0 = 0x400000 (TARGET_ABI) */
+    const char *entry;      /* entry symbol; NULL = "_start" */
+    unsigned long base;     /* text load address; 0 = 0x400000 (TARGET_ABI) */
+    int emit_embx;          /* 1 = write a native EMBX binary instead of ELF */
+    unsigned long long caps;/* EMBX capability bitmask (bit == cap_id); 0 = none */
 };
 
 /* Links inputs[0..n) into an ET_EXEC at `out`. Inputs are object files

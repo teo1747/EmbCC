@@ -93,6 +93,22 @@ static int is_null_const(const struct expr *e)
     return e->kind == EXPR_NUM && e->num == 0;
 }
 
+/* IEEE-754 +infinity / quiet-NaN as doubles, built from their bit patterns so
+ * the value is exact regardless of the host EmbCC runs on. Used to lower the
+ * __builtin_inf/huge_val/nan family to a float constant. */
+static double ieee_inf(void)
+{
+    union { unsigned long u; double d; } v;
+    v.u = 0x7ff0000000000000UL;
+    return v.d;
+}
+static double ieee_nan(void)
+{
+    union { unsigned long u; double d; } v;
+    v.u = 0x7ff8000000000000UL;
+    return v.d;
+}
+
 /* Wrap in an implicit cast node unless already exactly that type. */
 static struct expr *mk_cast(struct expr *inner, struct type *to)
 {
@@ -182,21 +198,6 @@ static void need_arith(struct unit *u, struct expr *e, const char *what)
  * refuses instead of quietly producing the wrong number (THE RULE).
  * Every other combination is exact: narrower integers are converted
  * through their 64-bit form. */
-static void check_u64_float(struct unit *u, int line, struct type *a,
-                            struct type *b)
-{
-    struct type *i = ty_is_float(a) ? b : a;
-    struct type *fp = ty_is_float(a) ? a : b;
-    if (!ty_is_float(fp) || !ty_is_integer(i))
-        return;
-    if (i->kind == TY_LONG && i->is_unsigned)
-        diag_fatal(u->file, line,
-                   "converting between unsigned long and %s is not "
-                   "supported yet (SSE2 has no unsigned 64-bit "
-                   "conversion; cast through a signed long if the value "
-                   "fits)", ty_name(fp));
-}
-
 static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                                    struct type *to, const char *ctx)
 {
@@ -206,10 +207,13 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
                        ctx, ty_name(rhs->ty), ty_name(to));
         return rhs; /* same struct type: passed/returned as its bytes */
     }
-    if (ty_is_arith(to) && ty_is_arith(rhs->ty)) {
-        check_u64_float(u, rhs->line, to, rhs->ty);
+    /* Any scalar converts to _Bool implicitly (C99 6.3.1.2): the result is
+     * 0 or 1. This includes pointers, which otherwise need an explicit cast
+     * to an integer type. */
+    if (to->kind == TY_BOOL && ty_is_scalar(rhs->ty))
         return mk_cast(rhs, to);
-    }
+    if (ty_is_arith(to) && ty_is_arith(rhs->ty))
+        return mk_cast(rhs, to);
     if (to->kind == TY_PTR) {
         if (rhs->ty->kind == TY_PTR &&
             (ty_equal(rhs->ty, to) || to->pointee->kind == TY_VOID ||
@@ -236,10 +240,51 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
 static int is_lvalue(const struct expr *e)
 {
     return e->kind == EXPR_VAR || e->kind == EXPR_DEREF ||
-           e->kind == EXPR_MEMBER;
+           e->kind == EXPR_MEMBER || e->kind == EXPR_COMPLIT;
 }
 
 static int const_fold(const struct expr *e, long *out);
+
+/* A growing (offset, type, value) list of flattened initializer leaves —
+ * defined here so both check_expr (compound literals) and check_stmt
+ * (declarations) can build one. */
+struct initbuf {
+    struct initelem *v;
+    int n, cap;
+};
+static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
+                         struct expr *init, struct type *ty, int off,
+                         struct initbuf *out);
+static void lower_static_bytes(struct unit *u, int line, int size,
+                               struct initelem *v, int n,
+                               const char **out_bytes,
+                               struct greloc **out_rel, int *out_nrel);
+
+/* Nonzero while lowering a static initializer (a file-scope global or a
+ * static local). A compound literal met here has static storage: it becomes
+ * an anonymous global rather than a stack slot. */
+static int g_in_static_init;
+
+/* Resolve `name` as a member of `base`, descending into any anonymous
+ * struct/union members (C11 6.7.2.1p13: their members are reached as if
+ * they belonged to the enclosing type). On success fills *out with the leaf
+ * member — a copy, its offset made cumulative from `base` — and returns 1. */
+static int find_member_deep(struct type *base, const char *name,
+                            struct member *out, int base_off)
+{
+    for (int i = 0; i < base->nmembers; i++) {
+        struct member *m = &base->members[i];
+        if (m->name && strcmp(m->name, name) == 0) {
+            *out = *m;
+            out->off += base_off;
+            return 1;
+        }
+        if (!m->name && !m->is_bitfield && m->ty->kind == TY_STRUCT &&
+            find_member_deep(m->ty, name, out, base_off + m->off))
+            return 1;
+    }
+    return 0;
+}
 
 /* ---- expression checking ---- */
 
@@ -270,7 +315,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             for (; ec; ec = ec->next)
                 if (strcmp(ec->name, e->name) == 0)
                     break;
-            if (ec && ec->seq < cur_body_seq) {
+            /* '<=' not '<': an enum is COMPLETE before the declarator that
+             * uses it in the same declaration (`enum { A, B } g = B;`), so a
+             * same-item (same seq) reference is legal -- the same reasoning the
+             * global self-reference below uses. A truly earlier use (a lower
+             * seq than the enum's) is still rejected. */
+            if (ec && ec->seq <= cur_body_seq) {
                 e->kind = EXPR_NUM;
                 e->num = ec->val;
                 e->ty = ty_base(TY_INT, 0);
@@ -402,8 +452,109 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "'&' on an array is not supported yet (its name "
                        "is already the address of the first element)");
+        if (e->rhs->kind == EXPR_MEMBER && e->rhs->memb &&
+            e->rhs->memb->is_bitfield)
+            diag_fatal(u->file, e->line,
+                       "cannot take the address of bitfield '%s'",
+                       e->rhs->memb->name);
         e->ty = ty_ptr(e->rhs->ty);
         break;
+    case EXPR_COMPLIT: {
+        /* `(type){ init }` — an unnamed object with automatic storage in
+         * this block. Give it a synthesized local slot and flatten the
+         * initializer into it exactly like a declared aggregate; the
+         * literal is an lvalue of that type (an array decays, a struct is
+         * carried by address, a scalar is loaded). */
+        struct type *ty = e->cast_ty;
+        if (ty->kind == TY_VOID || ty->kind == TY_FUNC)
+            diag_fatal(u->file, e->line,
+                       "a compound literal cannot have type %s",
+                       ty_name(ty));
+        if (ty->kind == TY_STRUCT && !ty->complete)
+            diag_fatal(u->file, e->line,
+                       "compound literal of incomplete type %s",
+                       ty_name(ty));
+        /* `(int[]){...}` takes its size from the initializer, as `int a[]`
+         * does. */
+        if (ty->kind == TY_ARRAY && ty->count == 0 &&
+            e->lhs->kind == EXPR_INITLIST)
+            ty = ty_array(ty->pointee, initlist_array_count(e->lhs));
+        e->cast_ty = ty;
+        if (g_in_static_init) {
+            /* Static storage: the literal is an anonymous global, and this
+             * node becomes a reference to it (so `&(T){...}` in a static
+             * initializer lowers to a relocation like any `&global`). */
+            struct initbuf ib = { 0, 0, 0 };
+            flatten_init(u, f, sc, e->lhs, ty, 0, &ib);
+            static int anon_seq;
+            struct global *g = xcalloc(1, sizeof *g);
+            char *nm = xmalloc(24);
+            snprintf(nm, 24, ".Lcomplit.%d", anon_seq++);
+            g->name = nm;
+            g->line = e->line;
+            g->seq = -1;
+            g->ty = ty;
+            g->is_static = 1;
+            g->defined = 1;
+            g->used = 1;
+            g->has_init = 1;   /* it has real bytes -> .data, not .bss */
+            lower_static_bytes(u, e->line, ty_size(ty), ib.v, ib.n,
+                               &g->init_bytes, &g->relocs, &g->nrelocs);
+            g->init_len = ty_size(ty);
+            struct global **gt = &u->globals;
+            while (*gt) gt = &(*gt)->next;
+            *gt = g;
+            e->kind = EXPR_VAR;      /* an lvalue naming the anonymous global */
+            e->gref = g;
+            e->name = g->name;
+            e->inits = NULL; e->ninits = 0; e->lhs = NULL;
+            if (ty->kind == TY_ARRAY) {
+                e->undecayed = ty;
+                e->ty = ty_ptr(ty->pointee);
+            } else {
+                e->ty = ty;
+            }
+            break;
+        }
+        e->var_index = scope_add(sc, "<compound literal>", ty, NULL);
+        struct initbuf ib = { 0, 0, 0 };
+        flatten_init(u, f, sc, e->lhs, ty, 0, &ib);
+        e->inits = ib.v;
+        e->ninits = ib.n;
+        e->lhs = NULL;
+        if (ty->kind == TY_ARRAY) {
+            e->undecayed = ty;   /* the object; e->ty is the decayed pointer */
+            e->ty = ty_ptr(ty->pointee);
+        } else {
+            e->ty = ty;
+        }
+        break;
+    }
+    case EXPR_GENERIC: {
+        /* Pick the association whose type matches the controlling
+         * expression's (after its lvalue conversion — an array/function
+         * operand already carries its decayed type here), else `default`.
+         * The controlling expression is not evaluated (C11 6.5.1.1); the
+         * node simply becomes the selected expression. */
+        check_expr(u, f, sc, e->lhs);
+        struct expr *chosen = NULL, *deflt = NULL;
+        for (int i = 0; i < e->ngen; i++) {
+            if (!e->gtypes[i]) { deflt = e->gexprs[i]; continue; }
+            if (ty_equal(e->lhs->ty, e->gtypes[i])) {
+                chosen = e->gexprs[i];
+                break;
+            }
+        }
+        if (!chosen)
+            chosen = deflt;
+        if (!chosen)
+            diag_fatal(u->file, e->line,
+                       "no _Generic association matches type %s",
+                       ty_name(e->lhs->ty));
+        check_expr(u, f, sc, chosen);
+        *e = *chosen;   /* become the selected expression */
+        break;
+    }
     case EXPR_CAST:
         check_expr(u, f, sc, e->rhs);
         if (e->cast_ty->kind == TY_VOID) {
@@ -421,8 +572,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "cannot convert between %s and %s",
                        ty_name(e->rhs->ty), ty_name(e->cast_ty));
-        if (ty_is_arith(e->cast_ty) && ty_is_arith(e->rhs->ty))
-            check_u64_float(u, e->line, e->cast_ty, e->rhs->ty);
         e->ty = e->cast_ty;
         break;
     case EXPR_COMMA:
@@ -508,7 +657,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             need_integer(u, e->rhs, "this operator");
         }
         e->cast_ty = arith_common(e->lhs->ty, e->rhs->ty);
-        check_u64_float(u, e->line, e->cast_ty, e->rhs->ty);
         e->rhs = mk_cast(e->rhs, e->cast_ty);
         e->ty = e->lhs->ty;
         break;
@@ -531,10 +679,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "%s is incomplete here (its body comes later "
                        "or never)", ty_name(base));
-        e->memb = ty_find_member(base, e->name);
-        if (!e->memb)
+        struct member *mm = xcalloc(1, sizeof *mm);
+        if (!find_member_deep(base, e->name, mm, 0))
             diag_fatal(u->file, e->line, "%s has no member '%s'",
                        ty_name(base), e->name);
+        e->memb = mm;
         e->ty = e->memb->ty;
         if (e->ty->kind == TY_ARRAY) {
             e->undecayed = e->ty;
@@ -575,10 +724,6 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             diag_fatal(u->file, e->line,
                        "va_arg of a struct passed by value is not "
                        "supported yet");
-        if (ty_is_float(e->cast_ty))
-            diag_fatal(u->file, e->line,
-                       "va_arg of a floating type is not supported yet "
-                       "(EmbCC reads integer and pointer varargs)");
         e->ty = e->cast_ty;
         break;
     case EXPR_BINOP: {
@@ -720,6 +865,32 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->ty = ty_base(TY_VOID, 0);
             break;
         }
+        /* Compiler builtins for the floating specials: lower directly to a
+         * constant with the right bit pattern (HUGE_VAL/INFINITY/NAN expand to
+         * these). The `f` variants are single precision; nan's string arg is
+         * evaluated for side effects only (there are none) and ignored. */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            strncmp(e->lhs->name, "__builtin_", 10) == 0) {
+            const char *bn = e->lhs->name + 10;
+            int is_inf = strcmp(bn, "inf") == 0 || strcmp(bn, "huge_val") == 0;
+            int is_inff = strcmp(bn, "inff") == 0 || strcmp(bn, "huge_valf") == 0;
+            int is_nan = strcmp(bn, "nan") == 0;
+            int is_nanf = strcmp(bn, "nanf") == 0;
+            if (is_inf || is_inff || is_nan || is_nanf) {
+                for (int i = 0; i < e->nargs; i++)
+                    check_expr(u, f, sc, e->args[i]);
+                e->kind = EXPR_FNUM;
+                e->fnum = (is_nan || is_nanf) ? ieee_nan() : ieee_inf();
+                e->ty = ty_base((is_inff || is_nanf) ? TY_FLOAT : TY_DOUBLE, 0);
+                break;
+            }
+            /* __builtin_memcpy/memmove/memset are the libc functions under a
+             * reserved name -- rename and let the ordinary call path resolve
+             * them (the program must declare/provide them). */
+            if (strcmp(bn, "memcpy") == 0 || strcmp(bn, "memmove") == 0 ||
+                strcmp(bn, "memset") == 0)
+                e->lhs->name = bn;   /* fall through to normal call handling */
+        }
         /* Direct when the callee is a name that is not a variable in
          * scope and names a function; otherwise a call through a
          * function-pointer value. */
@@ -821,6 +992,50 @@ static int const_fold(const struct expr *e, long *out)
     }
 }
 
+/* Fold a FLOATING constant expression to a double, for static initializers of
+ * float/double storage (`double g = 1.0/3.0;`). Integer leaves promote to
+ * double; a cast to an integer type truncates (C semantics), a cast to float
+ * rounds to single precision. Returns 0 (not constant) if it can't reduce. */
+static int const_fold_f(const struct expr *e, double *out)
+{
+    double a, b; long iv;
+    switch (e->kind) {
+    case EXPR_FNUM:
+        *out = e->fnum;
+        return 1;
+    case EXPR_NUM:
+        *out = (double)e->num;      /* an integer constant used where a float is wanted */
+        return 1;
+    case EXPR_CAST:
+        if (ty_is_float(e->ty)) {
+            if (!const_fold_f(e->rhs, &a)) return 0;
+            *out = (e->ty->kind == TY_FLOAT) ? (double)(float)a : a;
+            return 1;
+        }
+        if (ty_is_integer(e->ty)) {   /* (int)f : evaluate then truncate toward zero */
+            if (const_fold_f(e->rhs, &a)) { *out = (double)(long)a; return 1; }
+            if (const_fold(e->rhs, &iv)) { *out = (double)iv; return 1; }
+        }
+        return 0;
+    case EXPR_NEG:
+        if (!const_fold_f(e->rhs, &a)) return 0;
+        *out = -a;
+        return 1;
+    case EXPR_BINOP:
+        if (!const_fold_f(e->lhs, &a) || !const_fold_f(e->rhs, &b))
+            return 0;
+        switch (e->op) {
+        case B_ADD: *out = a + b; return 1;
+        case B_SUB: *out = a - b; return 1;
+        case B_MUL: *out = a * b; return 1;
+        case B_DIV: *out = a / b; return 1;   /* x/0.0 is inf/nan -- valid float result */
+        default: return 0;
+        }
+    default:
+        return 0;
+    }
+}
+
 /* The statement list a switch dispatches over: its body, unwrapped when
  * it is the usual brace block. Case markers must live at THIS level. */
 struct stmt *switch_stmts(struct stmt *body)
@@ -835,11 +1050,6 @@ struct stmt *switch_stmts(struct stmt *body)
  * aggregate member is checked and converted like any assignment. C's
  * rule that unlisted elements are zero is honoured by irgen, which
  * clears the whole object first. */
-struct initbuf {
-    struct initelem *v;
-    int n, cap;
-};
-
 static void init_push(struct initbuf *b, int off, struct type *ty,
                       struct expr *e)
 {
@@ -850,13 +1060,37 @@ static void init_push(struct initbuf *b, int off, struct type *ty,
     b->v[b->n].off = off;
     b->v[b->n].ty = ty;
     b->v[b->n].e = e;
+    b->v[b->n].bit_off = 0;
+    b->v[b->n].bit_width = 0;
     b->n++;
+}
+
+/* A bitfield leaf: same as init_push but recording where in the storage
+ * unit at `off` the value lands, so the lowerings mask and merge it. */
+static void init_push_bf(struct initbuf *b, int off, struct type *ty,
+                         struct expr *e, int bit_off, int bit_width)
+{
+    init_push(b, off, ty, e);
+    b->v[b->n - 1].bit_off = bit_off;
+    b->v[b->n - 1].bit_width = bit_width;
 }
 
 static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                          struct expr *init, struct type *ty, int off,
                          struct initbuf *out)
 {
+    /* A compound literal used AS an initializer is exactly its brace
+     * initializer placed at this offset — `T g = (T){...}` (even at file
+     * scope) and a literal nested in another initializer need no separate
+     * object. Only an unbraced literal reaches here as `init` (a plain
+     * `expr` initializer keeps EXPR_COMPLIT); `&(T){...}` stays an
+     * EXPR_ADDR and is lowered through the anonymous-object path instead. */
+    if (init->kind == EXPR_COMPLIT) {
+        if (init->lhs && init->lhs->kind == EXPR_INITLIST) {
+            flatten_init(u, f, sc, init->lhs, ty, off, out);
+            return;
+        }
+    }
     if (init->kind != EXPR_INITLIST) {
         if (ty->kind == TY_ARRAY) {
             /* char a[] = "..." — the literal's bytes ARE the object */
@@ -890,17 +1124,24 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
 
     if (ty->kind == TY_ARRAY) {
         int esz = ty_size(ty->pointee);
-        if (ty->count && init->nelems > ty->count)
-            diag_fatal(u->file, init->line,
-                       "%d initializers for an array of %d",
-                       init->nelems, ty->count);
+        /* Positional by default; a `[i] =` designator repositions the
+         * running index and initialization continues positionally after it
+         * (later writes to the same slot win, matching C). */
+        int ai = 0;
         for (int i = 0; i < init->nelems; i++) {
-            if (init->elems[i]->desig_field)
-                diag_fatal(u->file, init->elems[i]->line,
+            struct expr *el = init->elems[i];
+            if (el->desig_field)
+                diag_fatal(u->file, el->line,
                            "field designator '.%s' in an array initializer",
-                           init->elems[i]->desig_field);
-            flatten_init(u, f, sc, init->elems[i], ty->pointee,
-                         off + i * esz, out);
+                           el->desig_field);
+            if (el->desig_index >= 0)
+                ai = el->desig_index;
+            if (ty->count && ai >= ty->count)
+                diag_fatal(u->file, el->line,
+                           "initializer index %d is past the end of an "
+                           "array of %d", ai, ty->count);
+            flatten_init(u, f, sc, el, ty->pointee, off + ai * esz, out);
+            ai++;
         }
         return;
     }
@@ -918,12 +1159,30 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                                el->desig_field);
                 mi = (int)(m - ty->members);
             }
+            /* An unnamed bitfield (padding, or a `:0` separator) takes no
+             * initializer — skip past it in positional order. */
+            while (mi < ty->nmembers && ty->members[mi].is_bitfield &&
+                   !ty->members[mi].name)
+                mi++;
             if (mi >= ty->nmembers)
                 diag_fatal(u->file, init->line,
                            "too many initializers for %s, which has %d "
                            "members", ty_name(ty), ty->nmembers);
-            flatten_init(u, f, sc, el, ty->members[mi].ty,
-                         off + ty->members[mi].off, out);
+            struct member *m = &ty->members[mi];
+            if (m->is_bitfield) {
+                /* A bitfield leaf: its value is masked and merged into the
+                 * shared storage unit at m->off by both lowerings, so it
+                 * carries (bit_off, bit_width) rather than a byte width. */
+                check_expr(u, f, sc, el);
+                need_scalar(u, el, "a bitfield initializer");
+                struct expr *cv = convert_assign(u, el, m->ty,
+                                                 "initialization");
+                init_push_bf(out, off + m->off, m->ty, cv,
+                             m->bit_off, m->bit_width);
+                mi++;
+                continue;
+            }
+            flatten_init(u, f, sc, el, m->ty, off + m->off, out);
             mi++;
         }
         return;
@@ -980,12 +1239,41 @@ static void lower_static_bytes(struct unit *u, int line, int size,
             nrel++;
             continue;
         }
+        int sz = ty_size(v[k].ty);
+        /* A float/double slot: fold to the value, store its IEEE-754 bit
+         * pattern (4 bytes for float, 8 for double), little-endian. */
+        if (ty_is_float(v[k].ty)) {
+            double dv;
+            if (!const_fold_f(v[k].e, &dv))
+                diag_fatal(u->file, line,
+                           "a static float initializer must be a constant "
+                           "expression");
+            unsigned long ubits;
+            if (v[k].ty->kind == TY_FLOAT) {
+                float fv = (float)dv; unsigned int u32;
+                memcpy(&u32, &fv, 4); ubits = u32;
+            } else {
+                memcpy(&ubits, &dv, 8);
+            }
+            for (int b = 0; b < sz; b++)
+                bytes[v[k].off + b] = (char)(ubits >> (8 * b));
+            continue;
+        }
         long cv;
         if (!const_fold(v[k].e, &cv))
             diag_fatal(u->file, line,
                        "a static initializer must be a constant, a "
                        "string literal, or the address of a global");
-        int sz = ty_size(v[k].ty);
+        if (v[k].bit_width) {
+            /* merge the field's bits into its storage unit (bytes start
+             * zeroed, so OR is enough and neighbours are preserved) */
+            unsigned long mask = v[k].bit_width >= 64
+                               ? ~0UL : (((unsigned long)1 << v[k].bit_width) - 1);
+            unsigned long field = ((unsigned long)cv & mask) << v[k].bit_off;
+            for (int b = 0; b < sz; b++)
+                bytes[v[k].off + b] |= (char)(field >> (8 * b));
+            continue;
+        }
         for (int b = 0; b < sz; b++)
             bytes[v[k].off + b] = (char)((unsigned long)cv >> (8 * b));
     }
@@ -1009,7 +1297,9 @@ static void lower_globals(struct unit *u)
         cur_body_seq = g->def_seq;
         struct scope sc = { 0, 0, 0, 0 };
         struct initbuf ib = { 0, 0, 0 };
+        g_in_static_init++;
         flatten_init(u, &gf, &sc, g->init_expr, g->ty, 0, &ib);
+        g_in_static_init--;
         lower_static_bytes(u, g->line, ty_size(g->ty), ib.v, ib.n,
                            &g->init_bytes, &g->relocs, &g->nrelocs);
         g->init_len = ty_size(g->ty);
@@ -1077,9 +1367,12 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
     for (const char *p = c; *p; p++)             /* else allocate a register */
         if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R')
             return -2;
+    for (const char *p = c; *p; p++)             /* an SSE/XMM ('x') operand */
+        if (*p == 'x')
+            return -3;                            /* irgen allocates an xmm */
     diag_fatal(u->file, s->line,
                "asm constraint \"%s\" is not supported "
-               "(EmbCC handles a/b/c/d/S/D, 'r'/'q'/'g'/'m', and a "
+               "(EmbCC handles a/b/c/d/S/D, 'r'/'q'/'g'/'m', 'x', and a "
                "register-asm variable)", op->constraint);
     return -1;
 }
@@ -1149,6 +1442,43 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             need_scalar(u, s->cond, "'do'/'while'");
             break;
         case STMT_DECL:
+            if (s->is_extern) {
+                /* block-scope extern: no storage here, external linkage. Register
+                 * the unit global/function (safe now -- parsing is done, so the
+                 * list tails are no longer live) if not already present, and for
+                 * a variable wire a block-scope entry onto it so references
+                 * resolve. A function needs no var entry (calls use find_func). */
+                if (s->dty->kind == TY_FUNC) {
+                    if (!find_func(u, s->name)) {
+                        struct func *g = xcalloc(1, sizeof *g);
+                        g->name = s->name; g->file = u->file; g->line = s->line;
+                        g->seq = f->seq; g->declared = 1;
+                        g->ret_ty = s->dty->ret;
+                        g->nparams = s->dty->nptypes;
+                        for (int k = 0; k < s->dty->nptypes; k++)
+                            g->param_tys[k] = s->dty->ptypes[k];
+                        g->is_varargs = s->dty->is_varargs;
+                        struct func **ft = &u->funcs;
+                        while (*ft) ft = &(*ft)->next;
+                        *ft = g;
+                    }
+                } else {
+                    struct global *g = find_global(u, s->name);
+                    if (!g) {
+                        g = xcalloc(1, sizeof *g);
+                        g->name = s->name; g->ty = s->dty; g->is_extern = 1;
+                        g->file = u->file; g->line = s->line;
+                        g->seq = f->seq; g->def_seq = f->seq;
+                        struct global **gt = &u->globals;
+                        while (*gt) gt = &(*gt)->next;
+                        *gt = g;
+                    }
+                    s->var_index = scope_add(sc, s->name, s->dty, NULL);
+                    sc->vars[s->var_index].g = g;
+                    s->sglob = g;   /* irgen: this decl carries no local storage */
+                }
+                break;
+            }
             if (s->expr && s->dty->kind == TY_ARRAY &&
                 s->expr->kind == EXPR_STR) {
                 /* char a[] = "..." : an omitted size is the literal's */
@@ -1161,8 +1491,9 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                                       (int)s->expr->num);
             } else if (s->expr && s->expr->kind == EXPR_INITLIST &&
                        s->dty->kind == TY_ARRAY && s->dty->count == 0) {
-                /* an omitted array size is the element count */
-                s->dty = ty_array(s->dty->pointee, s->expr->nelems);
+                /* an omitted array size is the highest index reached */
+                s->dty = ty_array(s->dty->pointee,
+                                  initlist_array_count(s->expr));
             }
             /* The name is in scope WITHIN its own initializer (C11
              * 6.2.1p7: scope begins just after the declarator), so the
@@ -1175,6 +1506,10 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                            s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
             sc->vars[s->var_index].asm_reg = s->asm_reg;
+            /* A static local has static storage, so a compound literal in its
+             * initializer is an anonymous global, not a stack slot. */
+            if (s->is_static)
+                g_in_static_init++;
             if (s->expr && s->dty->kind != TY_ARRAY &&
                 s->dty->kind != TY_STRUCT) {
                 check_expr(u, f, sc, s->expr);
@@ -1192,6 +1527,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 s->ninits = ib.n;
                 s->expr = NULL;
             }
+            if (s->is_static)
+                g_in_static_init--;
             if (s->is_static) {
                 /* A static local has static STORAGE and internal
                  * linkage: it becomes a global of its own, named so it
@@ -1319,6 +1656,13 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             sc->block_start = prev;
             break;
         }
+        case STMT_LABEL:
+            /* the labeled statement is checked in the label's own context */
+            check_stmt(u, f, sc, s->body, in_loop, in_switch, 0);
+            break;
+        case STMT_GOTO:
+            /* target existence is validated function-wide at codegen */
+            break;
         }
     }
 }
@@ -1414,6 +1758,12 @@ static int stmt_returns(struct stmt *s)
         return (const_fold(s->cond, &v) && v != 0 &&
                 !has_own_break(s->body)) || stmt_returns(s->body);
     }
+    case STMT_GOTO:
+        /* an unconditional jump: control leaves here, it does not fall off
+         * the end of the function at this point. */
+        return 1;
+    case STMT_LABEL:
+        return stmt_returns(s->body);
     default:
         return 0;
     }

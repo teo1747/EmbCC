@@ -129,6 +129,54 @@ struct brsite {
  * sound; codegen_unit sets it from want_debug. */
 static int g_want_debug;
 
+/* ---- local register (RAX) residency cache (the -O codegen step) ----
+ *
+ * Every vreg still owns a stack slot, but a value just computed into RAX
+ * need not be reloaded from its slot to be used again. The cache records
+ * which TEMP's value RAX currently holds and in which load shape, so an
+ * identical reload is elided. Soundness rests on three facts:
+ *   - only TEMPS are cached; their slots are never address-taken, so their
+ *     memory is stable from the (single) store that defines them;
+ *   - STORES are never elided, so a memory operand (a binary op's second
+ *     source, read straight from a slot) is always the current value;
+ *   - the cache is invalidated (cg_reset) wherever RAX is clobbered without
+ *     a cg_load/cg_store fixing it, and at every basic-block boundary.
+ * Off (g_regcache 0) the helpers are exactly the old direct calls, so -O0
+ * output is byte-for-byte unchanged — which the self-host fixed point needs.
+ */
+static int g_regcache;        /* enabled only when optimizing */
+static int rc_nvars;          /* vregs < this are locals/params (aliasable) */
+static int rc_vreg = -1;      /* the temp whose value RAX holds, or -1 */
+static int rc_size, rc_sign, rc_w;   /* the exact shape RAX holds it in */
+
+static void cg_reset(void) { rc_vreg = -1; }
+
+/* Load vreg into RAX, eliding the load when RAX already holds it. */
+static void cg_load(struct code *text, const int *sd, int vreg,
+                    int size, int sign, int w)
+{
+    if (g_regcache && vreg >= rc_nvars && rc_vreg == vreg &&
+        rc_size == size && rc_sign == sign && rc_w == w)
+        return;
+    x86_load_slot(text, sd[vreg], size, sign, w);
+    if (g_regcache && vreg >= rc_nvars) {
+        rc_vreg = vreg; rc_size = size; rc_sign = sign; rc_w = w;
+    } else {
+        cg_reset();               /* a local (or cache off): do not cache */
+    }
+}
+
+/* Store RAX (8 bytes) to a temp's slot and record that a (valw,0,valw)
+ * reload reproduces RAX. A 32-bit result is zero-extended into the slot, so
+ * for valw==4 both a 4- and an 8-byte reload would match the stored bytes. */
+static void cg_store(struct code *text, const int *sd, int vreg, int valw)
+{
+    x86_store_slot(text, sd[vreg], 8);
+    if (g_regcache) {
+        rc_vreg = vreg; rc_size = valw; rc_sign = 0; rc_w = valw;
+    }
+}
+
 static void gen_func(struct ir_func *fn, struct code *text,
                      struct sites *st)
 {
@@ -243,6 +291,8 @@ static void gen_func(struct ir_func *fn, struct code *text,
         va_overflow = incoming;
     }
 
+    rc_nvars = fn->src->nvars;
+    cg_reset();
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
         /* -g: a row where the source line changes. text->len is the .text
@@ -268,11 +318,11 @@ static void gen_func(struct ir_func *fn, struct code *text,
         switch (i->op) {
         case IR_CONST:
             x86_mov_eax_imm(text, i->imm, i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_MOV:
-            x86_load_slot(text, sd[i->a], 8, 0, 8);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_load(text, sd, i->a, 8, 0, 8);
+            cg_store(text, sd, i->dst, 8);
             break;
         case IR_ADD:
         case IR_SUB:
@@ -281,6 +331,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_OR:
         case IR_XOR:
             if (i->flt) {
+                cg_reset();
                 x86_movs_load(text, 0, sd[i->a], i->w);
                 x86_sse_alu_mem(text,
                                 i->op == IR_ADD ? '+' :
@@ -289,7 +340,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_movs_store(text, 0, sd[i->dst], i->w);
                 break;
             }
-            x86_load_slot(text, sd[i->a], i->w, 0, i->w);
+            cg_load(text, sd, i->a, i->w, 0, i->w);
             x86_alu_eax_mem(text,
                             i->op == IR_ADD ? '+' :
                             i->op == IR_SUB ? '-' :
@@ -297,17 +348,18 @@ static void gen_func(struct ir_func *fn, struct code *text,
                             i->op == IR_AND ? '&' :
                             i->op == IR_OR ? '|' : '^',
                             sd[i->b], i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_DIV:
         case IR_MOD:
             if (i->flt) { /* only DIV is ever float; MOD is integers */
+                cg_reset();
                 x86_movs_load(text, 0, sd[i->a], i->w);
                 x86_sse_alu_mem(text, '/', sd[i->b], i->w);
                 x86_movs_store(text, 0, sd[i->dst], i->w);
                 break;
             }
-            x86_load_slot(text, sd[i->a], i->w, 0, i->w);
+            cg_load(text, sd, i->a, i->w, 0, i->w);
             if (i->sign)
                 x86_cdq(text, i->w);
             else
@@ -315,25 +367,25 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_div_mem(text, sd[i->b], i->sign, i->w);
             if (i->op == IR_MOD)
                 x86_mov_eax_edx(text, i->w); /* remainder lives in edx */
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_SHL:
         case IR_SHR:
-            x86_load_slot(text, sd[i->a], i->w, 0, i->w);
+            cg_load(text, sd, i->a, i->w, 0, i->w);
             x86_mov_ecx_mem(text, sd[i->b], 4);
             x86_shift_eax_cl(text,
                              i->op == IR_SHL ? '<' :
                              i->sign ? '>' : 'u', i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_NEG:
         case IR_BNOT:
-            x86_load_slot(text, sd[i->a], i->w, 0, i->w);
+            cg_load(text, sd, i->a, i->w, 0, i->w);
             if (i->op == IR_NEG)
                 x86_neg_eax(text, i->w);
             else
                 x86_not_eax(text, i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_CMP:
             if (i->flt) {
@@ -341,6 +393,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
                  * directly and <,<= are the same test with the operands
                  * swapped — which is also what makes NaN compare false
                  * in every direction. */
+                cg_reset();
                 int swap = i->pred == B_LT || i->pred == B_LE;
                 x86_movs_load(text, 0, sd[swap ? i->b : i->a], i->w);
                 x86_ucomis_mem(text, sd[swap ? i->a : i->b], i->w);
@@ -351,44 +404,47 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                   cc_for(i->pred == B_LT ? B_GT :
                                          i->pred == B_LE ? B_GE : i->pred,
                                          0));
-                x86_store_slot(text, sd[i->dst], 8);
+                cg_store(text, sd, i->dst, 4);   /* the 0/1 result is an int */
                 break;
             }
-            x86_load_slot(text, sd[i->a], i->w, 0, i->w);
+            cg_load(text, sd, i->a, i->w, 0, i->w);
             x86_cmp_eax_mem(text, sd[i->b], i->w);
             x86_setcc_eax(text, cc_for(i->pred, i->sign));
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, 4);        /* the 0/1 result is an int */
             break;
         case IR_I2F:
+            cg_reset();
             x86_cvtsi2s(text, sd[i->a], i->size, i->w);
             x86_movs_store(text, 0, sd[i->dst], i->w);
             break;
         case IR_F2I:
+            cg_reset();
             x86_cvtts2si(text, sd[i->a], i->size, i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_F2F:
+            cg_reset();
             x86_cvts2s(text, sd[i->a], i->size);
             x86_movs_store(text, 0, sd[i->dst], i->w);
             break;
         case IR_LDVAR:
-            x86_load_slot(text, sd[i->a], i->size, i->sign, i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_load(text, sd, i->a, i->size, i->sign, i->w);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STVAR:
-            x86_load_slot(text, sd[i->a], 8, 0, 8);
-            x86_store_slot(text, sd[i->dst], i->size);
+            cg_load(text, sd, i->a, 8, 0, 8);
+            x86_store_slot(text, sd[i->dst], i->size);   /* dst is a local */
             break;
         case IR_ADDR:
             x86_lea_rax_slot(text, sd[i->a]);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, 8);
             break;
         case IR_STRADDR: {
             struct strsite ss;
             ss.patch_off = x86_lea_rax_rip(text);
             ss.str_off = i->label;  /* resolved to an offset below */
             PUSH(st->str, st->nstr, st->capstr, ss);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_GADDR: {
@@ -396,7 +452,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             gs.patch_off = x86_lea_rax_rip(text);
             gs.glob = i->glob;
             PUSH(st->g, st->ng, st->capg, gs);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_FADDR: {
@@ -404,26 +460,27 @@ static void gen_func(struct ir_func *fn, struct code *text,
             fs.patch_off = x86_lea_rax_rip(text);
             fs.target = i->callee;
             PUSH(st->f, st->nf, st->capf, fs);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_LOAD:
-            x86_load_slot(text, sd[i->a], 8, 0, 8); /* the address */
+            cg_load(text, sd, i->a, 8, 0, 8);       /* the address */
             x86_load_mem_rax(text, i->size, i->sign, i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STORE:
-            x86_mov_rcx_slot(text, sd[i->a]);       /* the address */
-            x86_load_slot(text, sd[i->b], 8, 0, 8); /* the value */
+            x86_mov_rcx_slot(text, sd[i->a]);       /* the address -> rcx */
+            cg_load(text, sd, i->b, 8, 0, 8);       /* the value -> rax */
             x86_store_mem_rcx(text, i->size);
             break;
         case IR_EXT:
             /* re-extend from the low `size` bytes of the temp's slot */
-            x86_load_slot(text, sd[i->a], i->size, i->sign, i->w);
-            x86_store_slot(text, sd[i->dst], 8);
+            cg_load(text, sd, i->a, i->size, i->sign, i->w);
+            cg_store(text, sd, i->dst, i->w);
             break;
         case IR_MEMCPY: {
             /* a struct copy: 8 bytes at a time, then the tail */
+            cg_reset();
             x86_load_slot(text, sd[i->a], 8, 0, 8);
             x86_mov_reg_reg(text, REG_RCX, REG_RAX);       /* dst */
             x86_load_slot(text, sd[i->b], 8, 0, 8);
@@ -439,6 +496,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
         case IR_MEMZERO: {
+            cg_reset();
             x86_load_slot(text, sd[i->a], 8, 0, 8);
             x86_mov_reg_reg(text, REG_RCX, REG_RAX);
             x86_mov_eax_imm(text, 0, 8);
@@ -453,6 +511,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
         case IR_LABEL:
+            cg_reset();      /* a merge point: RAX is unknown here */
             label_off[i->label] = text->len;
             break;
         case IR_JMP:
@@ -462,11 +521,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
             if (i->op == IR_JMP) {
                 patch = x86_jmp_rel32(text);
             } else {
-                x86_load_slot(text, sd[i->a], i->w, 0, i->w);
+                cg_load(text, sd, i->a, i->w, 0, i->w);
                 x86_test_eax(text, i->w);
                 patch = i->op == IR_BRZ ? x86_jz_rel32(text)
                                         : x86_jnz_rel32(text);
             }
+            cg_reset();      /* control splits: don't carry RAX across */
             if (nbrs == capbrs) {
                 capbrs = capbrs ? capbrs * 2 : 16;
                 brs = xrealloc(brs, (size_t)capbrs * sizeof *brs);
@@ -479,6 +539,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_CALL: {
             /* SysV walks TWO register files independently: integers and
              * pointers take rdi..r9, floats take xmm0..7. */
+            cg_reset();     /* a call clobbers every caller-saved register */
             int ireg = 0, freg = 0;
 
             /* MEMORY-class aggregates go to the outgoing area first,
@@ -583,13 +644,13 @@ static void gen_func(struct ir_func *fn, struct code *text,
                     }
                 }
                 x86_lea_rax_slot(text, scratch_base + i->scratch);
-                x86_store_slot(text, sd[i->dst], 8);
+                cg_store(text, sd, i->dst, 8);
                 break;
             }
             if (i->flt)
-                x86_movs_store(text, 0, sd[i->dst], i->w);
+                x86_movs_store(text, 0, sd[i->dst], i->w);   /* stays reset */
             else
-                x86_store_slot(text, sd[i->dst], 8);
+                cg_store(text, sd, i->dst, i->w);
             break;
         }
         case IR_ASM: {
@@ -600,30 +661,45 @@ static void gen_func(struct ir_func *fn, struct code *text,
              * every live value is in memory, never a register, across the
              * asm. A scratch that avoids the output register carries the
              * address so the result register survives the store. */
+            cg_reset();   /* the template may clobber any register */
             struct ir_asm *ia = i->asm_ir;
+            /* Inputs carry their VALUE: a GPR ('r'/fixed) operand loads from its
+             * slot into the register; an xmm ('x', reg 16..23) uses movss/movsd
+             * into the xmm register instead. */
             for (int k = 0; k < ia->nin; k++)
-                x86_load_reg_mem(text, ia->in[k].reg, REG_RBP,
-                                 sd[ia->in[k].temp], 8);
+                if (ia->in[k].reg >= 16)
+                    x86_movs_load(text, ia->in[k].reg - 16,
+                                  sd[ia->in[k].temp], ia->in[k].size);
+                else
+                    x86_load_reg_mem(text, ia->in[k].reg, REG_RBP,
+                                     sd[ia->in[k].temp], 8);
             for (int k = 0; k < ia->codelen; k++)
                 code_byte(text, ia->code[k]);
             /* The address scratch must not be an OUTPUT register, or loading
              * it would clobber a result before it is stored (e.g. cpuid's
-             * four a/b/c/d outputs). Pick one free of every operand. */
+             * four a/b/c/d outputs). Pick one free of every operand. Only GPR
+             * operands (reg < 16) can collide with a GPR scratch. */
             int used16[16] = { 0 };
             for (int k = 0; k < ia->nin; k++)
-                used16[ia->in[k].reg] = 1;
+                if (ia->in[k].reg < 16) used16[ia->in[k].reg] = 1;
             for (int k = 0; k < ia->nout; k++)
-                used16[ia->out[k].reg] = 1;
+                if (ia->out[k].reg < 16) used16[ia->out[k].reg] = 1;
             int scr = -1;
             static const int scr_pool[] = { REG_RCX, REG_RDX, REG_RSI,
                                             REG_RDI, 8, 9, 10, 11 };
             for (unsigned p = 0; p < sizeof scr_pool / sizeof scr_pool[0]; p++)
                 if (!used16[scr_pool[p]]) { scr = scr_pool[p]; break; }
+            /* Outputs store the result register THROUGH the lvalue address
+             * (held in the operand's slot). xmm results go out via movss/movsd. */
             for (int k = 0; k < ia->nout; k++) {
                 x86_load_reg_mem(text, scr, REG_RBP,
                                  sd[ia->out[k].temp], 8);
-                x86_store_mem_reg(text, scr, 0, ia->out[k].reg,
-                                  ia->out[k].size);
+                if (ia->out[k].reg >= 16)
+                    x86_movs_store_base(text, scr, 0, ia->out[k].reg - 16,
+                                        ia->out[k].size);
+                else
+                    x86_store_mem_reg(text, scr, 0, ia->out[k].reg,
+                                      ia->out[k].size);
             }
             break;
         }
@@ -631,6 +707,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             /* Build a __va_list_tag on the frame and point the va_list at
              * it. Layout (SysV): gp_offset u32, fp_offset u32,
              * overflow_arg_area ptr, reg_save_area ptr. */
+            cg_reset();
             x86_mov_eax_imm(text, va_named_int * 8, 4);
             x86_store_mem_reg(text, REG_RBP, va_tag + 0, REG_RAX, 4);
             x86_mov_eax_imm(text, 48 + va_named_sse * 16, 4);
@@ -645,6 +722,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_store_mem_reg(text, REG_RCX, 0, REG_RAX, 8);
             break;
         case IR_RET:
+            cg_reset();
             if (i->a >= 0 && f->ret_ty->kind == TY_STRUCT) {
                 enum arg_class rc[2];
                 int rn = ty_classify(f->ret_ty, rc);
@@ -725,10 +803,11 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
                   struct strsite **strs, int *nstrs,
                   struct gsite **gs, int *ngs,
-                  struct fsite **fs, int *nfs, int want_debug)
+                  struct fsite **fs, int *nfs, int want_debug, int optimize)
 {
     struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     g_want_debug = want_debug;
+    g_regcache = optimize;
 
     for (int n = 0; n < iu->nfuncs; n++)
         gen_func(&iu->funcs[n], text, &st);

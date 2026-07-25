@@ -15,4 +15,8 @@ int embdbg_emit_objects(const unsigned char **objs, const long *lens,
                         const unsigned char *image, long imagelen,
                         const char *out);
 
+/* SHA-256(data[0..n)) -> out[32]. Exposed so EmbLD's EMBX emitter can stamp a
+ * build_id with the same hash the .embdbg producer uses. */
+void embdbg_sha256(const unsigned char *data, long n, unsigned char out[32]);
+
 #endif

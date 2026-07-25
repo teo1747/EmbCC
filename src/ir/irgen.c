@@ -59,6 +59,29 @@ static void emit_jmp(struct ir_func *fn, int label)
     i->label = label;
 }
 
+/* goto/label resolution. Labels are function-scoped and forward-referable, so a
+ * name gets its IR label the first time EITHER a `goto` or the label itself is
+ * seen. gen_func resets this table; after the body it errors on any label that
+ * was referenced by a goto but never defined. */
+#define IRGEN_MAX_LABELS 256
+static struct { const char *name; int label; int defined; int line; }
+    g_labels[IRGEN_MAX_LABELS];
+static int g_nlabels_used;
+
+static int label_idx(struct ir_func *fn, const char *name, int line)
+{
+    for (int i = 0; i < g_nlabels_used; i++)
+        if (strcmp(g_labels[i].name, name) == 0)
+            return i;
+    if (g_nlabels_used >= IRGEN_MAX_LABELS)
+        diag_fatal(fn->src->file, line, "too many labels in one function");
+    g_labels[g_nlabels_used].name = name;
+    g_labels[g_nlabels_used].label = new_label(fn);
+    g_labels[g_nlabels_used].defined = 0;
+    g_labels[g_nlabels_used].line = line;
+    return g_nlabels_used++;
+}
+
 static void emit_brz(struct ir_func *fn, int v, int w, int label)
 {
     struct ir_ins *i = emit(fn);
@@ -199,6 +222,81 @@ static void emit_mov(struct ir_func *fn, int dst, int src)
     i->a = src;
 }
 
+/* ---- bitfield access (little-endian, gcc-compatible) ----
+ * A bitfield occupies bits [bit_off, bit_off+width) of the storage unit at
+ * `addr` (a load/store of the field's declared type). Reading shifts the
+ * field to the top of the value class then back down — arithmetic for a
+ * signed field so its sign bit fills — the classic two-shift extraction,
+ * immune to neighbouring fields packed into the same unit. */
+static int bf_load(struct ir_func *fn, int addr, const struct member *m)
+{
+    const struct type *bt = m->ty;
+    int w = ty_wide(bt) ? 8 : 4;          /* value-class width, bytes */
+    int vb = w * 8;
+    /* load the raw storage unit UNSIGNED, so no stray sign extension */
+    int v = emit_load(fn, addr, ty_base(bt->kind, 1));
+    int lsh = vb - m->bit_off - m->bit_width;
+    if (lsh)
+        v = emit_bin(fn, IR_SHL, v, emit_const(fn, lsh, 4), w, 0);
+    int rsh = vb - m->bit_width;
+    if (rsh)
+        v = emit_bin(fn, IR_SHR, v, emit_const(fn, rsh, 4), w,
+                     ty_signed_int(bt));
+    return v;
+}
+
+/* Store `val` into a bitfield: read the storage unit, clear the field's
+ * bits, OR in the low `width` bits of the value, write it back. Returns the
+ * field re-read, which is the assignment expression's (truncated) value. */
+static int bf_store(struct ir_func *fn, int addr, const struct member *m,
+                    int val)
+{
+    const struct type *bt = m->ty;
+    int w = ty_wide(bt) ? 8 : 4;
+    struct type *ut = ty_base(bt->kind, 1);
+    unsigned long fmask = m->bit_width >= 64
+                        ? ~0UL : (((unsigned long)1 << m->bit_width) - 1);
+    unsigned long placed = fmask << m->bit_off;
+    int old = emit_load(fn, addr, ut);
+    int cleared = emit_bin(fn, IR_AND, old,
+                           emit_const(fn, (long)~placed, w), w, 0);
+    int low = emit_bin(fn, IR_AND, val,
+                       emit_const(fn, (long)fmask, w), w, 0);
+    if (m->bit_off)
+        low = emit_bin(fn, IR_SHL, low, emit_const(fn, m->bit_off, 4), w, 0);
+    int merged = emit_bin(fn, IR_OR, cleared, low, w, 0);
+    emit_store(fn, addr, merged, ut);
+    return bf_load(fn, addr, m);
+}
+
+/* Place one flattened initializer leaf `ie` (value already in `v`) at address
+ * `at`: a bitfield merges into its storage unit, a struct is a byte copy, any
+ * other scalar a plain truncating store. Shared by declaration and compound-
+ * literal initialization. */
+static void store_init_leaf(struct ir_func *fn, int at,
+                            const struct initelem *ie, int v)
+{
+    if (ie->bit_width) {
+        struct member m;
+        m.name = NULL; m.ty = ie->ty; m.off = 0;
+        m.is_bitfield = 1; m.bit_off = ie->bit_off; m.bit_width = ie->bit_width;
+        bf_store(fn, at, &m, v);
+    } else if (ie->ty->kind == TY_STRUCT) {
+        struct ir_ins *mm = emit(fn);
+        mm->op = IR_MEMCPY;
+        mm->a = at;
+        mm->b = v;
+        mm->size = ty_size(ie->ty);
+    } else {
+        emit_store(fn, at, v, ie->ty);
+    }
+}
+
+static int expr_is_bitfield(const struct expr *e)
+{
+    return e->kind == EXPR_MEMBER && e->memb && e->memb->is_bitfield;
+}
+
 static int emit_cmp(struct ir_func *fn, enum binop pred, int a, int b,
                     int w, int sign)
 {
@@ -214,6 +312,7 @@ static int emit_cmp(struct ir_func *fn, enum binop pred, int a, int b,
 }
 
 static int gen_expr(struct ir_func *fn, struct expr *e);
+static int gen_complit(struct ir_func *fn, struct expr *e);
 
 /* va_arg(ap, T) for an INTEGER-class T (SysV). ap's value is a pointer to
  * a __va_list_tag { gp_offset u32, fp_offset u32, overflow_arg_area ptr,
@@ -229,6 +328,42 @@ static int gen_va_arg(struct ir_func *fn, struct expr *e)
 
     int a_ova = emit_bin(fn, IR_ADD, ap, emit_const(fn, 8, 8), 8, 1);
     int a_rsa = emit_bin(fn, IR_ADD, ap, emit_const(fn, 16, 8), 8, 1);
+
+    /* SSE class (float/double): the SysV register save area lays the eight xmm
+     * regs AFTER the six GP regs, so fp_offset (at ap+4) runs 48..176 in strides
+     * of 16 (each xmm slot is 16 bytes, of which we read the low 8 = a double).
+     * A variadic float arg is promoted to double, so the overflow slot is 8. */
+    if (ty_is_float(rt)) {
+        struct type *dbl = ty_base(TY_DOUBLE, 0);
+        int a_fp = emit_bin(fn, IR_ADD, ap, emit_const(fn, 4, 8), 8, 1);
+        int fp = emit_load(fn, a_fp, u32);      /* fp_offset (at ap+4) */
+        int in_reg = emit_cmp(fn, B_LT, fp, emit_const(fn, 176, 4), 4, 0);
+        int addr = new_temp(fn);
+        int l_over = new_label(fn), l_done = new_label(fn);
+        emit_brz(fn, in_reg, 4, l_over);        /* fp_offset >= 176 -> overflow */
+        /* register save area: addr = reg_save_area + fp_offset; fp_offset += 16 */
+        int rsa = emit_load(fn, a_rsa, ptr);
+        emit_mov(fn, addr, emit_bin(fn, IR_ADD, rsa, fp, 8, 1));
+        emit_store(fn, a_fp,
+                   emit_bin(fn, IR_ADD, fp, emit_const(fn, 16, 4), 4, 0), u32);
+        emit_jmp(fn, l_done);
+        /* overflow area: addr = overflow_arg_area; advance it by 8 */
+        emit_label(fn, l_over);
+        int ova = emit_load(fn, a_ova, ptr);
+        emit_mov(fn, addr, ova);
+        emit_store(fn, a_ova,
+                   emit_bin(fn, IR_ADD, ova, emit_const(fn, 8, 8), 8, 1), ptr);
+        emit_label(fn, l_done);
+        int v = emit_load(fn, addr, dbl);       /* the value is a promoted double */
+        if (rt->kind == TY_FLOAT) {             /* va_arg(ap,float): narrow it */
+            struct ir_ins *cv = emit(fn);
+            cv->op = IR_F2F; cv->a = v; cv->size = 8; cv->w = 4;
+            cv->dst = new_temp(fn);
+            return cv->dst;
+        }
+        return v;
+    }
+
     int gp = emit_load(fn, ap, u32);        /* gp_offset (at ap+0) */
     int in_reg = emit_cmp(fn, B_LT, gp, emit_const(fn, 48, 4), 4, 0);
 
@@ -280,6 +415,8 @@ static int gen_addr(struct ir_func *fn, struct expr *e)
         int off = emit_const(fn, e->memb->off, 8);
         return emit_bin(fn, IR_ADD, base, off, 8, 1);
     }
+    case EXPR_COMPLIT:
+        return gen_complit(fn, e);
     default:
         fprintf(stderr, "embcc: internal: address of a non-lvalue\n");
         exit(1);
@@ -287,6 +424,34 @@ static int gen_addr(struct ir_func *fn, struct expr *e)
 }
 
 static int gen_expr(struct ir_func *fn, struct expr *e);
+
+/* A compound literal `(type){ init }`: clear its synthesized slot, place the
+ * flattened initializer leaves (zero-fill + last-write-wins, like a declared
+ * aggregate), and return the object's address. */
+static int gen_complit(struct ir_func *fn, struct expr *e)
+{
+    struct ir_ins *ad = emit(fn);
+    ad->op = IR_ADDR;
+    ad->a = e->var_index;
+    ad->dst = new_temp(fn);
+    int base = ad->dst;
+    struct ir_ins *z = emit(fn);
+    z->op = IR_MEMZERO;
+    z->a = base;
+    /* e->ty is the decayed pointer for an array literal; the OBJECT's size
+     * is the undecayed array (or the type itself for struct/scalar). */
+    z->size = ty_size(e->undecayed ? e->undecayed : e->ty);
+    for (int k = 0; k < e->ninits; k++) {
+        int v = gen_expr(fn, e->inits[k].e);
+        int at = base;
+        if (e->inits[k].off) {
+            int o = emit_const(fn, e->inits[k].off, 8);
+            at = emit_bin(fn, IR_ADD, base, o, 8, 1);
+        }
+        store_init_leaf(fn, at, &e->inits[k], v);
+    }
+    return base;
+}
 
 /* The unit being generated — for the string table. One compilation per
  * process, so a file-scope current-unit pointer is honest. */
@@ -335,6 +500,93 @@ static int emit_isz(struct ir_func *fn, int v, int w)
     return i->dst;
 }
 
+/* Convert any scalar to _Bool: the result is (v != 0), a 0/1 int. C says a
+ * store to _Bool normalizes this way, and a float 0.5 must become 1 (so it
+ * compares the float directly, not a truncation). */
+static int emit_tobool(struct ir_func *fn, int v, const struct type *from)
+{
+    int flt = ty_is_float(from);
+    /* the zero operand MUST be emitted before the compare that reads it —
+     * the IR is lowered in order, so an operand emitted after would be
+     * materialized after the cmp already ran (a real bug, once). */
+    int zero = flt ? emit_fconst(fn, 0.0, ty_size(from))
+                   : emit_const(fn, 0, ty_w(from));
+    struct ir_ins *i = emit(fn);
+    i->op = IR_CMP;
+    i->pred = B_NE;
+    i->a = v;
+    i->b = zero;
+    i->sign = 0;
+    i->flt = flt;
+    i->w = flt ? ty_size(from) : ty_w(from);
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
+/* An I2F/F2I instruction, spelled out because unsigned-64 conversions build
+ * several by hand. `a` is the source vreg. */
+static int emit_i2f(struct ir_func *fn, int a, int srcw, int dstw)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_I2F; i->a = a; i->size = srcw; i->sign = 1; i->w = dstw;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+static int emit_f2i(struct ir_func *fn, int a, int srcw, int dstw)
+{
+    struct ir_ins *i = emit(fn);
+    i->op = IR_F2I; i->a = a; i->size = srcw; i->sign = 1; i->w = dstw;
+    i->dst = new_temp(fn);
+    return i->dst;
+}
+
+/* unsigned-64 -> floating. SSE2's cvtsi2sd is SIGNED, so a u64 with its top bit
+ * set would convert as a huge negative. Split into two 32-bit halves -- each is
+ * positive and < 2^32, so cvtsi2sd is exact -- then hi*2^32 + lo. Both partials
+ * are exact doubles, so the single add rounds the true u64 once (correctly
+ * rounded). For a float target do it in double first (exact) then narrow, which
+ * avoids a double rounding. */
+static int gen_u64_to_float(struct ir_func *fn, int v, int tsize)
+{
+    int hi = emit_bin(fn, IR_SHR, v, emit_const(fn, 32, 4), 8, 0);      /* v >> 32 */
+    int lo = emit_bin(fn, IR_AND, v, emit_const(fn, 0xffffffffL, 8), 8, 1);
+    int hd = emit_i2f(fn, hi, 8, 8);
+    int ld = emit_i2f(fn, lo, 8, 8);
+    int hs = emit_fbin(fn, IR_MUL, hd, emit_fconst(fn, 4294967296.0, 8), 8);
+    int res = emit_fbin(fn, IR_ADD, hs, ld, 8);
+    if (tsize == 4) {   /* narrow the exact double to float: one rounding */
+        struct ir_ins *nf = emit(fn);
+        nf->op = IR_F2F; nf->a = res; nf->size = 8; nf->w = 4;
+        nf->dst = new_temp(fn);
+        return nf->dst;
+    }
+    return res;
+}
+
+/* floating -> unsigned-64. cvttsd2si is SIGNED: exact for v < 2^63, but v in
+ * [2^63, 2^64) overflows it. For those, convert (v - 2^63) and set the top bit
+ * back. Branch on v >= 2^63. */
+static int gen_float_to_u64(struct ir_func *fn, int v, int fsize)
+{
+    int two63 = emit_fconst(fn, 9223372036854775808.0, fsize);   /* 2^63 */
+    struct ir_ins *cmp = emit(fn);                               /* c = v >= 2^63 */
+    cmp->op = IR_CMP; cmp->pred = B_GE; cmp->a = v; cmp->b = two63;
+    cmp->w = fsize; cmp->flt = 1; cmp->dst = new_temp(fn);
+    int res = new_temp(fn);
+    int l_small = new_label(fn), l_done = new_label(fn);
+    emit_brz(fn, cmp->dst, 4, l_small);                          /* v < 2^63 -> direct */
+    /* v >= 2^63: (u64)(v - 2^63) with the sign bit flipped back on */
+    int vm = emit_fbin(fn, IR_SUB, v, two63, fsize);
+    int big = emit_bin(fn, IR_XOR, emit_f2i(fn, vm, fsize, 8),
+                       emit_const(fn, (long)1 << 63, 8), 8, 0);
+    emit_mov(fn, res, big);
+    emit_jmp(fn, l_done);
+    emit_label(fn, l_small);
+    emit_mov(fn, res, emit_f2i(fn, v, fsize, 8));
+    emit_label(fn, l_done);
+    return res;
+}
+
 /* Change a temp's representation between type classes: truncating to a
  * narrow type re-extends from its low bytes; widening extends per the
  * SOURCE's signedness. Free conversions return the same temp. */
@@ -343,6 +595,10 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
 {
     int fsize = ty_size(from), tsize = ty_size(to);
     int fw = ty_w(from), tw = ty_w(to);
+
+    /* To _Bool is a normalize-to-0/1, not a truncation. */
+    if (to->kind == TY_BOOL && from->kind != TY_BOOL)
+        return emit_tobool(fn, v, from);
 
     /* Floating conversions are real instructions, not reinterpretations
      * — the bit patterns have nothing in common. */
@@ -360,14 +616,17 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
             return i->dst;
         }
         if (ty_is_float(to)) {
+            /* unsigned 64-bit -> float needs the split-and-add fixup; every
+             * other integer source goes straight through signed cvtsi2sd. */
+            if (from->is_unsigned && ty_size(from) == 8)
+                return gen_u64_to_float(fn, v, tsize);
             /* int -> float, and the source WIDTH matters: a 32-bit
              * operation zero-extends its result into the 8-byte slot
              * regardless of signedness, so a negative int read back as
              * 64 bits is 2^32 too large. Read a signed 32-bit source as
              * 32 bits and let cvtsi2sd interpret the sign; read an
              * unsigned int as 64, where the zero extension IS the value
-             * (which is what makes it exact). unsigned long is refused
-             * by sema — SSE2 cannot do it. */
+             * (which is what makes it exact). */
             int srcw = 4;
             if (ty_wide(from) ||
                 (from->is_unsigned && ty_size(from) == 4))
@@ -381,6 +640,10 @@ static int gen_convert(struct ir_func *fn, int v, const struct type *from,
             i->dst = new_temp(fn);
             return i->dst;
         }
+        /* float -> unsigned 64-bit needs the 2^63 bias fixup (cvttsd2si is
+         * signed); other targets use the signed convert-then-narrow below. */
+        if (to->is_unsigned && ty_size(to) == 8)
+            return gen_float_to_u64(fn, v, fsize);
         /* float -> int: truncates toward zero, as C requires. Convert
          * to the 64-bit form then narrow, so unsigned int lands right. */
         i = emit(fn);
@@ -462,8 +725,16 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return emit_ldvar(fn, e->var_index, e->ty);
     case EXPR_MEMBER: {
         int addr = gen_addr(fn, e);
+        if (e->memb->is_bitfield)
+            return bf_load(fn, addr, e->memb);
         if (e->undecayed || e->ty->kind == TY_STRUCT)
             return addr; /* array member decays; nested struct is addr */
+        return emit_load(fn, addr, e->ty);
+    }
+    case EXPR_COMPLIT: {
+        int addr = gen_complit(fn, e);
+        if (e->undecayed || e->ty->kind == TY_STRUCT)
+            return addr; /* an array decays; a struct is carried by address */
         return emit_load(fn, addr, e->ty);
     }
     case EXPR_ASSIGN: {
@@ -486,6 +757,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         /* global, *p, or member: a store through an address */
         int addr = gen_addr(fn, e->lhs);
         int v = gen_expr(fn, e->rhs);
+        if (expr_is_bitfield(e->lhs))
+            return bf_store(fn, addr, e->lhs->memb, v);
         emit_store(fn, addr, v, e->ty);
         return v;
     }
@@ -494,8 +767,10 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         int scale = t->kind == TY_PTR ? ty_size(t->pointee) : 1;
         int w = ty_w(t);
         int local = e->lhs->kind == EXPR_VAR && !e->lhs->gref;
+        int is_bf = expr_is_bitfield(e->lhs);
         int addr = local ? -1 : gen_addr(fn, e->lhs);
         int cur = local ? emit_ldvar(fn, e->lhs->var_index, t)
+                : is_bf ? bf_load(fn, addr, e->lhs->memb)
                         : emit_load(fn, addr, t);
         int old = -1;
         if (e->is_post) {
@@ -506,7 +781,7 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         int d = emit_const(fn, (long)e->delta * scale, w);
         int sum = emit_bin(fn, IR_ADD, cur, d, w, 1);
-        if (ty_size(t) <= 2) {
+        if (ty_size(t) <= 2 && !is_bf) {
             /* ++c on a char must wrap like a char, in the value too */
             struct ir_ins *i = emit(fn);
             i->op = IR_EXT;
@@ -519,6 +794,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         if (local)
             emit_stvar(fn, e->lhs->var_index, sum, t);
+        else if (is_bf)
+            sum = bf_store(fn, addr, e->lhs->memb, sum);
         else
             emit_store(fn, addr, sum, t);
         return e->is_post ? old : sum;
@@ -715,13 +992,17 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return gen_expr(fn, e->rhs);
     case EXPR_INITLIST:
         break; /* consumed by sema's flattening; never evaluated */
+    case EXPR_GENERIC:
+        break; /* sema replaced it with the selected expression */
     case EXPR_COMPOUND: {
         /* the address is computed ONCE — the whole reason this is not
          * desugared to `x = x op y` */
         struct type *lt = e->lhs->ty;
         int local = e->lhs->kind == EXPR_VAR && !e->lhs->gref;
+        int is_bf = expr_is_bitfield(e->lhs);
         int addr = local ? -1 : gen_addr(fn, e->lhs);
         int cur = local ? emit_ldvar(fn, e->lhs->var_index, lt)
+                : is_bf ? bf_load(fn, addr, e->lhs->memb)
                         : emit_load(fn, addr, lt);
         int rv = gen_expr(fn, e->rhs);
         int res;
@@ -750,6 +1031,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         if (local)
             emit_stvar(fn, e->lhs->var_index, res, lt);
+        else if (is_bf)
+            return bf_store(fn, addr, e->lhs->memb, res);
         else
             emit_store(fn, addr, res, lt);
         return res;
@@ -909,7 +1192,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             reg = opregs[idx];
         }
 
-        if (n + 4 > cap) {
+        if (n + 8 > cap) {
             cap = cap ? cap * 2 : 16;
             code = xrealloc(code, (size_t)cap);
         }
@@ -955,6 +1238,45 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             code[n++] = 0x0f;
             code[n++] = 0x92;
             code[n++] = (unsigned char)(0xc0 | (reg & 7));          /* /0 */
+        } else if (mlen == 6 && strncmp(m, "sqrts", 5) == 0 &&
+                   (m[5] == 'd' || m[5] == 's')) {
+            /* sqrtsd/sqrtss %src,%dst (AT&T order): F2/F3 0F 51 /r, both xmm.
+             * `reg` already holds the FIRST operand (%src); parse `,%dst`. */
+            int is_sd = m[5] == 'd';
+            if (reg < 16)
+                diag_fatal(file, line,
+                           "asm '%.*s' operands must be 'x' (xmm): \"%s\"",
+                           mlen, m, tmpl);
+            int src = reg;
+            if (*p != ',')
+                diag_fatal(file, line,
+                           "asm '%.*s' wants %%src,%%dst: \"%s\"", mlen, m, tmpl);
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '%' || !(p[1] >= '0' && p[1] <= '9'))
+                diag_fatal(file, line,
+                           "asm '%.*s' destination must be %%N: \"%s\"",
+                           mlen, m, tmpl);
+            p++;
+            int idx2 = 0;
+            while (*p >= '0' && *p <= '9')
+                idx2 = idx2 * 10 + (*p++ - '0');
+            if (idx2 >= nops)
+                diag_fatal(file, line,
+                           "asm operand %%%d out of range in \"%s\"", idx2, tmpl);
+            int dst = opregs[idx2];
+            if (dst < 16)
+                diag_fatal(file, line,
+                           "asm '%.*s' destination must be 'x' (xmm): \"%s\"",
+                           mlen, m, tmpl);
+            int s = src - 16, d = dst - 16;
+            code[n++] = (unsigned char)(is_sd ? 0xf2 : 0xf3);
+            if (d >= 8 || s >= 8)     /* REX.R names dst>=8, REX.B names src>=8 */
+                code[n++] = (unsigned char)(0x40 | (d >= 8 ? 4 : 0) |
+                                            (s >= 8 ? 1 : 0));
+            code[n++] = 0x0f;
+            code[n++] = 0x51;
+            code[n++] = (unsigned char)(0xc0 | ((d & 7) << 3) | (s & 7));
         } else {
             diag_fatal(file, line,
                        "asm instruction \"%.*s\" not supported "
@@ -980,6 +1302,17 @@ static int asm_alloc_reg(int *used, const char *file, int line)
     return -1;
 }
 
+/* Assign a free XMM register to an 'x' (SSE) asm operand. XMM registers are
+ * encoded as 16 + n (0..7 -> 16..23) so they share one operand-register space
+ * with the GPRs (0..15); codegen and asm_assemble decode reg >= 16 as xmm. */
+static int asm_alloc_xmm(int *xused, const char *file, int line)
+{
+    for (int i = 0; i < 8; i++)
+        if (!xused[i]) { xused[i] = 1; return 16 + i; }
+    diag_fatal(file, line, "asm: out of xmm registers for the operands");
+    return -1;
+}
+
 /* Innermost enclosing loop's exit and continue targets; sema already
  * rejected break/continue outside any loop. */
 struct loopctx {
@@ -999,7 +1332,22 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
         case STMT_CONTINUE:
             emit_jmp(fn, loop->cont);
             break;
+        case STMT_LABEL: {
+            int ix = label_idx(fn, s->name, s->line);
+            if (g_labels[ix].defined)
+                diag_fatal(fn->src->file, s->line, "duplicate label '%s'",
+                           s->name);
+            g_labels[ix].defined = 1;
+            emit_label(fn, g_labels[ix].label);
+            gen_stmt(fn, s->body, loop);   /* the labeled statement */
+            break;
+        }
+        case STMT_GOTO:
+            emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
+            break;
         case STMT_DECL:
+            if (s->is_extern)
+                break; /* block-scope extern: a declaration, emits no code */
             if (s->sglob)
                 break; /* a static local IS its global; no code here */
             if (s->ninits) {
@@ -1022,15 +1370,7 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
                         int o = emit_const(fn, s->inits[k].off, 8);
                         at = emit_bin(fn, IR_ADD, base, o, 8, 1);
                     }
-                    if (s->inits[k].ty->kind == TY_STRUCT) {
-                        struct ir_ins *m = emit(fn);
-                        m->op = IR_MEMCPY;
-                        m->a = at;
-                        m->b = v;
-                        m->size = ty_size(s->inits[k].ty);
-                    } else {
-                        emit_store(fn, at, v, s->inits[k].ty);
-                    }
+                    store_init_leaf(fn, at, &s->inits[k], v);
                 }
                 break;
             }
@@ -1068,31 +1408,38 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
              * allocatable ones (-2) get a free register. Then %N substitution
              * numbers outputs first, then inputs, exactly as gcc does. */
             int used[16] = { 0 };
-            for (int i = 0; i < a->nout; i++)
-                if (a->out[i].reg >= 0) used[a->out[i].reg] = 1;
-            for (int i = 0; i < a->nin; i++)
-                if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
+            int xused[8] = { 0 };   /* xmm operands (reg 16..23) */
+            for (int i = 0; i < a->nout; i++) {
+                if (a->out[i].reg >= 16) xused[a->out[i].reg - 16] = 1;
+                else if (a->out[i].reg >= 0) used[a->out[i].reg] = 1;
+            }
+            for (int i = 0; i < a->nin; i++) {
+                if (a->in[i].reg >= 16) xused[a->in[i].reg - 16] = 1;
+                else if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
+            }
             int opregs[2 * MAX_PARAMS], nops = 0;
             for (int i = 0; i < a->nout; i++) {
                 int r = a->out[i].reg;
-                if (r == -2)
-                    r = asm_alloc_reg(used, fn->src->file, s->line);
+                if (r == -2)      r = asm_alloc_reg(used, fn->src->file, s->line);
+                else if (r == -3) r = asm_alloc_xmm(xused, fn->src->file, s->line);
                 ia->out[i].reg = r;
                 opregs[nops++] = r;
             }
             for (int i = 0; i < a->nin; i++) {
                 int r = a->in[i].reg;
-                if (r == -2)
-                    r = asm_alloc_reg(used, fn->src->file, s->line);
+                if (r == -2)      r = asm_alloc_reg(used, fn->src->file, s->line);
+                else if (r == -3) r = asm_alloc_xmm(xused, fn->src->file, s->line);
                 ia->in[i].reg = r;
                 opregs[nops++] = r;
             }
             asm_assemble(fn, s, opregs, nops, ia);
             /* An input carries its VALUE; an output the ADDRESS of its
-             * lvalue. */
+             * lvalue. An xmm ('x') input is moved with movss/movsd, so its
+             * size is the operand's own float width. */
             for (int i = 0; i < a->nin; i++) {
                 ia->in[i].temp = gen_expr(fn, a->in[i].expr);
-                ia->in[i].size = 8;
+                ia->in[i].size = ia->in[i].reg >= 16
+                               ? ty_size(a->in[i].expr->ty) : 8;
             }
             for (int i = 0; i < a->nout; i++) {
                 ia->out[i].temp = gen_addr(fn, a->out[i].expr);
@@ -1265,6 +1612,8 @@ static void collect_locals(struct ir_func *fn, struct stmt *s)
     for (; s; s = s->next) {
         switch (s->kind) {
         case STMT_DECL:
+            if (s->is_extern)     /* block-scope extern: no local slot at all */
+                break;
             if (!s->sglob)
                 add_dbgvar(fn, s->name, s->var_index, 0,
                            fn->src->var_tys[s->var_index]);
@@ -1301,7 +1650,12 @@ static void gen_func(struct ir_func *fn, struct func *f)
     for (int i = 0; i < f->nparams; i++)
         add_dbgvar(fn, f->params[i], i, 1, f->param_tys[i]);
     collect_locals(fn, f->body);
+    g_nlabels_used = 0;                 /* labels are per-function */
     gen_stmt(fn, f->body, NULL);
+    for (int i = 0; i < g_nlabels_used; i++)
+        if (!g_labels[i].defined)
+            diag_fatal(fn->src->file, g_labels[i].line,
+                       "label '%s' used but not defined", g_labels[i].name);
 }
 
 struct ir_unit *irgen(struct unit *u)

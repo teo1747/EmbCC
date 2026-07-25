@@ -58,6 +58,9 @@ static const struct {
     { "long", TOK_KW_LONG },
     { "float", TOK_KW_FLOAT },
     { "double", TOK_KW_DOUBLE },
+    { "_Bool", TOK_KW_BOOL },
+    { "_Static_assert", TOK_KW_STATIC_ASSERT },
+    { "_Generic", TOK_KW_GENERIC },
     { "unsigned", TOK_KW_UNSIGNED },
     { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
@@ -86,6 +89,7 @@ static const struct {
     { "for", TOK_KW_FOR },
     { "break", TOK_KW_BREAK },
     { "continue", TOK_KW_CONTINUE },
+    { "goto", TOK_KW_GOTO },
     { "do", TOK_KW_DO },
     { "switch", TOK_KW_SWITCH },
     { "case", TOK_KW_CASE },
@@ -126,6 +130,16 @@ void lex_next(struct lexer *lx)
                          isdigit((unsigned char)scan[2])))) {
                 looks_float = 1;
             }
+        } else {
+            /* A hex float REQUIRES a binary exponent 'p'/'P' (C99 6.4.4.2):
+             * scan past the hex digits + an optional '.' and look for it, so
+             * 0x1.8p3 / 0x1p-4 lex as floats while 0x10 stays an integer.
+             * strtod below parses the hex-float form directly. */
+            scan = lx->p + 2;               /* past "0x" */
+            while (isxdigit((unsigned char)*scan) || *scan == '.')
+                scan++;
+            if (*scan == 'p' || *scan == 'P')
+                looks_float = 1;
         }
         if (looks_float) {
             char *fend;
@@ -435,6 +449,9 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_LONG: return "'long'";
     case TOK_KW_FLOAT: return "'float'";
     case TOK_KW_DOUBLE: return "'double'";
+    case TOK_KW_BOOL: return "'_Bool'";
+    case TOK_KW_STATIC_ASSERT: return "'_Static_assert'";
+    case TOK_KW_GENERIC: return "'_Generic'";
     case TOK_KW_UNSIGNED: return "'unsigned'";
     case TOK_KW_SIGNED: return "'signed'";
     case TOK_KW_SIZEOF: return "'sizeof'";
@@ -460,6 +477,7 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_FOR: return "'for'";
     case TOK_KW_BREAK: return "'break'";
     case TOK_KW_CONTINUE: return "'continue'";
+    case TOK_KW_GOTO: return "'goto'";
     case TOK_KW_DO: return "'do'";
     case TOK_KW_SWITCH: return "'switch'";
     case TOK_KW_CASE: return "'case'";

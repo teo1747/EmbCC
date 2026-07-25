@@ -88,7 +88,7 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_SIGNED || k == TOK_KW_VOID ||
            k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM ||
            k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
-           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE;
+           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL;
 }
 
 /* const/volatile/restrict are accepted and IGNORED: EmbCC does not
@@ -118,6 +118,8 @@ static struct expr *parse_cond(struct parser *ps);
 static int size_fold(const struct expr *e, long *out);
 static struct type *parse_array_dims(struct parser *ps, struct type *t);
 static struct type *parse_type_spec(struct parser *ps, int allow_body);
+static void parse_static_assert(struct parser *ps);
+static struct expr *parse_initializer(struct parser *ps);
 
 /* Declarator over a base type: leading stars, then either the function-
  * pointer form '( * [*...] [name] [dims] ) ( params )' or a plain
@@ -339,11 +341,12 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     /* base specifiers in any order: unsigned long int, long unsigned... */
     int uns = -1, nlong = 0, nshort = 0, nchar = 0, nint = 0, nvoid = 0;
-    int nfloat = 0, ndouble = 0;
+    int nfloat = 0, ndouble = 0, nbool = 0;
     int any = 0;
     for (;;) {
         enum tok_kind k = cur(ps)->kind;
         if (k == TOK_KW_FLOAT) nfloat++;
+        else if (k == TOK_KW_BOOL) nbool++;
         else if (k == TOK_KW_DOUBLE) ndouble++;
         else if (k == TOK_KW_UNSIGNED) uns = 1;
         else if (k == TOK_KW_SIGNED) uns = 0;
@@ -360,6 +363,12 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     if (!any)
         return NULL;
+    if (nbool) {
+        if (any > 1)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "_Bool cannot combine with other specifiers");
+        return ty_base(TY_BOOL, 0);
+    }
     if (nfloat || ndouble) {
         if (uns != -1 || nchar || nshort || nint || nvoid ||
             (nfloat && ndouble))
@@ -402,6 +411,10 @@ static struct type *parse_stars(struct parser *ps, struct type *t)
  * `__fds_bits[_howmany(FD_SETSIZE, _NFDBITS)]`, and _NFDBITS expands to
  * ((int)sizeof(__fd_mask) * 8). Anything it cannot evaluate (an
  * identifier, sizeof of an expression) is refused by name. */
+/* The unit being parsed, so size_fold can resolve enum constants (which are
+ * compile-time integer constants) in constant expressions like array sizes. */
+static struct unit *g_fold_unit;
+
 static int size_fold(const struct expr *e, long *out)
 {
     long a, b;
@@ -410,6 +423,15 @@ static int size_fold(const struct expr *e, long *out)
     case EXPR_NUM:
         *out = e->num;
         return 1;
+    case EXPR_VAR:
+        /* an enumerator is an integer constant expression: `int a[N];` */
+        for (struct econst *ec = g_fold_unit ? g_fold_unit->econsts : NULL;
+             ec; ec = ec->next)
+            if (strcmp(ec->name, e->name) == 0) {
+                *out = ec->val;
+                return 1;
+            }
+        return 0;
     case EXPR_SIZEOF:
         if (!e->cast_ty)
             return 0; /* sizeof(expr) needs types this pass lacks */
@@ -449,6 +471,8 @@ static int size_fold(const struct expr *e, long *out)
         case B_GE:  *out = a >= b; return 1;
         case B_EQ:  *out = a == b; return 1;
         case B_NE:  *out = a != b; return 1;
+        case B_LAND: *out = a && b; return 1;
+        case B_LOR:  *out = a || b; return 1;
         default: return 0;
         }
     default:
@@ -552,6 +576,11 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
     int n = 0, cap = 0;
 
     while (cur(ps)->kind != TOK_RBRACE) {
+        /* a `_Static_assert` among the members: checked, contributes none */
+        if (cur(ps)->kind == TOK_KW_STATIC_ASSERT) {
+            parse_static_assert(ps);
+            continue;
+        }
         /* allow_body: nested struct/union definitions are legal C */
         struct type *spec = parse_type_spec(ps, 1);
         if (!spec)
@@ -562,6 +591,32 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
             int mline = cur(ps)->line;
             const char *mname;
             struct type *mty = parse_declarator(ps, spec, &mname);
+            /* A bitfield: `T name : width` or an anonymous `T : width`
+             * (padding) / `T : 0` (a separator forcing the next field to a
+             * storage-unit boundary). Only integer types may be bitfields. */
+            int is_bf = 0, bit_width = 0;
+            if (cur(ps)->kind == TOK_COLON) {
+                advance(ps);
+                if (!ty_is_integer(mty))
+                    diag_fatal(ps->lx.file, mline,
+                               "a bitfield must have integer type, not %s",
+                               ty_name(mty));
+                struct expr *we = parse_cond(ps);
+                long wv;
+                if (!size_fold(we, &wv) || wv < 0)
+                    diag_fatal(ps->lx.file, mline,
+                               "a bitfield width must be a constant >= 0");
+                if (wv > 8 * (long)ty_size(mty))
+                    diag_fatal(ps->lx.file, mline,
+                               "bitfield '%s' width %ld exceeds its type %s",
+                               mname ? mname : "<anon>", wv, ty_name(mty));
+                if (wv == 0 && mname)
+                    diag_fatal(ps->lx.file, mline,
+                               "a named bitfield '%s' cannot have width 0",
+                               mname);
+                is_bf = 1;
+                bit_width = (int)wv;
+            }
             if (mty->kind == TY_VOID)
                 diag_fatal(ps->lx.file, mline,
                            "a member cannot have type void");
@@ -569,18 +624,23 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
                 diag_fatal(ps->lx.file, mline,
                            "a member cannot be a function — use a "
                            "function pointer");
-            if (!mname)
+            /* An anonymous struct/union member (`struct { ... };` with no
+             * declarator) is legal C11 — its members are reached as if they
+             * belonged to the enclosing type. A nameless non-aggregate is
+             * still an error. */
+            if (!mname && !is_bf && mty->kind != TY_STRUCT)
                 diag_fatal(ps->lx.file, cur(ps)->line,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
-            if (ty_size(mty) == 0)
+            if (!is_bf && ty_size(mty) == 0)
                 diag_fatal(ps->lx.file, mline,
                            "member '%s' has incomplete type %s",
                            mname, ty_name(mty));
-            for (int i = 0; i < n; i++)
-                if (strcmp(ms[i].name, mname) == 0)
-                    diag_fatal(ps->lx.file, mline,
-                               "duplicate member '%s'", mname);
+            if (mname)
+                for (int i = 0; i < n; i++)
+                    if (ms[i].name && strcmp(ms[i].name, mname) == 0)
+                        diag_fatal(ps->lx.file, mline,
+                                   "duplicate member '%s'", mname);
             if (n == cap) {
                 cap = cap ? cap * 2 : 8;
                 ms = xrealloc(ms, (size_t)cap * sizeof *ms);
@@ -589,6 +649,9 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
             ms[n].name = mname;
             ms[n].ty = mty;
             ms[n].off = 0;
+            ms[n].is_bitfield = is_bf;
+            ms[n].bit_off = 0;
+            ms[n].bit_width = bit_width;
             n++;
             if (cur(ps)->kind == TOK_COMMA) {
                 advance(ps);
@@ -659,6 +722,7 @@ static struct expr *new_expr(enum expr_kind kind, int line)
     struct expr *e = xcalloc(1, sizeof *e);
     e->kind = kind;
     e->line = line;
+    e->desig_index = -1;      /* positional unless a [i] designator sets it */
     return e;
 }
 
@@ -674,6 +738,35 @@ static struct expr *parse_primary(struct parser *ps)
     struct expr *e;
 
     switch (t->kind) {
+    case TOK_KW_GENERIC: {
+        /* _Generic(controlling, T1: e1, ..., default: eN) — a compile-time
+         * type-directed selection; sema picks the matching arm. */
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after _Generic");
+        e = new_expr(EXPR_GENERIC, t->line);
+        e->lhs = parse_expr(ps);          /* the controlling expression */
+        int cap = 0;
+        while (cur(ps)->kind == TOK_COMMA) {
+            advance(ps);
+            struct type *at = NULL;
+            if (cur(ps)->kind == TOK_KW_DEFAULT)
+                advance(ps);              /* the default association */
+            else
+                at = parse_type_name(ps, parse_type_spec(ps, 0));
+            expect(ps, TOK_COLON, "':' in a _Generic association");
+            struct expr *ae = parse_expr(ps);
+            if (e->ngen == cap) {
+                cap = cap ? cap * 2 : 4;
+                e->gtypes = xrealloc(e->gtypes, (size_t)cap * sizeof *e->gtypes);
+                e->gexprs = xrealloc(e->gexprs, (size_t)cap * sizeof *e->gexprs);
+            }
+            e->gtypes[e->ngen] = at;
+            e->gexprs[e->ngen] = ae;
+            e->ngen++;
+        }
+        expect(ps, TOK_RPAREN, "')' to close _Generic");
+        return e;
+    }
     case TOK_NUM:
         e = new_expr(EXPR_NUM, t->line);
         e->num = t->num;
@@ -753,9 +846,11 @@ static struct expr *incdec(struct parser *ps, struct expr *target,
     return e;
 }
 
-static struct expr *parse_postfix(struct parser *ps)
+/* Applies postfix operators (call, [], ., ->, ++/--) to an already-parsed
+ * primary/compound-literal seed. Split out so a compound literal can take
+ * postfix too: `(struct P){...}.x`, `(int[]){1,2,3}[0]`. */
+static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
 {
-    struct expr *e = parse_primary(ps);
     for (;;) {
         if (cur(ps)->kind == TOK_LPAREN) {
             /* a call — through a name or any pointer-valued expression */
@@ -816,6 +911,11 @@ static struct expr *parse_postfix(struct parser *ps)
     }
 }
 
+static struct expr *parse_postfix(struct parser *ps)
+{
+    return parse_postfix_ops(ps, parse_primary(ps));
+}
+
 static struct expr *parse_unary(struct parser *ps)
 {
     struct token *t = cur(ps);
@@ -827,6 +927,11 @@ static struct expr *parse_unary(struct parser *ps)
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
+    case TOK_PLUS:
+        /* unary plus: identity on an arithmetic operand (the surrounding
+         * context applies the usual promotions). Just yield the operand. */
+        advance(ps);
+        return parse_unary(ps);
     case TOK_MINUS:
         e = new_expr(EXPR_NEG, t->line);
         advance(ps);
@@ -878,6 +983,14 @@ static struct expr *parse_unary(struct parser *ps)
         if (at_type_start(ps)) {
             struct type *ct = parse_type_name(ps, parse_type_spec(ps, 0));
             expect(ps, TOK_RPAREN, "')'");
+            /* `(type){ ... }` is a compound literal (an unnamed object),
+             * not a cast — it can even take postfix operators. */
+            if (cur(ps)->kind == TOK_LBRACE) {
+                e = new_expr(EXPR_COMPLIT, t->line);
+                e->cast_ty = ct;
+                e->lhs = parse_initializer(ps);
+                return parse_postfix_ops(ps, e);
+            }
             e = new_expr(EXPR_CAST, t->line);
             e->cast_ty = ct;
             e->rhs = parse_unary(ps);
@@ -1041,6 +1154,22 @@ static struct stmt *new_stmt(enum stmt_kind kind, int line)
 
 static struct stmt *parse_stmt(struct parser *ps, int allow_decl);
 
+/* The element count an initializer list implies for an unsized array:
+ * the highest index reached, where a `[i] =` designator repositions the
+ * running index and each element then advances it by one. */
+int initlist_array_count(const struct expr *il)
+{
+    int idx = 0, max = 0;
+    for (int i = 0; i < il->nelems; i++) {
+        if (il->elems[i]->desig_index >= 0)
+            idx = il->elems[i]->desig_index;
+        idx++;
+        if (idx > max)
+            max = idx;
+    }
+    return max;
+}
+
 /* An initializer: either an ordinary expression or a brace list, which
  * may nest. Sema matches it against the target type. */
 static struct expr *parse_initializer(struct parser *ps)
@@ -1055,13 +1184,21 @@ static struct expr *parse_initializer(struct parser *ps)
         if (cur(ps)->kind == TOK_EOF)
             diag_fatal(ps->lx.file, cur(ps)->line,
                        "unterminated initializer");
-        /* A struct field designator `.name =`; array `[i] =` is a future
-         * seam (EmbCC's own source needs only the field form). */
+        /* A designator: struct field `.name =` or array element `[i] =`.
+         * One level only (no `[i].f =` chains — no EmbCC source needs it). */
         const char *field = NULL;
-        if (cur(ps)->kind == TOK_LBRACKET)
-            diag_fatal(ps->lx.file, cur(ps)->line,
-                       "array [index] designators are not supported yet");
-        if (cur(ps)->kind == TOK_DOT) {
+        long index = -1;
+        if (cur(ps)->kind == TOK_LBRACKET) {
+            int iline = cur(ps)->line;
+            advance(ps);
+            struct expr *ie = parse_cond(ps);
+            if (!size_fold(ie, &index) || index < 0)
+                diag_fatal(ps->lx.file, iline,
+                           "an array designator [index] must be a constant "
+                           ">= 0");
+            expect(ps, TOK_RBRACKET, "']'");
+            expect(ps, TOK_ASSIGN, "'=' after an array designator");
+        } else if (cur(ps)->kind == TOK_DOT) {
             advance(ps);
             if (cur(ps)->kind != TOK_IDENT)
                 diag_fatal(ps->lx.file, cur(ps)->line,
@@ -1077,6 +1214,7 @@ static struct expr *parse_initializer(struct parser *ps)
         }
         struct expr *el = parse_initializer(ps);
         el->desig_field = field;
+        el->desig_index = index >= 0 ? (int)index : -1;
         e->elems[e->nelems++] = el;
         if (cur(ps)->kind != TOK_COMMA)
             break;
@@ -1202,6 +1340,74 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     if (t->kind == TOK_KW_ASM)
         return parse_asm_stmt(ps);
 
+    /* A block-scope `_Static_assert`: checked now, emits nothing. */
+    if (t->kind == TOK_KW_STATIC_ASSERT) {
+        parse_static_assert(ps);
+        return new_stmt(STMT_BLOCK, t->line);
+    }
+
+    /* Block-scope `typedef` and `extern`: declarations that emit no code and
+     * take no local storage. Handled here at the parser level -- a local
+     * typedef registers a type name; a local extern registers the external
+     * global/function the reference resolves to. Both are unit-visible (the
+     * one flat namespace EmbCC keeps), which admits a superset of C's block
+     * scoping -- fine, and the same trade-off tags/typedefs already make. */
+    if (t->kind == TOK_KW_TYPEDEF || t->kind == TOK_KW_EXTERN) {
+        if (!allow_decl)
+            diag_fatal(ps->lx.file, t->line,
+                       "a declaration cannot be the body of if/while/for; "
+                       "wrap it in braces");
+        int is_td = t->kind == TOK_KW_TYPEDEF;
+        advance(ps);
+        struct type *base = parse_type_spec(ps, 1);
+        if (!base)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a type after '%s'", is_td ? "typedef" : "extern");
+        /* extern declarators become STMT_DECL nodes with is_extern set; sema
+         * registers the unit global/function (appending to those lists at
+         * PARSE time would race parse_top's own list tails). typedef registers
+         * a name right here (its list is a prepend-list -- no tail to race). */
+        struct stmt *ehead = NULL, **etail = &ehead;
+        for (;;) {
+            if (is_td) {
+                const char *tname;
+                struct type *tt = parse_declarator(ps, base, &tname);
+                if (!tname)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "typedef needs a name, got %s", tok_describe(cur(ps)));
+                struct type *prev = find_typedef(ps, tname);
+                if (prev && !ty_equal(prev, tt))
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "redefinition of typedef '%s'", tname);
+                struct typedefent *te = xcalloc(1, sizeof *te);
+                te->name = tname; te->ty = tt;
+                te->next = ps->typedefs; ps->typedefs = te;
+            } else {
+                struct type *dty = parse_stars(ps, base);
+                if (cur(ps)->kind != TOK_IDENT)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "expected a name before %s", tok_describe(cur(ps)));
+                const char *dname = cur(ps)->text;
+                int dline = cur(ps)->line;
+                advance(ps);
+                /* a function type is `name(params)`, else it's a variable */
+                struct type *ety = cur(ps)->kind == TOK_LPAREN
+                                 ? parse_fn_params(ps, dty)
+                                 : parse_array_dims(ps, dty);
+                struct stmt *sd = new_stmt(STMT_DECL, dline);
+                sd->dty = ety; sd->name = dname; sd->is_extern = 1;
+                *etail = sd; etail = &sd->next;
+            }
+            if (cur(ps)->kind == TOK_COMMA) { advance(ps); continue; }
+            break;
+        }
+        expect(ps, TOK_SEMI, "';'");
+        if (ehead)
+            return ehead;                    /* extern declarations (sema-handled) */
+        s = new_stmt(STMT_BLOCK, t->line);   /* typedef only -> no code */
+        return s;
+    }
+
     /* `register` is otherwise an ignored storage hint, but it carries the
      * `register T x __asm__("r10")` binding EmbCC needs to place an asm 'r'
      * operand — so accept it as a qualifier before the type. */
@@ -1224,7 +1430,12 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             diag_fatal(ps->lx.file, t->line,
                        "a declaration cannot be the body of if/while/for "
                        "(C99 forbids it too); wrap it in braces");
-        struct type *base = parse_type_spec(ps, 0);
+        /* allow_body=1: a block-scope struct/union/enum DEFINITION is legal C
+         * (`union { double d; uint64_t u; } v;` inside a function). Tags share
+         * the one flat tag namespace EmbCC keeps -- fine for the anonymous
+         * types real code uses here; a same-named tag in two scopes is the
+         * documented limitation, not a miscompile. */
+        struct type *base = parse_type_spec(ps, 1);
         struct stmt *head = NULL, **dtail = &head;
         for (;;) {
             s = new_stmt(STMT_DECL, t->line);
@@ -1274,7 +1485,39 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         return head;
     }
 
+    /* A label: `IDENT ':'` prefixes a statement (a goto target). Peek one
+     * token past the identifier; if it is ':' this is a label, else restore
+     * and fall through to the expression-statement path. */
+    if (t->kind == TOK_IDENT) {
+        const char *lname = t->text;
+        int lline = t->line;
+        struct lexer save = ps->lx;
+        advance(ps);
+        if (cur(ps)->kind == TOK_COLON) {
+            advance(ps);                       /* consume ':' */
+            s = new_stmt(STMT_LABEL, lline);
+            s->name = lname;
+            s->body = parse_stmt(ps, allow_decl);
+            return s;
+        }
+        ps->lx = save;                         /* not a label */
+    }
+
     switch (t->kind) {
+    case TOK_SEMI:                             /* the null statement */
+        s = new_stmt(STMT_BLOCK, t->line);     /* an empty block does nothing */
+        advance(ps);
+        return s;
+    case TOK_KW_GOTO:
+        s = new_stmt(STMT_GOTO, t->line);
+        advance(ps);
+        if (cur(ps)->kind != TOK_IDENT)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a label name after 'goto'");
+        s->name = cur(ps)->text;
+        advance(ps);
+        expect(ps, TOK_SEMI, "';'");
+        return s;
     case TOK_LBRACE:
         return parse_block(ps);
     case TOK_KW_RETURN:
@@ -1440,7 +1683,8 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
                     g->ty->pointee->kind == TY_CHAR)
                     g->ty = ty_array(g->ty->pointee, (int)ie->num);
                 else if (ie->kind == EXPR_INITLIST)
-                    g->ty = ty_array(g->ty->pointee, ie->nelems);
+                    g->ty = ty_array(g->ty->pointee,
+                                     initlist_array_count(ie));
                 else
                     diag_fatal(ps->lx.file, cur(ps)->line,
                                "'%s' needs a brace or string initializer "
@@ -1461,10 +1705,42 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
 
 /* Parses one top-level item into the unit: a function (prototype or
  * definition) or a global variable. */
+/* `_Static_assert ( constant-expression , "message" ) ;` — evaluated now,
+ * at parse time (like an array size). A false assertion is a fatal error
+ * naming the message; a true one produces nothing. The message is optional
+ * (C23 relaxed C11's requirement), which real headers rely on. Legal at
+ * file scope, in a block, and in a struct/union body. */
+static void parse_static_assert(struct parser *ps)
+{
+    int line = cur(ps)->line;
+    advance(ps); /* _Static_assert */
+    expect(ps, TOK_LPAREN, "'(' after _Static_assert");
+    struct expr *ce = parse_cond(ps);
+    long v;
+    if (!size_fold(ce, &v))
+        diag_fatal(ps->lx.file, line,
+                   "_Static_assert needs a constant integer expression");
+    const char *msg = NULL;
+    if (cur(ps)->kind == TOK_COMMA) {
+        advance(ps);
+        msg = parse_str_literal(ps, "a _Static_assert message string");
+    }
+    expect(ps, TOK_RPAREN, "')' to close _Static_assert");
+    expect(ps, TOK_SEMI, "';'");
+    if (v == 0)
+        diag_fatal(ps->lx.file, line, "static assertion failed: %s",
+                   msg ? msg : "(no message)");
+}
+
 static void parse_top(struct parser *ps, struct unit *u,
                       struct func ***ftail, struct global ***gtail,
                       int seq)
 {
+    if (cur(ps)->kind == TOK_KW_STATIC_ASSERT) {
+        parse_static_assert(ps);
+        return;
+    }
+
     int is_static = 0, is_extern = 0;
     struct attrs at = { 0, 0, 0 };
     ps->seq = seq;
@@ -1659,6 +1935,56 @@ static void parse_top(struct parser *ps, struct unit *u,
 
     if (cur(ps)->kind == TOK_SEMI) {
         advance(ps); /* prototype */
+    } else if (cur(ps)->kind == TOK_COMMA) {
+        /* The first declarator was a function PROTOTYPE and more declarators
+         * share the same base type: `extern double f(double), g(double), x;`.
+         * A comma can only follow a prototype, never a definition. */
+        **ftail = f;
+        *ftail = &f->next;
+        while (cur(ps)->kind == TOK_COMMA) {
+            advance(ps);
+            struct type *dty = parse_stars(ps, base);
+            if (cur(ps)->kind != TOK_IDENT)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a name before %s", tok_describe(cur(ps)));
+            const char *dname = cur(ps)->text;
+            int dline = cur(ps)->line;
+            advance(ps);
+            if (cur(ps)->kind == TOK_LPAREN) {
+                /* a sibling function prototype: `g(double)` */
+                struct type *fty = parse_fn_params(ps, dty);
+                struct func *g = xcalloc(1, sizeof *g);
+                g->is_static = is_static;
+                g->ret_ty = fty->ret;
+                g->name = dname;
+                g->file = ps->lx.file;
+                g->line = dline;
+                g->seq = seq;
+                g->nparams = fty->nptypes;
+                for (int i = 0; i < fty->nptypes; i++) {
+                    g->param_tys[i] = fty->ptypes[i];
+                    g->params[i] = NULL;  /* unnamed prototype parameters */
+                }
+                g->is_varargs = fty->is_varargs;
+                **ftail = g;
+                *ftail = &g->next;
+            } else {
+                /* a sibling variable: `x`, `*p`, `a[10]`, with optional init */
+                struct type *vty = parse_array_dims(ps, dty);
+                parse_attributes(ps, &at);
+                struct global *g = parse_global(ps, vty, dname, dline,
+                                                is_static, is_extern);
+                parse_attributes(ps, &at);
+                g->is_weak = at.weak;
+                g->seq = seq;
+                g->def_seq = seq;
+                **gtail = g;
+                *gtail = &g->next;
+            }
+        }
+        expect(ps, TOK_SEMI, "';'");
+        (void)u;
+        return;
     } else {
         if (cur(ps)->kind != TOK_LBRACE)
             diag_fatal(ps->lx.file, cur(ps)->line,
@@ -1684,6 +2010,7 @@ struct unit *parse_unit(const char *file, const char *src)
     u->file = file;
 
     ps.unit = u;
+    g_fold_unit = u;          /* size_fold resolves this unit's enum constants */
     ps.tags = NULL;
     ps.typedefs = NULL;
     ps.econst_tail = &u->econsts;
