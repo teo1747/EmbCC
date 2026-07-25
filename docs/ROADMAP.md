@@ -5,8 +5,46 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position: M3 COMPLETE — EmbCC self-hosts, and the fixed point is
-closed ON THE OS (2026-07-24).** The self-built compiler (`embcc.elf`,
+**Current position (2026-07-26): M3 closed, and the compiler has grown well
+past it — it emits the native format, builds the OS's own libc (floating point
+included), and gained an optimizer.** The one *named* milestone still open is M4
+(EmbBuild builds EmbCC); everything below it in this file has landed, and a good
+deal the original milestones did not anticipate landed alongside.
+
+**Since M3 — the axes the milestones did not name:**
+
+- **The fixed point still holds, now over fifteen sources.** The optimizer
+  (`src/opt/opt.c`) joined the compiler, so the self-host source set grew 12 →
+  15; `test embcc self` is **15/15 byte-identical on the OS**, opt included.
+- **EmbLD runs on the OS, and closes the loop *with the link*.** Cross-built into
+  an EmbLinkOS binary (`embld.elf`), it makes `test embcc selfhost` have the OS
+  compile all fifteen sources **and relink them** into a working `embcc`,
+  byte-identical to the host build — no cross-`ld`, no tcc in the loop. (M3
+  proved object determinism; this proves the whole bootstrap on the metal.)
+- **The native format is emitted by the toolchain.** EmbLD emits **EMBX**
+  directly (`embld --embx --cap NAME`, byte-identical to the reference producer),
+  on the host and **on the OS** (`test embld embx`). EmbCC compiles a program
+  from source, EmbLD emits it as EMBX, and the loader births it holding exactly
+  its declared capabilities (`test embcc embx`). The D-003-revised target, reached.
+- **It builds the OS's own libc.** EmbCC compiles **emlibc** — EmbLinkOS's
+  non-POSIX C library — on the OS, and emlibc self-hosts: `test emlibc math
+  selfhost` compiles the whole libc *including real `fdlibm` floating point*
+  (38 units) with EmbCC, links with EmbLD, and runs at 1e-12. Closing that took
+  **floating-point codegen** (SSE, the XMM ABI) and a corpus-driven completion
+  pass over the language — bitfields, designated array initializers, compound
+  literals, a real `_Bool`, `_Static_assert`/`_Generic`/anonymous members,
+  block-scope `extern`/`typedef`, weak undefined references, unsigned-64↔double —
+  full suite green (80/80), the self-host fixed point holding throughout.
+
+The essence of M4 is partly here — the OS *does* compile and link EmbCC's own
+sources on itself (`test embcc selfhost`, the kernel oracle) — but doing it
+*through EmbBuild from a manifest*, the total-loop framing below, is still the
+open step.
+
+---
+
+**M3 — how it closed (2026-07-24; twelve sources at the time, fifteen now):**
+The self-built compiler (`embcc.elf`,
 itself compiled by EmbCC and linked by EmbLD) was staged to EmbLinkOS and,
 under the kernel `test embcc self` oracle, **recompiled all twelve of its
 own source files on the OS — every object byte-for-byte identical to the
@@ -103,8 +141,10 @@ capability contract. EmbCC's eventual output is EMBX; ELF stays as the porting
 substrate. This does **not** change M1–M2 — an EMBX APP is fully linked
 (spec §4.1), so the producer of an `.embx` is the LINKER, which makes M3's
 integrated linker the gate for the native format as well as for self-hosting
-(see WORKPLAN "The EMBX finding"). Landed already: `embread`, the EMBX
-dumper/verifier, checked against the OS's own images.
+(see WORKPLAN "The EMBX finding"). **Landed since:** `embread`, the EMBX
+dumper/verifier, and then EmbLD's native **EMBX emitter** (`embld --embx --cap
+NAME`) — byte-identical to the reference producer, checked against the OS's own
+images, runs on the host and on the OS.
 
 ---
 
@@ -219,7 +259,8 @@ the OS's programs.
 These are candidates, not commitments, and each needs a stated reason
 (DECISIONS D-006):
 
-- **Codegen quality** — the first honest reason to prefer EmbCC over TCC
+- **Codegen quality** — *started*: an optimizer (`src/opt/opt.c`) is in the
+  pipeline and rides through the self-host fixed point (15/15).
 - **`__thread`/TLS** — a real TCC wall; needs `PT_TLS` and the OS's
   `set_fs_base` contract
 - **Dynamic linking output** — would let EmbCC build EmUI/GUI apps
@@ -228,8 +269,9 @@ These are candidates, not commitments, and each needs a stated reason
   size, and now the stated long-term second language (DECISIONS D-008)
 - **A language with EmbLink's typed values first-class** — not planned
   (DECISIONS D-008); D-002's ten-lines test remains the only gate back in
-- **ELF-superset extensions** — gated on a capability model existing first
-  (DECISIONS D-003)
+- **The native format, not merely an ELF-superset** — *done*: EmbLD emits EMBX
+  with a declared capability table (the capability model this was gated on now
+  exists, in EmbLinkOS), byte-identical to the reference producer, on host and OS.
 
 ---
 
