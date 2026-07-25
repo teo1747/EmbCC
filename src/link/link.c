@@ -19,6 +19,7 @@
 
 #include "../driver/util.h"
 #include "../elf/elf.h"
+#include "../embx/embx.h"
 #include "../../tools/embdbg/embdbg_core.h"
 
 /* EmbLink app image (TARGET_ABI §4a, newlib.ld): text at 0x400000
@@ -779,6 +780,109 @@ static void write_exec(struct linker *l, const char *out,
     free(img);
 }
 
+/* Emit a native EMBX binary (EMBX_Specification_v2.md), the container ELF
+ * cannot carry: it declares this program's required capabilities in a table
+ * the kernel loader checks against the spawner's set (§6 step 9). Same two
+ * W^X segments write_exec lays out — text R+X, data R+W — wrapped in EMBX's
+ * header/segment/capability tables instead of an ELF ehdr+phdrs.
+ *
+ * Byte layout mirrors tools/embx/mkembx.py exactly so host and on-OS producers
+ * agree: header(128) | 2 segment descriptors(64 each) | cap table(16 each) |
+ * segment payloads at file offsets congruent to their vaddr mod align. */
+static void emit_embx(struct linker *l, const char *out, unsigned long long caps,
+                      Elf64_Addr entry,
+                      Elf64_Addr text_start, Elf64_Xword text_size,
+                      Elf64_Addr data_start, Elf64_Xword data_filesz,
+                      Elf64_Xword data_memsz)
+{
+    /* Capability list: sorted ascending is free — walk cap_id low to high. */
+    int ncaps = 0;
+    for (int id = 1; id <= EMBX_CAP_MAX; id++)
+        if (caps & (1ULL << id)) ncaps++;
+
+    embx_u32 seg_tab_off = EMBX_HDR_SIZE;                    /* 128 */
+    embx_u32 cap_tab_off = ncaps ? seg_tab_off + 2 * EMBX_SEG_SIZE : 0;
+    embx_u32 tables_end  = seg_tab_off + 2 * EMBX_SEG_SIZE + (embx_u32)ncaps * EMBX_CAP_SIZE;
+
+    /* Payload offsets: file_offset ≡ vaddr (mod PAGE), never before `cur`
+     * (mkembx's congruent_offset; PAGE is a power of two). */
+    embx_u64 text_fo = tables_end + (((embx_u64)text_start - tables_end) & (PAGE - 1));
+    embx_u64 data_fo = (text_fo + text_size) + (((embx_u64)data_start - (text_fo + text_size)) & (PAGE - 1));
+    embx_u64 image_size = data_fo + data_filesz;
+
+    unsigned char *img = xcalloc(1, (size_t)image_size);
+
+    /* --- section payloads: the same copy loop write_exec uses --- */
+    for (int i = 0; i < l->nsec; i++) {
+        struct insec *s = &l->insecs[i];
+        if (s->is_bss || !s->data) continue;
+        embx_u64 base  = (s->seg == SEG_TEXT) ? text_fo : data_fo;
+        Elf64_Addr segva = (s->seg == SEG_TEXT) ? text_start : data_start;
+        memcpy(img + base + (s->vaddr - segva), s->data, (size_t)s->size);
+    }
+
+    /* --- header --- */
+    struct embx_header *h = (struct embx_header *)img;
+    const embx_u8 magic[8] = EMBX_MAGIC_BYTES;
+    memcpy(h->magic, magic, 8);
+    h->version_major = 1; h->version_minor = 0;
+    h->header_size = EMBX_HDR_SIZE;
+    h->binary_type = EMBX_TYPE_APP;
+    h->machine = EMBX_MACHINE_X86_64;
+    h->abi_version = EMBX_ABI_VERSION;
+    h->flags = 0; h->feature_incompat = 0; h->feature_compat = 0;
+    h->entry_point = entry;
+    h->segment_table_offset = seg_tab_off;
+    h->segment_count = 2;
+    h->segment_entry_size = EMBX_SEG_SIZE;
+    h->capability_table_offset = cap_tab_off;
+    h->capability_count = (embx_u16)ncaps;
+    h->capability_entry_size = EMBX_CAP_SIZE;
+    h->grantor = 0; h->reserved0 = 0;
+    h->image_size = image_size; h->reserved1 = 0;
+    h->header_checksum = 0;                 /* filled last */
+
+    /* --- segment descriptors: text R+X, data R+W (already W^X clean) --- */
+    struct embx_segment *seg = (struct embx_segment *)(img + seg_tab_off);
+    seg[0].type = EMBX_SEG_LOAD; seg[0].flags = EMBX_SEG_R | EMBX_SEG_X;
+    seg[0].vaddr = text_start; seg[0].file_offset = text_fo;
+    seg[0].file_size = text_size; seg[0].mem_size = text_size;
+    seg[0].align = PAGE; seg[0].reserved0 = 0; seg[0].paddr = 0;
+    seg[0].checksum = text_size ? embx_crc32c(img + text_fo, text_size) : 0;
+
+    seg[1].type = EMBX_SEG_LOAD; seg[1].flags = EMBX_SEG_R | EMBX_SEG_W;
+    seg[1].vaddr = data_start; seg[1].file_offset = data_fo;
+    seg[1].file_size = data_filesz; seg[1].mem_size = data_memsz;
+    seg[1].align = PAGE; seg[1].reserved0 = 0; seg[1].paddr = 0;
+    seg[1].checksum = data_filesz ? embx_crc32c(img + data_fo, data_filesz) : 0;
+
+    /* --- capability table (ascending, unique by construction) --- */
+    if (ncaps) {
+        struct embx_capability *ct = (struct embx_capability *)(img + cap_tab_off);
+        int ci = 0;
+        for (int id = 1; id <= EMBX_CAP_MAX; id++)
+            if (caps & (1ULL << id)) {
+                ct[ci].cap_id = (embx_u32)id;
+                ct[ci].cap_flags = 0; ct[ci].reserved0 = 0;
+                ci++;
+            }
+    }
+
+    /* --- checksum order (§3.4): build_id over the whole image with build_id
+     * and header_checksum still zero, then the header CRC32C last. --- */
+    embdbg_sha256(img, (long)image_size, h->build_id);
+    h->header_checksum = embx_crc32c(img, EMBX_HDR_BODY_SIZE);
+
+    FILE *f = fopen(out, "wb");
+    if (!f) die("cannot open '%s' for writing", out);
+    if (fwrite(img, 1, (size_t)image_size, f) != (size_t)image_size)
+        die("write error on '%s'", out);
+    fclose(f);
+    free(img);
+    fprintf(stderr, "embld: wrote %s (EMBX, %d capabilit%s)\n",
+            out, ncaps, ncaps == 1 ? "y" : "ies");
+}
+
 static unsigned char *read_file(const char *path, long *len);
 
 /* Emit a native .embdbg sidecar for a debug-carrying input, now that layout
@@ -889,8 +993,13 @@ int embld_link(const char **inputs, int ninputs, const char *out,
     for (int i = 0; i < l.nobj; i++)
         apply_relocs(&l, l.objs[i]);
 
-    write_exec(&l, out, e->value, text_start, text_size,
-               data_start, data_filesz, data_memsz);
-    emit_embdbg(&l, out);   /* a .embdbg sidecar if any input carries -g info */
+    if (opts && opts->emit_embx) {
+        emit_embx(&l, out, opts->caps, e->value, text_start, text_size,
+                  data_start, data_filesz, data_memsz);
+    } else {
+        write_exec(&l, out, e->value, text_start, text_size,
+                   data_start, data_filesz, data_memsz);
+        emit_embdbg(&l, out);   /* a .embdbg sidecar if any input carries -g info */
+    }
     return 0;
 }

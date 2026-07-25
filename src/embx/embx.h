@@ -163,6 +163,10 @@ _Static_assert(sizeof(struct embx_capability) == EMBX_CAP_SIZE,
 embx_u32 embx_crc32c(const void *data, unsigned long len);
 int embx_crc32c_selftest(void);
 
+/* Name -> cap_id (case-insensitive), reverse of embx_cap_name; 0 if unknown.
+ * Backs EmbLD's `--cap NAME`. */
+embx_u32 embx_cap_id(const char *name);
+
 /* Runtime restatement of the _Static_asserts above, for builds where
  * they were compiled out. Nonzero when the layout is right. */
 int embx_layout_ok(void);

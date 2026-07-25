@@ -41,7 +41,7 @@ done
 # (src/driver/util.c), the CLI driver (tools/embld/embld.c), and the EmbDBG
 # core (tools/embdbg/embdbg.c, -DEMBDBG_NO_MAIN) so a link can emit a native
 # .embdbg through the same writer the embdbg tool uses.
-SRCS="tools/embld/embld.c src/link/link.c src/driver/util.c tools/embdbg/embdbg.c"
+SRCS="tools/embld/embld.c src/link/link.c src/driver/util.c src/embx/embx.c tools/embdbg/embdbg.c"
 
 # Match the OS's own user-app compile flags (myos Makefile NEWLIB_CFLAGS).
 CFLAGS="-std=c99 -mno-red-zone -fno-stack-protector -O2 -DEMBDBG_NO_MAIN -Wno-unused-function \

@@ -69,6 +69,30 @@ const char *embx_cap_name(embx_u32 cap_id)
     }
 }
 
+/* Name -> cap_id (case-insensitive), the reverse of embx_cap_name. Used by
+ * EmbLD's `--cap NAME` flag to fill an EMBX capability table. Returns 0 for an
+ * unknown name (0 is never a valid cap_id). Mirrors mkembx.py's CAPS dict. */
+embx_u32 embx_cap_id(const char *name)
+{
+    static const struct { const char *n; embx_u32 id; } tab[] = {
+        { "filesystem", EMBX_CAP_FILESYSTEM }, { "network", EMBX_CAP_NETWORK },
+        { "gpu", EMBX_CAP_GPU },               { "audio", EMBX_CAP_AUDIO },
+        { "camera", EMBX_CAP_CAMERA },         { "usb", EMBX_CAP_USB },
+        { "serial", EMBX_CAP_SERIAL },         { "rawdisk", EMBX_CAP_RAWDISK },
+        { "kernel_ext", EMBX_CAP_KERNEL_EXT },
+    };
+    for (unsigned k = 0; k < sizeof tab / sizeof tab[0]; k++) {
+        const char *a = name, *b = tab[k].n;
+        for (;; a++, b++) {
+            int ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca += 32;   /* fold to lower */
+            if (ca != cb) break;
+            if (ca == 0) return tab[k].id;
+        }
+    }
+    return 0;
+}
+
 const char *embx_type_name(embx_u16 binary_type)
 {
     switch (binary_type) {

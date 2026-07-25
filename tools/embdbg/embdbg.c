@@ -1139,6 +1139,13 @@ static void sha256(const unsigned char *data, long n, unsigned char out[32])
     }
 }
 
+/* Exposed for EmbLD's EMBX emitter (embdbg_core.h): the same SHA-256 that
+ * stamps a .embdbg build_id stamps an EMBX build_id — one hash, one discipline. */
+void embdbg_sha256(const unsigned char *data, long n, unsigned char out[32])
+{
+    sha256(data, n, out);
+}
+
 /* --- little-endian output buffer --- */
 struct ob { unsigned char *p; long n, cap; };
 static void ob_need(struct ob *b, long k) {
