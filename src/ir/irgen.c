@@ -1193,6 +1193,8 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
             break;
         case STMT_DECL:
+            if (s->is_extern)
+                break; /* block-scope extern: a declaration, emits no code */
             if (s->sglob)
                 break; /* a static local IS its global; no code here */
             if (s->ninits) {
@@ -1465,6 +1467,8 @@ static void collect_locals(struct ir_func *fn, struct stmt *s)
     for (; s; s = s->next) {
         switch (s->kind) {
         case STMT_DECL:
+            if (s->is_extern)     /* block-scope extern: no local slot at all */
+                break;
             if (!s->sglob)
                 add_dbgvar(fn, s->name, s->var_index, 0,
                            fn->src->var_tys[s->var_index]);

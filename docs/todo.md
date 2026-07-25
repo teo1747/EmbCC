@@ -17,7 +17,14 @@ NL="/home/motsou/cross/newlib-c99/x86_64-elf/include"
 
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
 
-- [ ] **1. Block-scope `extern` / `typedef` declarations.**
+*Status: both landed. On the TinyCC 0.9.27 corpus (24 files) the block-scope
+`extern`/`typedef` and `redefined-differently` first-errors dropped to **zero**;
+every remaining blocker is now `cannot find include file "dlfcn.h"` (a missing
+host header for dynamic linking — integration, not a language gap) or a file's
+own `#error`. The front-end runs the whole preprocessor + language layer before
+stopping. Full suite 74/74; self-host fixed point holds.*
+
+- [x] **1. Block-scope `extern` / `typedef` declarations.**
   `int f(void){ extern int errno; ... }` and `... { typedef int T; ... }`.
   Error: `expected a statement, got 'extern'` / `'typedef'`. Confirmed on ~33
   newlib files. `parse_stmt` accepts a type or `static` (and the register-asm
@@ -25,7 +32,7 @@ NL="/home/motsou/cross/newlib-c99/x86_64-elf/include"
   `typedef`. Fix: recognize `extern`/`typedef` (and `extern`+type combos) at the
   start of a block-scope declaration. Very common in real C; contained fix.
 
-- [ ] **2. Macro redefinition: warn, don't fatal.**
+- [x] **2. Macro redefinition: warn, don't fatal.**
   A macro redefined with a DIFFERENT body is a fatal `error: macro 'X' redefined
   differently` in EmbCC; gcc issues a WARNING and takes the new definition.
   Blocked ~190 corpus files (mostly `SEEK_SET`, `ARG_MAX` — largely a two-header-

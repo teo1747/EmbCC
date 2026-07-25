@@ -1220,6 +1220,68 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     if (t->kind == TOK_KW_ASM)
         return parse_asm_stmt(ps);
 
+    /* Block-scope `typedef` and `extern`: declarations that emit no code and
+     * take no local storage. Handled here at the parser level -- a local
+     * typedef registers a type name; a local extern registers the external
+     * global/function the reference resolves to. Both are unit-visible (the
+     * one flat namespace EmbCC keeps), which admits a superset of C's block
+     * scoping -- fine, and the same trade-off tags/typedefs already make. */
+    if (t->kind == TOK_KW_TYPEDEF || t->kind == TOK_KW_EXTERN) {
+        if (!allow_decl)
+            diag_fatal(ps->lx.file, t->line,
+                       "a declaration cannot be the body of if/while/for; "
+                       "wrap it in braces");
+        int is_td = t->kind == TOK_KW_TYPEDEF;
+        advance(ps);
+        struct type *base = parse_type_spec(ps, 1);
+        if (!base)
+            diag_fatal(ps->lx.file, cur(ps)->line,
+                       "expected a type after '%s'", is_td ? "typedef" : "extern");
+        /* extern declarators become STMT_DECL nodes with is_extern set; sema
+         * registers the unit global/function (appending to those lists at
+         * PARSE time would race parse_top's own list tails). typedef registers
+         * a name right here (its list is a prepend-list -- no tail to race). */
+        struct stmt *ehead = NULL, **etail = &ehead;
+        for (;;) {
+            if (is_td) {
+                const char *tname;
+                struct type *tt = parse_declarator(ps, base, &tname);
+                if (!tname)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "typedef needs a name, got %s", tok_describe(cur(ps)));
+                struct type *prev = find_typedef(ps, tname);
+                if (prev && !ty_equal(prev, tt))
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "redefinition of typedef '%s'", tname);
+                struct typedefent *te = xcalloc(1, sizeof *te);
+                te->name = tname; te->ty = tt;
+                te->next = ps->typedefs; ps->typedefs = te;
+            } else {
+                struct type *dty = parse_stars(ps, base);
+                if (cur(ps)->kind != TOK_IDENT)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "expected a name before %s", tok_describe(cur(ps)));
+                const char *dname = cur(ps)->text;
+                int dline = cur(ps)->line;
+                advance(ps);
+                /* a function type is `name(params)`, else it's a variable */
+                struct type *ety = cur(ps)->kind == TOK_LPAREN
+                                 ? parse_fn_params(ps, dty)
+                                 : parse_array_dims(ps, dty);
+                struct stmt *sd = new_stmt(STMT_DECL, dline);
+                sd->dty = ety; sd->name = dname; sd->is_extern = 1;
+                *etail = sd; etail = &sd->next;
+            }
+            if (cur(ps)->kind == TOK_COMMA) { advance(ps); continue; }
+            break;
+        }
+        expect(ps, TOK_SEMI, "';'");
+        if (ehead)
+            return ehead;                    /* extern declarations (sema-handled) */
+        s = new_stmt(STMT_BLOCK, t->line);   /* typedef only -> no code */
+        return s;
+    }
+
     /* `register` is otherwise an ignored storage hint, but it carries the
      * `register T x __asm__("r10")` binding EmbCC needs to place an asm 'r'
      * operand — so accept it as a qualifier before the type. */

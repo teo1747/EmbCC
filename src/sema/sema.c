@@ -1238,6 +1238,43 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             need_scalar(u, s->cond, "'do'/'while'");
             break;
         case STMT_DECL:
+            if (s->is_extern) {
+                /* block-scope extern: no storage here, external linkage. Register
+                 * the unit global/function (safe now -- parsing is done, so the
+                 * list tails are no longer live) if not already present, and for
+                 * a variable wire a block-scope entry onto it so references
+                 * resolve. A function needs no var entry (calls use find_func). */
+                if (s->dty->kind == TY_FUNC) {
+                    if (!find_func(u, s->name)) {
+                        struct func *g = xcalloc(1, sizeof *g);
+                        g->name = s->name; g->file = u->file; g->line = s->line;
+                        g->seq = f->seq; g->declared = 1;
+                        g->ret_ty = s->dty->ret;
+                        g->nparams = s->dty->nptypes;
+                        for (int k = 0; k < s->dty->nptypes; k++)
+                            g->param_tys[k] = s->dty->ptypes[k];
+                        g->is_varargs = s->dty->is_varargs;
+                        struct func **ft = &u->funcs;
+                        while (*ft) ft = &(*ft)->next;
+                        *ft = g;
+                    }
+                } else {
+                    struct global *g = find_global(u, s->name);
+                    if (!g) {
+                        g = xcalloc(1, sizeof *g);
+                        g->name = s->name; g->ty = s->dty; g->is_extern = 1;
+                        g->file = u->file; g->line = s->line;
+                        g->seq = f->seq; g->def_seq = f->seq;
+                        struct global **gt = &u->globals;
+                        while (*gt) gt = &(*gt)->next;
+                        *gt = g;
+                    }
+                    s->var_index = scope_add(sc, s->name, s->dty, NULL);
+                    sc->vars[s->var_index].g = g;
+                    s->sglob = g;   /* irgen: this decl carries no local storage */
+                }
+                break;
+            }
             if (s->expr && s->dty->kind == TY_ARRAY &&
                 s->expr->kind == EXPR_STR) {
                 /* char a[] = "..." : an omitted size is the literal's */
