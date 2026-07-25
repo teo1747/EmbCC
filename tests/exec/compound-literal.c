@@ -7,6 +7,12 @@
 
 struct P { int x, y; };
 
+/* file-scope compound literals: a direct value, and the address of one
+ * (which becomes an anonymous global the pointer relocates to) */
+struct P gp = (struct P){ 1, 2 };
+struct P *gpp = &(struct P){ 7, 8 };
+int garr[3] = (int[3]){ 10, 20, 30 };
+
 static int psum(struct P *p) { return p->x + p->y; }
 static int vsum(struct P p)  { return p.x + p.y; }
 
@@ -30,6 +36,11 @@ int main(void) {
     /* an array literal with a gap left zero by a designator */
     int *a = (int[4]){ [3] = 99 };
     if (a[0] || a[1] || a[2] || a[3] != 99) return 7;
+
+    /* the file-scope literals */
+    if (gp.x != 1 || gp.y != 2) return 8;
+    if (gpp->x != 7 || gpp->y != 8) return 9;
+    if (garr[0] != 10 || garr[1] != 20 || garr[2] != 30) return 10;
 
     return 42;
 }

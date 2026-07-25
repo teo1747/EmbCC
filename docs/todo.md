@@ -51,10 +51,10 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
   unsigned extraction via the two-shift trick, read/assign/`+=`/`++`, access
   through pointers, and `long` (>32-bit) fields. Verified against gcc for
   values, `sizeof` layout, and by-value SysV ABI (incl. a cross-ABI
-  embcc→gcc link). `&bitfield` is refused. *Known gap (seam left):* a braced
-  initializer that targets a bitfield is refused loudly (not miscompiled) —
-  needs bit-masked merge on `initelem` in both the static-byte and local
-  lowerings; assign in a statement meanwhile.
+  embcc→gcc link). `&bitfield` is refused. Braced initialization of bitfields
+  also works — static, local, and designated — by carrying `(bit_off,
+  bit_width)` on `initelem` and masking/merging in both the static-byte and
+  local lowerings.
 - [x] **4. Designated ARRAY initializers.** `int a[5] = { [2]=9, [4]=1 };` —
   DONE. File-scope and local, unsized arrays sized to the highest index
   reached, gaps zero-filled, a `[i]=` designator repositions the running
@@ -65,8 +65,10 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
   initialized like a declared aggregate (zero-fill, designators, last-write-
   wins). It is an lvalue: address-of, member access, array decay + indexing,
   by-value passing, scalar literals, and initializing a local all work and
-  match gcc. *Seam:* a file-scope (static-storage) compound literal is refused
-  loudly, not lowered — it needs a synthesized static global.
+  match gcc. File-scope (static-storage) literals work too: a direct
+  `T g = (T){...}` (or one nested in a static initializer) unwraps to its brace
+  initializer, and `&(T){...}` becomes an anonymous global the pointer
+  relocates to.
 - [x] **6. A real `_Bool` type.** DONE. `_Bool` is a keyword and a distinct
   1-byte unsigned type (TY_BOOL); a store normalizes any nonzero scalar
   (integer, pointer, or float) to 1. `<stdbool.h>` now maps `bool` to it, so
@@ -111,7 +113,8 @@ hitting a Tier-2 feature; full test suite + self-host fixed point stay green.
 
 All of Tier 1, Tier 2, and the Tier-3 `-isystem` item are DONE — each landed
 with a gcc-refereed exec test, the full suite green (80/80), and the self-host
-fixed point holding. Remaining open seams, each refused loudly rather than
-miscompiled: (a) a braced initializer targeting a **bitfield**, and (b) a
-**file-scope compound literal** (static storage). The other Tier-3 entries are
+fixed point holding. The two initializer seams that were once refused loudly
+are now implemented too: braced initialization of **bitfields** (static/local/
+designated) and **file-scope compound literals** (direct value, nested, and
+`&(T){...}` via an anonymous global). The remaining Tier-3 entries are
 integration notes, not compiler work.

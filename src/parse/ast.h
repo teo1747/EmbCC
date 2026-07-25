@@ -88,11 +88,15 @@ struct expr {
 };
 
 /* An aggregate initializer, flattened by sema into (offset, type,
- * value) triples so irgen never has to re-walk the type. */
+ * value) triples so irgen never has to re-walk the type. A bitfield leaf
+ * additionally carries its position within the storage unit at `off`
+ * (bit_width 0 means an ordinary, non-bitfield leaf). */
 struct initelem {
     int off;
     struct type *ty;
     struct expr *e;
+    int bit_off;
+    int bit_width;
 };
 
 /* A relocation inside a static object's byte image: a pointer-typed slot

@@ -255,6 +255,15 @@ struct initbuf {
 static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                          struct expr *init, struct type *ty, int off,
                          struct initbuf *out);
+static void lower_static_bytes(struct unit *u, int line, int size,
+                               struct initelem *v, int n,
+                               const char **out_bytes,
+                               struct greloc **out_rel, int *out_nrel);
+
+/* Nonzero while lowering a static initializer (a file-scope global or a
+ * static local). A compound literal met here has static storage: it becomes
+ * an anonymous global rather than a stack slot. */
+static int g_in_static_init;
 
 /* Resolve `name` as a member of `base`, descending into any anonymous
  * struct/union members (C11 6.7.2.1p13: their members are reached as if
@@ -471,6 +480,42 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->lhs->kind == EXPR_INITLIST)
             ty = ty_array(ty->pointee, initlist_array_count(e->lhs));
         e->cast_ty = ty;
+        if (g_in_static_init) {
+            /* Static storage: the literal is an anonymous global, and this
+             * node becomes a reference to it (so `&(T){...}` in a static
+             * initializer lowers to a relocation like any `&global`). */
+            struct initbuf ib = { 0, 0, 0 };
+            flatten_init(u, f, sc, e->lhs, ty, 0, &ib);
+            static int anon_seq;
+            struct global *g = xcalloc(1, sizeof *g);
+            char *nm = xmalloc(24);
+            snprintf(nm, 24, ".Lcomplit.%d", anon_seq++);
+            g->name = nm;
+            g->line = e->line;
+            g->seq = -1;
+            g->ty = ty;
+            g->is_static = 1;
+            g->defined = 1;
+            g->used = 1;
+            g->has_init = 1;   /* it has real bytes -> .data, not .bss */
+            lower_static_bytes(u, e->line, ty_size(ty), ib.v, ib.n,
+                               &g->init_bytes, &g->relocs, &g->nrelocs);
+            g->init_len = ty_size(ty);
+            struct global **gt = &u->globals;
+            while (*gt) gt = &(*gt)->next;
+            *gt = g;
+            e->kind = EXPR_VAR;      /* an lvalue naming the anonymous global */
+            e->gref = g;
+            e->name = g->name;
+            e->inits = NULL; e->ninits = 0; e->lhs = NULL;
+            if (ty->kind == TY_ARRAY) {
+                e->undecayed = ty;
+                e->ty = ty_ptr(ty->pointee);
+            } else {
+                e->ty = ty;
+            }
+            break;
+        }
         e->var_index = scope_add(sc, "<compound literal>", ty, NULL);
         struct initbuf ib = { 0, 0, 0 };
         flatten_init(u, f, sc, e->lhs, ty, 0, &ib);
@@ -1015,13 +1060,37 @@ static void init_push(struct initbuf *b, int off, struct type *ty,
     b->v[b->n].off = off;
     b->v[b->n].ty = ty;
     b->v[b->n].e = e;
+    b->v[b->n].bit_off = 0;
+    b->v[b->n].bit_width = 0;
     b->n++;
+}
+
+/* A bitfield leaf: same as init_push but recording where in the storage
+ * unit at `off` the value lands, so the lowerings mask and merge it. */
+static void init_push_bf(struct initbuf *b, int off, struct type *ty,
+                         struct expr *e, int bit_off, int bit_width)
+{
+    init_push(b, off, ty, e);
+    b->v[b->n - 1].bit_off = bit_off;
+    b->v[b->n - 1].bit_width = bit_width;
 }
 
 static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                          struct expr *init, struct type *ty, int off,
                          struct initbuf *out)
 {
+    /* A compound literal used AS an initializer is exactly its brace
+     * initializer placed at this offset — `T g = (T){...}` (even at file
+     * scope) and a literal nested in another initializer need no separate
+     * object. Only an unbraced literal reaches here as `init` (a plain
+     * `expr` initializer keeps EXPR_COMPLIT); `&(T){...}` stays an
+     * EXPR_ADDR and is lowered through the anonymous-object path instead. */
+    if (init->kind == EXPR_COMPLIT) {
+        if (init->lhs && init->lhs->kind == EXPR_INITLIST) {
+            flatten_init(u, f, sc, init->lhs, ty, off, out);
+            return;
+        }
+    }
     if (init->kind != EXPR_INITLIST) {
         if (ty->kind == TY_ARRAY) {
             /* char a[] = "..." — the literal's bytes ARE the object */
@@ -1090,24 +1159,30 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                                el->desig_field);
                 mi = (int)(m - ty->members);
             }
+            /* An unnamed bitfield (padding, or a `:0` separator) takes no
+             * initializer — skip past it in positional order. */
+            while (mi < ty->nmembers && ty->members[mi].is_bitfield &&
+                   !ty->members[mi].name)
+                mi++;
             if (mi >= ty->nmembers)
                 diag_fatal(u->file, init->line,
                            "too many initializers for %s, which has %d "
                            "members", ty_name(ty), ty->nmembers);
-            /* A braced initializer for a bitfield would need bit-masked
-             * merging into its shared storage unit (both the static byte
-             * image and local stores) — not yet plumbed. Refuse rather than
-             * write clobbering full-width values. Seam: carry (bit_off,
-             * bit_width) on initelem and merge in both lowerings. */
-            if (ty->members[mi].is_bitfield)
-                diag_fatal(u->file, init->line,
-                           "initializing bitfield '%s' in a braced "
-                           "initializer is not supported yet — assign it "
-                           "in a statement instead",
-                           ty->members[mi].name ? ty->members[mi].name
-                                                : "<anonymous>");
-            flatten_init(u, f, sc, el, ty->members[mi].ty,
-                         off + ty->members[mi].off, out);
+            struct member *m = &ty->members[mi];
+            if (m->is_bitfield) {
+                /* A bitfield leaf: its value is masked and merged into the
+                 * shared storage unit at m->off by both lowerings, so it
+                 * carries (bit_off, bit_width) rather than a byte width. */
+                check_expr(u, f, sc, el);
+                need_scalar(u, el, "a bitfield initializer");
+                struct expr *cv = convert_assign(u, el, m->ty,
+                                                 "initialization");
+                init_push_bf(out, off + m->off, m->ty, cv,
+                             m->bit_off, m->bit_width);
+                mi++;
+                continue;
+            }
+            flatten_init(u, f, sc, el, m->ty, off + m->off, out);
             mi++;
         }
         return;
@@ -1189,6 +1264,16 @@ static void lower_static_bytes(struct unit *u, int line, int size,
             diag_fatal(u->file, line,
                        "a static initializer must be a constant, a "
                        "string literal, or the address of a global");
+        if (v[k].bit_width) {
+            /* merge the field's bits into its storage unit (bytes start
+             * zeroed, so OR is enough and neighbours are preserved) */
+            unsigned long mask = v[k].bit_width >= 64
+                               ? ~0UL : (((unsigned long)1 << v[k].bit_width) - 1);
+            unsigned long field = ((unsigned long)cv & mask) << v[k].bit_off;
+            for (int b = 0; b < sz; b++)
+                bytes[v[k].off + b] |= (char)(field >> (8 * b));
+            continue;
+        }
         for (int b = 0; b < sz; b++)
             bytes[v[k].off + b] = (char)((unsigned long)cv >> (8 * b));
     }
@@ -1212,7 +1297,9 @@ static void lower_globals(struct unit *u)
         cur_body_seq = g->def_seq;
         struct scope sc = { 0, 0, 0, 0 };
         struct initbuf ib = { 0, 0, 0 };
+        g_in_static_init++;
         flatten_init(u, &gf, &sc, g->init_expr, g->ty, 0, &ib);
+        g_in_static_init--;
         lower_static_bytes(u, g->line, ty_size(g->ty), ib.v, ib.n,
                            &g->init_bytes, &g->relocs, &g->nrelocs);
         g->init_len = ty_size(g->ty);
@@ -1419,6 +1506,10 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                            s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
             sc->vars[s->var_index].asm_reg = s->asm_reg;
+            /* A static local has static storage, so a compound literal in its
+             * initializer is an anonymous global, not a stack slot. */
+            if (s->is_static)
+                g_in_static_init++;
             if (s->expr && s->dty->kind != TY_ARRAY &&
                 s->dty->kind != TY_STRUCT) {
                 check_expr(u, f, sc, s->expr);
@@ -1436,6 +1527,8 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 s->ninits = ib.n;
                 s->expr = NULL;
             }
+            if (s->is_static)
+                g_in_static_init--;
             if (s->is_static) {
                 /* A static local has static STORAGE and internal
                  * linkage: it becomes a global of its own, named so it

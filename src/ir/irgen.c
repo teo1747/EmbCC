@@ -269,6 +269,29 @@ static int bf_store(struct ir_func *fn, int addr, const struct member *m,
     return bf_load(fn, addr, m);
 }
 
+/* Place one flattened initializer leaf `ie` (value already in `v`) at address
+ * `at`: a bitfield merges into its storage unit, a struct is a byte copy, any
+ * other scalar a plain truncating store. Shared by declaration and compound-
+ * literal initialization. */
+static void store_init_leaf(struct ir_func *fn, int at,
+                            const struct initelem *ie, int v)
+{
+    if (ie->bit_width) {
+        struct member m;
+        m.name = NULL; m.ty = ie->ty; m.off = 0;
+        m.is_bitfield = 1; m.bit_off = ie->bit_off; m.bit_width = ie->bit_width;
+        bf_store(fn, at, &m, v);
+    } else if (ie->ty->kind == TY_STRUCT) {
+        struct ir_ins *mm = emit(fn);
+        mm->op = IR_MEMCPY;
+        mm->a = at;
+        mm->b = v;
+        mm->size = ty_size(ie->ty);
+    } else {
+        emit_store(fn, at, v, ie->ty);
+    }
+}
+
 static int expr_is_bitfield(const struct expr *e)
 {
     return e->kind == EXPR_MEMBER && e->memb && e->memb->is_bitfield;
@@ -425,15 +448,7 @@ static int gen_complit(struct ir_func *fn, struct expr *e)
             int o = emit_const(fn, e->inits[k].off, 8);
             at = emit_bin(fn, IR_ADD, base, o, 8, 1);
         }
-        if (e->inits[k].ty->kind == TY_STRUCT) {
-            struct ir_ins *m = emit(fn);
-            m->op = IR_MEMCPY;
-            m->a = at;
-            m->b = v;
-            m->size = ty_size(e->inits[k].ty);
-        } else {
-            emit_store(fn, at, v, e->inits[k].ty);
-        }
+        store_init_leaf(fn, at, &e->inits[k], v);
     }
     return base;
 }
@@ -1355,15 +1370,7 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
                         int o = emit_const(fn, s->inits[k].off, 8);
                         at = emit_bin(fn, IR_ADD, base, o, 8, 1);
                     }
-                    if (s->inits[k].ty->kind == TY_STRUCT) {
-                        struct ir_ins *m = emit(fn);
-                        m->op = IR_MEMCPY;
-                        m->a = at;
-                        m->b = v;
-                        m->size = ty_size(s->inits[k].ty);
-                    } else {
-                        emit_store(fn, at, v, s->inits[k].ty);
-                    }
+                    store_init_leaf(fn, at, &s->inits[k], v);
                 }
                 break;
             }

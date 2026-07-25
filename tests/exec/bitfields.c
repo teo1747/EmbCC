@@ -14,6 +14,9 @@ struct Z { int a:5; int :0; int b:5; };              /* :0 forces a new unit */
 struct R { unsigned en:1; unsigned mode:3; unsigned :4; unsigned prio:8; };
 struct L { unsigned long lo:40; unsigned long hi:20; };
 struct M { char tag; int flag:1; int val:20; char tail; };
+struct BI { unsigned a:3; unsigned b:5; unsigned c:8; int d:12; };
+
+struct BI gbi = { 5, 17, 200, -3 };          /* static bitfield brace-init */
 
 static int viaptr(struct R *r) {
     r->en = 1; r->mode = 6; r->prio = 200;
@@ -52,6 +55,13 @@ int main(void) {
     struct M m; m.tag = 'A'; m.flag = 1; m.val = -5; m.tail = 'Z';
     if (m.tag != 'A' || m.tail != 'Z') return 14;
     if (m.flag != -1 || m.val != -5) return 15;   /* int:1 is signed */
+
+    /* brace-initializing bitfields — static, local, and designated */
+    if (gbi.a != 5 || gbi.b != 17 || gbi.c != 200 || gbi.d != -3) return 16;
+    struct BI lbi = { 1, 2, 3, -1 };
+    if (lbi.a != 1 || lbi.b != 2 || lbi.c != 3 || lbi.d != -1) return 17;
+    struct BI dbi = { .b = 9, .a = 1 };
+    if (dbi.a != 1 || dbi.b != 9 || dbi.c != 0 || dbi.d != 0) return 18;
 
     return 42;
 }
