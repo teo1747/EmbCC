@@ -23,6 +23,7 @@ enum tok_kind {
     TOK_KW_FLOAT,
     TOK_KW_DOUBLE,
     TOK_KW_BOOL,
+    TOK_KW_STATIC_ASSERT,
     TOK_KW_UNSIGNED,
     TOK_KW_SIGNED,
     TOK_KW_VOID,

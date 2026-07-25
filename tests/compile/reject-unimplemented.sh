@@ -322,3 +322,7 @@ int f(int n, ...) { va_list ap; __builtin_va_start(ap, n);
      return p.x; }
 int main(void) { return 0; }' \
     "struct passed by value"
+check static-assert-false \
+    '_Static_assert(sizeof(int) == 8, "int is not eight bytes");
+int main(void) { return 0; }' \
+    "static assertion failed: int is not eight bytes"

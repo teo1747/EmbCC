@@ -118,6 +118,7 @@ static struct expr *parse_cond(struct parser *ps);
 static int size_fold(const struct expr *e, long *out);
 static struct type *parse_array_dims(struct parser *ps, struct type *t);
 static struct type *parse_type_spec(struct parser *ps, int allow_body);
+static void parse_static_assert(struct parser *ps);
 
 /* Declarator over a base type: leading stars, then either the function-
  * pointer form '( * [*...] [name] [dims] ) ( params )' or a plain
@@ -469,6 +470,8 @@ static int size_fold(const struct expr *e, long *out)
         case B_GE:  *out = a >= b; return 1;
         case B_EQ:  *out = a == b; return 1;
         case B_NE:  *out = a != b; return 1;
+        case B_LAND: *out = a && b; return 1;
+        case B_LOR:  *out = a || b; return 1;
         default: return 0;
         }
     default:
@@ -572,6 +575,11 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
     int n = 0, cap = 0;
 
     while (cur(ps)->kind != TOK_RBRACE) {
+        /* a `_Static_assert` among the members: checked, contributes none */
+        if (cur(ps)->kind == TOK_KW_STATIC_ASSERT) {
+            parse_static_assert(ps);
+            continue;
+        }
         /* allow_body: nested struct/union definitions are legal C */
         struct type *spec = parse_type_spec(ps, 1);
         if (!spec)
@@ -1283,6 +1291,12 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     if (t->kind == TOK_KW_ASM)
         return parse_asm_stmt(ps);
 
+    /* A block-scope `_Static_assert`: checked now, emits nothing. */
+    if (t->kind == TOK_KW_STATIC_ASSERT) {
+        parse_static_assert(ps);
+        return new_stmt(STMT_BLOCK, t->line);
+    }
+
     /* Block-scope `typedef` and `extern`: declarations that emit no code and
      * take no local storage. Handled here at the parser level -- a local
      * typedef registers a type name; a local extern registers the external
@@ -1642,10 +1656,42 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
 
 /* Parses one top-level item into the unit: a function (prototype or
  * definition) or a global variable. */
+/* `_Static_assert ( constant-expression , "message" ) ;` — evaluated now,
+ * at parse time (like an array size). A false assertion is a fatal error
+ * naming the message; a true one produces nothing. The message is optional
+ * (C23 relaxed C11's requirement), which real headers rely on. Legal at
+ * file scope, in a block, and in a struct/union body. */
+static void parse_static_assert(struct parser *ps)
+{
+    int line = cur(ps)->line;
+    advance(ps); /* _Static_assert */
+    expect(ps, TOK_LPAREN, "'(' after _Static_assert");
+    struct expr *ce = parse_cond(ps);
+    long v;
+    if (!size_fold(ce, &v))
+        diag_fatal(ps->lx.file, line,
+                   "_Static_assert needs a constant integer expression");
+    const char *msg = NULL;
+    if (cur(ps)->kind == TOK_COMMA) {
+        advance(ps);
+        msg = parse_str_literal(ps, "a _Static_assert message string");
+    }
+    expect(ps, TOK_RPAREN, "')' to close _Static_assert");
+    expect(ps, TOK_SEMI, "';'");
+    if (v == 0)
+        diag_fatal(ps->lx.file, line, "static assertion failed: %s",
+                   msg ? msg : "(no message)");
+}
+
 static void parse_top(struct parser *ps, struct unit *u,
                       struct func ***ftail, struct global ***gtail,
                       int seq)
 {
+    if (cur(ps)->kind == TOK_KW_STATIC_ASSERT) {
+        parse_static_assert(ps);
+        return;
+    }
+
     int is_static = 0, is_extern = 0;
     struct attrs at = { 0, 0, 0 };
     ps->seq = seq;

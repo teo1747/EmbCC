@@ -66,8 +66,13 @@ Lower corpus frequency only because Tier-1 fails hit first; each is real C.
   1-byte unsigned type (TY_BOOL); a store normalizes any nonzero scalar
   (integer, pointer, or float) to 1. `<stdbool.h>` now maps `bool` to it, so
   `sizeof(bool)==1`. Verified against gcc.
-- [ ] **7. C11 niceties.** `_Static_assert`, `_Generic`, anonymous struct/union
-  members. Niche, but headers occasionally want them.
+- [~] **7. C11 niceties.**
+  - [x] `_Static_assert(expr, "msg")` — DONE. Evaluated at parse time; legal
+    at file scope, in a struct/union body, and in a block; the message is
+    optional (C23). A false assertion is a fatal error naming the message.
+    (`size_fold` also learned `&&`/`||`, so constant asserts like
+    `sizeof(long)==8 && sizeof(void*)==8` fold.)
+  - [ ] `_Generic`, anonymous struct/union members. Still niche/pending.
 
 ## Tier 3 — integration / ergonomics (NOT compiler gaps)
 
