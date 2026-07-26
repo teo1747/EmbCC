@@ -219,6 +219,13 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
             (ty_equal(rhs->ty, to) || to->pointee->kind == TY_VOID ||
              rhs->ty->pointee->kind == TY_VOID))
             return mk_cast(rhs, to);
+        /* Same-size integer pointees differing only in signedness
+         * (`char *` vs `unsigned char *`): gcc warns but allows it, and real
+         * code — string/buffer routines especially — relies on it. */
+        if (rhs->ty->kind == TY_PTR &&
+            ty_is_integer(to->pointee) && ty_is_integer(rhs->ty->pointee) &&
+            ty_size(to->pointee) == ty_size(rhs->ty->pointee))
+            return mk_cast(rhs, to);
         if (is_null_const(rhs))
             return mk_cast(rhs, to);
         diag_fatal(u->file, rhs->line,
