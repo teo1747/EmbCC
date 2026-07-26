@@ -46,6 +46,12 @@ void f_enter(u64 e,u64 sp,u64 a){
     __asm__ volatile("movq %2, %%rdi\n" "mov $1, %%rax\n"
                      "pushq %0\n" "pushq $0x202\n" "pushq %1\n" "iretq\n"
                      :: "r"(sp),"r"(e),"r"(a) : "rdi","rax","memory"); }
+/* the gdt segment-reload trampoline: a local-label RIP-relative leaq,
+ * lretq, a 16-bit immediate load and segment-register moves. */
+void f_reload(void){
+    __asm__ volatile("pushq $0x08\n" "leaq 1f(%%rip), %%rax\n" "pushq %%rax\n"
+                     "lretq\n" "1:\n" "mov $0x10, %%ax\n" "mov %%ax, %%ds\n"
+                     "mov %%ax, %%es\n" "mov %%ax, %%ss\n" ::: "rax","memory"); }
 int main(void){ return 42; }
 EOF
 
@@ -63,7 +69,8 @@ fi
 # every expected mnemonic must be present, exactly as the reference decodes it
 for want in cli sti hlt pause mfence lfence sfence wbinvd rdtsc rdmsr wrmsr \
             pushf 'mov +%rax,%cr0' 'mov +%cr2,%rax' 'out +%al' 'in +.*%al' \
-            invlpg lidt lgdt str ltr movdqa iretq 'mov +\$0x1,%rax'; do
+            invlpg lidt lgdt str ltr movdqa iretq 'mov +\$0x1,%rax' \
+            lretq 'lea +0x3\(%rip\)' 'mov +\$0x10,%ax' 'mov +%eax,%ds'; do
     printf '%s\n' "$dis" | grep -Eq "$want" || {
         echo "missing expected instruction: $want"; exit 1; }
 done

@@ -1363,6 +1363,10 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
     unsigned char *code = NULL;
     int n = 0, cap = 0;
     const char *p = tmpl;
+    /* local labels `N:` and the RIP-relative `leaq Nf(%rip)` sites that
+     * reference them — resolved within this block after assembling it. */
+    struct { int num, off; } labels[16]; int nlab = 0;
+    struct { int num, patch; } fixups[16]; int nfix = 0;
 
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
@@ -1395,6 +1399,16 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
         if (n + 16 > cap) {
             cap = cap ? cap * 2 : 16;
             code = xrealloc(code, (size_t)cap);
+        }
+        /* a local label `N:` — record its offset for a leaq to reference */
+        if (mlen >= 2 && m[mlen - 1] == ':' &&
+            m[0] >= '0' && m[0] <= '9') {
+            int num = 0;
+            for (int i = 0; i < mlen - 1; i++)
+                num = num * 10 + (m[i] - '0');
+            if (nlab < 16) { labels[nlab].num = num; labels[nlab].off = n;
+                             nlab++; }
+            continue;
         }
         if (mlen == 3 && strncmp(m, "int", 3) == 0) {
             if (*p != '$')
@@ -1519,7 +1533,12 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
         /* ---- pop/push %N (64-bit; the `q` suffix is the same encoding) ---- */
         else if ((mlen == 3 && strncmp(m, "pop", 3) == 0) ||
                  (mlen == 4 && strncmp(m, "popq", 4) == 0)) {
-            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg < 0) {
+                a_ws(&p);
+                reg = (p[0] == '%' && p[1] == '%')
+                    ? a_regname(&p, file, line, tmpl)
+                    : a_opreg(&p, opregs, nops, file, line, tmpl);
+            }
             if (reg >= 8) code[n++] = 0x41;                /* REX.B */
             code[n++] = (unsigned char)(0x58 | (reg & 7));
         } else if ((mlen == 4 && strncmp(m, "push", 4) == 0) ||
@@ -1531,7 +1550,10 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                 for (int b = 0; b < 4; b++)
                     code[n++] = (unsigned char)(imm >> (8 * b));
             } else {
-                if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+                if (reg < 0)
+                    reg = (p[0] == '%' && p[1] == '%')
+                        ? a_regname(&p, file, line, tmpl)
+                        : a_opreg(&p, opregs, nops, file, line, tmpl);
                 if (reg >= 8) code[n++] = 0x41;
                 code[n++] = (unsigned char)(0x50 | (reg & 7));
             }
@@ -1540,6 +1562,29 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             code[n++] = 0x48; code[n++] = 0xcf;
         } else if (mlen == 5 && strncmp(m, "lretq", 5) == 0) {
             code[n++] = 0x48; code[n++] = 0xcb;
+        }
+        /* ---- leaq Nf(%%rip), %%reg : RIP-relative address of a local label ---- */
+        else if (mlen == 4 && strncmp(m, "leaq", 4) == 0) {
+            a_ws(&p);
+            if (!(*p >= '0' && *p <= '9'))
+                diag_fatal(file, line, "asm leaq expects a local label in "
+                           "\"%s\"", tmpl);
+            int num = 0;
+            while (*p >= '0' && *p <= '9') num = num * 10 + (*p++ - '0');
+            if (*p == 'f' || *p == 'b') p++;      /* forward/backward marker */
+            a_ws(&p);
+            if (strncmp(p, "(%%rip)", 7) != 0)
+                diag_fatal(file, line, "asm leaq expects `Nf(%%%%rip)` in "
+                           "\"%s\"", tmpl);
+            p += 7;
+            a_comma(&p, file, line, tmpl);
+            int dst = a_regname(&p, file, line, tmpl);
+            code[n++] = (unsigned char)(0x48 | (dst >= 8 ? 4 : 0));  /* REX.W[R] */
+            code[n++] = 0x8d;
+            code[n++] = (unsigned char)(0x05 | ((dst & 7) << 3));    /* rip+disp32 */
+            if (nfix < 16) { fixups[nfix].num = num; fixups[nfix].patch = n;
+                             nfix++; }
+            for (int b = 0; b < 4; b++) code[n++] = 0;   /* disp32 (patched) */
         }
         /* ---- str/ltr %N (task register; r/m16) ---- */
         else if (mlen == 3 && strncmp(m, "str", 3) == 0) {
@@ -1557,6 +1602,43 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
         else if ((mlen == 3 && strncmp(m, "mov", 3) == 0) ||
                  (mlen == 4 && strncmp(m, "movq", 4) == 0) ||
                  (mlen == 6 && strncmp(m, "movabs", 6) == 0)) {
+            /* segment-register / 16-bit accumulator forms the gdt trampoline
+             * uses: `mov %%ax, %%<seg>` and `mov $imm, %%ax`. */
+            static const char *const segs[] =
+                { "es", "cs", "ss", "ds", "fs", "gs" };
+            a_ws(&p);
+            if (reg < 0 && strncmp(p, "%%ax", 4) == 0) {
+                const char *q = p + 4;
+                a_ws(&q);
+                if (*q == ',') {
+                    q++; a_ws(&q);
+                    if (q[0] == '%' && q[1] == '%') {
+                        for (int si = 0; si < 6; si++)
+                            if (strncmp(q + 2, segs[si], 2) == 0) {
+                                code[n++] = 0x8e;   /* mov Sreg, r/m16 */
+                                code[n++] = (unsigned char)(0xc0 | (si << 3));
+                                p = q + 4;
+                                goto asm_next;
+                            }
+                    }
+                }
+            }
+            if (reg < 0 && p[0] == '$') {
+                const char *q = p;
+                long imm = a_imm(&q, file, line, tmpl);
+                a_ws(&q);
+                if (*q == ',') {
+                    q++;
+                    a_ws(&q);
+                    if (strncmp(q, "%%ax", 4) == 0) {   /* mov $imm16, %%ax */
+                        code[n++] = 0x66; code[n++] = 0xb8;
+                        code[n++] = (unsigned char)imm;
+                        code[n++] = (unsigned char)(imm >> 8);
+                        p = q + 4;
+                        goto asm_next;
+                    }
+                }
+            }
             int src_reg = -1, src_imm_valid = 0;
             long src_imm = 0;
             /* --- source operand --- */
@@ -1683,6 +1765,20 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
          * multi-line templates separate with '\n' and have no ';'. */
         while (*p && *p != ';' && *p != '\n' && *p != '\r')
             p++;
+    }
+    /* resolve each leaq's RIP-relative displacement to its local label: the
+     * disp is relative to the END of the 4-byte field, and both label and
+     * site are inside this block. */
+    for (int i = 0; i < nfix; i++) {
+        int off = -1;
+        for (int j = 0; j < nlab; j++)
+            if (labels[j].num == fixups[i].num) off = labels[j].off;
+        if (off < 0)
+            diag_fatal(file, line, "asm: local label %d not defined in "
+                       "\"%s\"", fixups[i].num, tmpl);
+        int disp = off - (fixups[i].patch + 4);
+        for (int b = 0; b < 4; b++)
+            code[fixups[i].patch + b] = (unsigned char)(disp >> (8 * b));
     }
     ia->code = code;
     ia->codelen = n;
