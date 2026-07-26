@@ -822,6 +822,55 @@ static struct expr *parse_primary(struct parser *ps)
             expect(ps, TOK_RPAREN, "')' to close __builtin_va_arg");
             return e;
         }
+        /* __builtin_offsetof(type, member-designator) — the byte offset of a
+         * member, folded to a size_t constant right here so it is usable in an
+         * integer-constant-expression (a _Static_assert, an array size). The
+         * designator may descend through `.field` and `[index]`. This is what
+         * <stddef.h>'s offsetof expands to. */
+        if (strcmp(t->text, "__builtin_offsetof") == 0) {
+            int line = t->line;
+            advance(ps);
+            expect(ps, TOK_LPAREN, "'(' after __builtin_offsetof");
+            struct type *ty = parse_type_name(ps, parse_type_spec(ps, 0));
+            expect(ps, TOK_COMMA, "',' before the member designator");
+            long off = 0;
+            for (;;) {
+                if (ty->kind != TY_STRUCT || !ty->complete)
+                    diag_fatal(ps->lx.file, line,
+                               "offsetof needs a complete struct/union type");
+                if (cur(ps)->kind != TOK_IDENT)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "expected a member name in offsetof");
+                struct member *m2 = ty_find_member(ty, cur(ps)->text);
+                if (!m2)
+                    diag_fatal(ps->lx.file, cur(ps)->line,
+                               "%s has no member '%s'", ty_name(ty),
+                               cur(ps)->text);
+                off += m2->off;
+                ty = m2->ty;
+                advance(ps);
+                while (cur(ps)->kind == TOK_LBRACKET) {
+                    advance(ps);
+                    long iv;
+                    if (!size_fold(parse_cond(ps), &iv))
+                        diag_fatal(ps->lx.file, line,
+                                   "offsetof array index must be constant");
+                    expect(ps, TOK_RBRACKET, "']'");
+                    if (ty->kind != TY_ARRAY)
+                        diag_fatal(ps->lx.file, line,
+                                   "offsetof indexed a non-array member");
+                    off += iv * ty_size(ty->pointee);
+                    ty = ty->pointee;
+                }
+                if (cur(ps)->kind == TOK_DOT) { advance(ps); continue; }
+                break;
+            }
+            expect(ps, TOK_RPAREN, "')' to close __builtin_offsetof");
+            e = new_expr(EXPR_NUM, line);
+            e->num = off;
+            e->ty = ty_base(TY_LONG, 1);   /* size_t */
+            return e;
+        }
         reject_reserved(ps, t->text, t->line);
         e = new_expr(EXPR_VAR, t->line);
         e->name = t->text;

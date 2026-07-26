@@ -98,15 +98,15 @@ struct initelem {
 };
 
 /* A relocation inside a static object's byte image: a pointer-typed slot
- * whose value is an address the linker fills in. For now the target is a
- * string literal (the only kind EmbCC's own source needs); the seam for
- * &global / &func addends is left open deliberately. */
+ * whose value is an address the linker fills in — a string literal, an
+ * &global, or a function address (a vtable of function pointers). */
 struct greloc {
     int off;              /* byte offset within the object */
-    const char *str;      /* a string-literal target (NULL if a global) */
+    const char *str;      /* a string-literal target (NULL if a global/func) */
     int str_len;          /* including its NUL */
     int str_off;          /* driver: the target's offset inside .rodata */
-    struct global *gtarget; /* an &global target (NULL if a string) */
+    struct global *gtarget; /* an &global target, else NULL */
+    struct func *ftarget; /* a function-address target, else NULL */
     long addend;
 };
 

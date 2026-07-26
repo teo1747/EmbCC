@@ -344,7 +344,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                            "(line %d)", e->name, g->line);
             } else if (find_func(u, e->name)) {
                 struct func *fd = find_func(u, e->name);
-                if (!fd->declared)
+                /* seq-based, not the ordered-walk `declared` flag: a function
+                 * used as a value in a static initializer (a vtable) is
+                 * lowered before that walk runs, but is still legal if the
+                 * function was declared earlier in the source. */
+                if (fd->seq > cur_body_seq)
                     diag_fatal(u->file, e->line,
                                "'%s' is used before its declaration",
                                e->name);
@@ -903,7 +907,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             !find_global(u, e->lhs->name) &&
             find_func(u, e->lhs->name)) {
             struct func *callee = find_func(u, e->lhs->name);
-            if (!callee->declared)
+            if (callee->seq > cur_body_seq)
                 diag_fatal(u->file, e->line,
                            "call to '%s' before its declaration — "
                            "declare or define functions before their "
@@ -1216,27 +1220,33 @@ static void lower_static_bytes(struct unit *u, int line, int size,
         /* The address of a global: `&g`, or an array/function global that
          * decayed to a pointer (`char **environ = embk_empty_env`). */
         struct global *gt = NULL;
+        struct func *ft = NULL;
         if (core && core->kind == EXPR_VAR && core->gref)
             gt = core->gref;
+        else if (core && core->kind == EXPR_VAR && core->fref)
+            ft = core->fref;             /* a function address (a vtable) */
         else if (core && core->kind == EXPR_ADDR) {
             struct expr *in = core->rhs;
             while (in && in->kind == EXPR_CAST)
                 in = in->rhs;
             if (in && in->kind == EXPR_VAR && in->gref)
                 gt = in->gref;
+            else if (in && in->kind == EXPR_VAR && in->fref)
+                ft = in->fref;
         }
         if ((core && core->kind == EXPR_STR && v[k].ty->kind == TY_PTR) ||
-            (gt && v[k].ty->kind == TY_PTR)) {
-            /* a pointer slot: zero bytes stay, the linker writes the
-             * address of a string literal or a global. */
+            ((gt || ft) && v[k].ty->kind == TY_PTR)) {
+            /* a pointer slot: zero bytes stay, the linker writes the address
+             * of a string literal, a global, or a function. */
             if (nrel == caprel) {
                 caprel = caprel ? caprel * 2 : 4;
                 rel = xrealloc(rel, (size_t)caprel * sizeof *rel);
             }
             rel[nrel].off = v[k].off;
-            rel[nrel].str = gt ? NULL : core->name;
-            rel[nrel].str_len = gt ? 0 : (int)core->num;
+            rel[nrel].str = (gt || ft) ? NULL : core->name;
+            rel[nrel].str_len = (gt || ft) ? 0 : (int)core->num;
             rel[nrel].gtarget = gt;
+            rel[nrel].ftarget = ft;
             rel[nrel].addend = 0;
             nrel++;
             continue;

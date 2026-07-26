@@ -396,10 +396,26 @@ static int compile(const char *in, const char *out, int pp_only)
         if (g->absorbed || !g->defined || g->in_bss)
             continue;
         for (int i = 0; i < g->nrelocs; i++) {
-            int sym = g->relocs[i].gtarget ? g->relocs[i].gtarget->sym_ndx
-                                           : rodata_sym;
-            long add = g->relocs[i].gtarget ? g->relocs[i].addend
-                       : g->relocs[i].str_off + g->relocs[i].addend;
+            struct func *ft = g->relocs[i].ftarget;
+            int sym;
+            long add;
+            if (ft) {
+                /* a function pointer (a vtable): resolve to the function's
+                 * symbol; an external, never-called one needs an UNDEF. */
+                if (!ft->sym_ndx)
+                    ft->sym_ndx = elfw_add_symbol(
+                        w, ft->name, 0, 0,
+                        ELF64_ST_INFO(ft->is_weak ? STB_WEAK : STB_GLOBAL,
+                                      STT_NOTYPE), SHN_UNDEF);
+                sym = ft->sym_ndx;
+                add = g->relocs[i].addend;
+            } else if (g->relocs[i].gtarget) {
+                sym = g->relocs[i].gtarget->sym_ndx;
+                add = g->relocs[i].addend;
+            } else {
+                sym = rodata_sym;
+                add = g->relocs[i].str_off + g->relocs[i].addend;
+            }
             elfw_add_rela(w, data_ndx,
                           (Elf64_Addr)(g->off + g->relocs[i].off),
                           sym, R_X86_64_64, add);
