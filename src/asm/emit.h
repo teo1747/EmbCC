@@ -100,6 +100,8 @@ void x86_mov_reg_reg(struct code *c, int dst, int src);   /* 64-bit */
  * callee-saved regs, not memory). All operate on register NUMBERS 0..15. */
 void x86_mov_rr_w(struct code *c, int dst, int src, int w);   /* dst=src, 32/64 */
 void x86_movsxd_rr(struct code *c, int dst, int src);         /* dst64=sext(src32) */
+void x86_movx_rr(struct code *c, int dst, int src, int size, int sign, int w);
+                                                    /* dst = extend(src low 1/2 bytes) */
 void x86_alu_rr(struct code *c, int op, int dst, int src, int w); /* dst op= src */
 void x86_cmp_rr(struct code *c, int a, int b, int w);         /* cmp a, b */
 void x86_div_rr(struct code *c, int src, int sign, int w);    /* [rdx:rax]/src */

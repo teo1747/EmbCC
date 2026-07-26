@@ -332,15 +332,24 @@ int/long/pointer locals & params of size 4/8) live in the five callee-saved GPRs
 - **Callee-saved only** — such a value survives a call untouched, so there is no
   spill-around-call machinery; the function saves/restores the regs it uses in
   dedicated frame slots. Params are synced slot→reg once in the prologue.
-- **Real liveness** — a backward dataflow (`compute_live_intervals`) gives each
-  vreg a live range that correctly spans loop back-edges; a linear scan colours
-  non-interfering ranges with the 5 registers, spilling the rest to memory. (An
-  earlier first/last-appearance interval was unsound across loops — a
-  loop-carried value's register got clobbered mid-loop; the dataflow fixed it.)
-- **Conservative eligibility** — any vreg touching an "opaque" raw-slot site (a
-  float op, an address-of, an atomic/memcpy/store-address/va_start/call-arg, or
-  inline asm — or live across an asm) stays in memory. Missing an exclusion
-  would read a stale slot, so the allocator errs toward memory.
+- **Real liveness + graph colouring** — a backward dataflow
+  (`compute_live_intervals`) gives per-instruction live-in/live-out sets; the
+  PRECISE interference graph (two vregs interfere only when live at the same
+  program point — entry or exit — so ranges that overlap but are never
+  simultaneously live can share a register) is greedily coloured with the 5
+  registers, spilling the rest. (Two subtleties, each caught by the gcc
+  differential: appearance intervals are unsound across loop back-edges — a
+  loop-carried value's register got clobbered mid-loop; and interference from
+  live-OUT alone misses a value whose only appearance is a last use, e.g. a
+  param consumed once — two such params collided in one register. Both fixed by
+  using real liveness and including live-IN.)
+- **Conservative eligibility** — temps, and scalar int/long/pointer/char/short
+  locals & params, are candidates; scalar-integer CALL ARGUMENTS are allocated
+  too (moved straight into their arg register / stack slot). Any vreg touching
+  an "opaque" raw-slot site (a float op, address-of, atomic/memcpy/store-address/
+  va_start, a struct/float call arg, or inline asm — or live across an asm)
+  stays in memory. Missing an exclusion would read a stale slot, so the
+  allocator errs toward memory.
 - **`-O0`/`-O1` untouched** — everything is gated on the regalloc flag, so their
   output stays byte-identical (the RAX residency cache is disabled at `-O2`,
   where register-resident values would make its tracking stale).
@@ -349,11 +358,12 @@ Verified: all 60 exec programs match gcc's exit + stdout at `-O2`
 (`tests/golden/regalloc-O2.sh`); a stress corpus (values live across calls,
 recursion, register pressure > 5 forcing spills, 8-param calls, div/mod/shift,
 pointers/structs/narrow types) agrees with gcc at `-O0`/`-O1`/`-O2`; codegen is
-deterministic; EmbCC self-compiles at `-O2` and links; the kernel compiles
-89/89 at `-O2`. Memory traffic drops materially — a simple counted loop went
-from 35 to 15 rbp-relative accesses (counter + accumulator now in registers).
-Suite 91/91. *(Next steps if pushed further: allocate call-argument values and
-narrow (char/short) locals; graph-colouring instead of linear scan.)*
+deterministic; EmbCC self-compiles at `-O2` and links (and the `-O2` compiler is
+*smaller* — fewer load/stores); the kernel compiles 89/89 at `-O2`. Memory
+traffic drops materially — a counted loop went 35→15 rbp accesses, an 8-param
+call 68→40, a value-live-across-calls function 30→12. Suite 91/91. *(Further
+still: precolour/coalesce moves, spill-cost heuristics, and a Briggs-style
+optimistic colouring order beyond the current greedy first-order.)*
 
 ---
 

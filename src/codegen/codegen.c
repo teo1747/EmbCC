@@ -198,12 +198,18 @@ static int ins_def(const struct ir_ins *in)
  * instruction index at which vreg v is live — a sound over-approximation of its
  * live range that spans loop back-edges (a naive first/last-appearance interval
  * does NOT, and would let a loop-carried value's register be clobbered mid-loop).
- * -1 for a vreg that is never live. */
-static void compute_live_intervals(struct ir_func *fn, int *first, int *last)
+ * -1 for a vreg that is never live. ALSO returns, for the interference graph,
+ * the per-instruction live-IN and live-OUT bitsets (each nins*words) and the def
+ * vreg per instruction (all malloc'd, caller frees), and *words_out. Returns
+ * NULL bitsets (and leaves the outputs NULL) for an empty function. */
+static unsigned long *compute_live_intervals(struct ir_func *fn, int *first,
+                                             int *last, unsigned long **livein_out,
+                                             int **defv_out, int *words_out)
 {
     int nins = fn->nins, nvr = fn->nvregs;
     for (int v = 0; v < nvr; v++) { first[v] = -1; last[v] = -1; }
-    if (nins == 0 || nvr == 0) return;
+    *defv_out = NULL; *livein_out = NULL; *words_out = 0;
+    if (nins == 0 || nvr == 0) return NULL;
     int words = (nvr + 63) / 64;
 
     unsigned long *use = xcalloc((size_t)nins * words, sizeof *use);
@@ -310,7 +316,11 @@ static void compute_live_intervals(struct ir_func *fn, int *first, int *last)
         }
     }
 
-    free(use); free(in); free(out); free(defv); free(labelidx);
+    free(use); free(labelidx);
+    *livein_out = in;
+    *defv_out = defv;
+    *words_out = words;
+    return out;
 }
 
 /* mark vreg v ineligible (used at an opaque site) */
@@ -329,16 +339,22 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     int *last  = xmalloc((size_t)nvr * sizeof *last);
     char *elig = xmalloc((size_t)nvr);
     /* live ranges from real dataflow (spans loops); appearance intervals would
-     * be unsound across a back-edge. */
-    compute_live_intervals(fn, first, last);
+     * be unsound across a back-edge. `liveout`/`defv` drive the interference
+     * graph below. */
+    int *defv = NULL, lwords = 0;
+    unsigned long *livein = NULL;
+    unsigned long *liveout = compute_live_intervals(fn, first, last,
+                                                    &livein, &defv, &lwords);
     for (int v = 0; v < nvr; v++) {
         if (v >= nvars) {
             elig[v] = 1;                          /* a temp */
         } else {
             struct type *t = fn->src->var_tys[v]; /* param or local */
             int sz = ty_size(t);
+            /* any scalar int/pointer that fits a GPR — char/short included: a
+             * narrow write keeps the low bytes, a read movsx/movzx-extends. */
             elig[v] = (ty_is_integer(t) || t->kind == TY_PTR) &&
-                      (sz == 4 || sz == 8);
+                      (sz == 1 || sz == 2 || sz == 4 || sz == 8);
         }
     }
 
@@ -364,9 +380,12 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 OPAQUE(in->a);
             break;
         case IR_CALL:
+            /* A scalar-INTEGER argument is register-aware (moved straight into
+             * its arg register / stack slot); a struct or float (SSE) argument
+             * still loads its slot raw, so it must stay in memory. */
             for (int k = 0; k < in->nargs; k++)
-                OPAQUE(in->argv[k].vreg);                 /* args load raw */
-            if (in->indirect) OPAQUE(in->a);              /* target ptr slot */
+                if (in->argv[k].is_struct || in->argv[k].cls[0] == CLASS_SSE)
+                    OPAQUE(in->argv[k].vreg);
             if (in->flt || in->retsize) OPAQUE(in->dst);  /* float/struct ret */
             break;
         case IR_ASM:
@@ -392,35 +411,95 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     for (int v = 0; v < nvr; v++)
         if (first[v] < 0) elig[v] = 0;
 
-    /* order eligible vregs by first-appearance (bucket sort, deterministic) */
-    int *head = xmalloc((size_t)(nins + 1) * sizeof *head);
-    for (int i = 0; i <= nins; i++) head[i] = -1;
-    int *nxt = xmalloc((size_t)nvr * sizeof *nxt);
-    for (int v = nvr - 1; v >= 0; v--) {
-        if (!elig[v]) { nxt[v] = -2; continue; }
-        int fi = first[v];
-        nxt[v] = head[fi]; head[fi] = v;
+    /* Number the eligible vregs 0..E-1 and build the PRECISE interference graph:
+     * at each instruction the vregs in live-out(i) ∪ {def(i)} are simultaneously
+     * live and so interfere pairwise. This is tighter than interval overlap —
+     * two vregs whose ranges overlap but are never live at the same point don't
+     * interfere, and a result may reuse a dying operand's register. */
+    int *eof = xmalloc((size_t)nvr * sizeof *eof);   /* vreg -> eligible index */
+    int E = 0;
+    for (int v = 0; v < nvr; v++) eof[v] = elig[v] ? E++ : -1;
+    int *eidx = xmalloc((size_t)(E ? E : 1) * sizeof *eidx);
+    for (int v = 0; v < nvr; v++) if (eof[v] >= 0) eidx[eof[v]] = v;
+
+    int ew = (E + 63) / 64;
+    unsigned long *adj = E ? xcalloc((size_t)E * ew, sizeof *adj) : NULL;
+    int *members = xmalloc((size_t)(E ? E : 1) * sizeof *members);
+    char *seen = xcalloc((size_t)(E ? E : 1), 1);   /* de-dup within one insn */
+    for (int i = 0; liveout && i < nins; i++) {
+        /* Everything live DURING instruction i — at its entry (live_in) or exit
+         * (live_out) — plus its def (which clobbers a register even if the value
+         * is dead). live_in matters: a value whose only appearance is a last use
+         * (e.g. a param consumed once) is in live_in but no live_out, yet is
+         * simultaneously live with the others there and must interfere. */
+        int m = 0;
+        unsigned long *ii = livein + (size_t)i * lwords;
+        unsigned long *oi = liveout + (size_t)i * lwords;
+        for (int w = 0; w < lwords; w++) {
+            unsigned long bits = ii[w] | oi[w];
+            while (bits) {
+                int b = 0; unsigned long t = bits;
+                while (!(t & 1)) { t >>= 1; b++; }
+                int v = w * 64 + b;
+                if (v < nvr && eof[v] >= 0 && !seen[eof[v]]) {
+                    seen[eof[v]] = 1; members[m++] = eof[v];
+                }
+                bits &= bits - 1;
+            }
+        }
+        int dv = defv[i];
+        if (dv >= 0 && dv < nvr && eof[dv] >= 0 && !seen[eof[dv]]) {
+            seen[eof[dv]] = 1; members[m++] = eof[dv];
+        }
+        for (int j = 0; j < m; j++) seen[members[j]] = 0;   /* reset */
+        for (int p = 0; p < m; p++)
+            for (int q = p + 1; q < m; q++) {
+                int a = members[p], b = members[q];
+                adj[(size_t)a * ew + (b >> 6)] |= 1UL << (b & 63);
+                adj[(size_t)b * ew + (a >> 6)] |= 1UL << (a & 63);
+            }
     }
 
-    /* linear scan: NCALLEE registers, each holding the `last` of its occupant;
-     * expire an occupant once its interval ends before the current vreg starts,
-     * else spill (leave in memory). */
-    int reg_busy_until[NCALLEE];      /* -1 = free */
-    int reg_used[NCALLEE];
-    for (int k = 0; k < NCALLEE; k++) { reg_busy_until[k] = -1; reg_used[k] = 0; }
-    for (int i = 0; i <= nins; i++) {
-        for (int v = head[i]; v >= 0; v = nxt[v]) {
-            int pick = -1;
-            for (int k = 0; k < NCALLEE; k++) {
-                if (reg_busy_until[k] >= 0 && reg_busy_until[k] < first[v])
-                    reg_busy_until[k] = -1;               /* expired */
-                if (pick < 0 && reg_busy_until[k] < 0) pick = k;
-            }
-            if (pick < 0) continue;                       /* spill: stays -1 */
-            reg_busy_until[pick] = last[v];
-            reg_used[pick] = 1;
-            loc[v] = CALLEE_POOL[pick];
+    /* Greedy colouring in first-appearance order (deterministic): give each vreg
+     * the lowest callee register no already-coloured neighbour uses; spill (stay
+     * in memory) if all NCALLEE are taken. */
+    int *order = xmalloc((size_t)(E ? E : 1) * sizeof *order);
+    {   /* bucket by first[] so the order is first-asc, ties by vreg index */
+        int *head = xmalloc((size_t)(nins + 1) * sizeof *head);
+        for (int i = 0; i <= nins; i++) head[i] = -1;
+        int *nxt = xmalloc((size_t)(E ? E : 1) * sizeof *nxt);
+        for (int e = E - 1; e >= 0; e--) {
+            int fi = first[eidx[e]];
+            nxt[e] = head[fi]; head[fi] = e;
         }
+        int oc = 0;
+        for (int i = 0; i <= nins; i++)
+            for (int e = head[i]; e >= 0; e = nxt[e]) order[oc++] = e;
+        free(head); free(nxt);
+    }
+
+    int reg_used[NCALLEE];
+    for (int k = 0; k < NCALLEE; k++) reg_used[k] = 0;
+    for (int oi = 0; oi < E; oi++) {
+        int e = order[oi];
+        int taken = 0;                        /* bitmask of neighbour registers */
+        unsigned long *row = adj + (size_t)e * ew;
+        for (int w = 0; w < ew; w++) {
+            unsigned long bits = row[w];
+            while (bits) {
+                int b = 0; unsigned long t = bits;
+                while (!(t & 1)) { t >>= 1; b++; }
+                int ne = w * 64 + b;
+                int nl = loc[eidx[ne]];
+                if (nl >= 0)
+                    for (int k = 0; k < NCALLEE; k++)
+                        if (CALLEE_POOL[k] == nl) taken |= 1 << k;
+                bits &= bits - 1;
+            }
+        }
+        for (int k = 0; k < NCALLEE; k++)
+            if (!(taken & (1 << k))) { loc[eidx[e]] = CALLEE_POOL[k];
+                                       reg_used[k] = 1; break; }
     }
 
     int nu = 0;
@@ -428,7 +507,9 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (reg_used[k]) used_out[nu++] = CALLEE_POOL[k];
     *nused_out = nu;
 
-    free(first); free(last); free(elig); free(head); free(nxt);
+    free(first); free(last); free(elig);
+    free(eof); free(eidx); free(adj); free(members); free(seen); free(order);
+    free(liveout); free(livein); free(defv);
     return loc;
 }
 #undef OPAQUE
@@ -632,7 +713,9 @@ static void cg_load(struct code *text, const int *sd, int vreg,
 {
     if (in_reg(vreg)) {
         int R = g_loc[vreg];
-        if (size == 4 && sign && w == 8)
+        if (size == 1 || size == 2)
+            x86_movx_rr(text, REG_RAX, R, size, sign, w); /* char/short widen */
+        else if (size == 4 && sign && w == 8)
             x86_movsxd_rr(text, REG_RAX, R);      /* signed int -> 64 */
         else
             x86_mov_rr_w(text, REG_RAX, R, size == 8 ? 8 : w);
@@ -1149,10 +1232,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
                     continue;
                 if (!a->is_struct) {
                     /* a scalar that ran out of registers: its slot
-                     * already holds the value, extended to 8 bytes */
-                    x86_load_slot(text, sd[a->vreg], 8, 0, 8);
-                    x86_store_mem_reg(text, REG_RSP, a->stk_off,
-                                      REG_RAX, 8);
+                     * already holds the value, extended to 8 bytes (or it is
+                     * register-resident -> store the register straight out). */
+                    if (in_reg(a->vreg)) {
+                        x86_store_mem_reg(text, REG_RSP, a->stk_off,
+                                          g_loc[a->vreg], 8);
+                    } else {
+                        x86_load_slot(text, sd[a->vreg], 8, 0, 8);
+                        x86_store_mem_reg(text, REG_RSP, a->stk_off,
+                                          REG_RAX, 8);
+                    }
                     continue;
                 }
                 x86_load_slot(text, sd[a->vreg], 8, 0, 8);
@@ -1193,11 +1282,17 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 }
                 if (a->cls[0] == CLASS_SSE)
                     x86_movs_load(text, freg++, sd[a->vreg], a->size);
+                else if (in_reg(a->vreg))
+                    x86_mov_reg_reg(text, x86_argreg(ireg++), g_loc[a->vreg]);
                 else
                     x86_load_arg(text, ireg++, sd[a->vreg]);
             }
-            if (i->indirect)
-                x86_mov_r11_slot(text, sd[i->a]);
+            if (i->indirect) {
+                if (in_reg(i->a))
+                    x86_mov_reg_reg(text, 11 /*r11*/, g_loc[i->a]);
+                else
+                    x86_mov_r11_slot(text, sd[i->a]);
+            }
             /* al = the number of VECTOR registers used. Zero was right
              * only while no floats existed; a variadic callee reads it
              * to find the register save area, so a wrong al is exactly

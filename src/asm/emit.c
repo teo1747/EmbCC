@@ -193,6 +193,19 @@ void x86_movsxd_rr(struct code *c, int dst, int src)
     code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
 }
 
+/* dst = extend(the low `size` (1 or 2) bytes of src) to width w — movsx/movzx,
+ * the reg-reg twin of x86_load_slot's narrow cases. */
+void x86_movx_rr(struct code *c, int dst, int src, int size, int sign, int w)
+{
+    rex_rb(c, w == 8, dst, src);
+    code_byte(c, 0x0f);
+    if (size == 1)
+        code_byte(c, sign ? 0xbe : 0xb6); /* movsx/movzx r, r/m8 */
+    else
+        code_byte(c, sign ? 0xbf : 0xb7); /* movsx/movzx r, r/m16 */
+    code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
 /* dst op= src (+ - * & | ^), w-bit — the reg-reg twin of x86_alu_eax_mem, same
  * "r, r/m" opcodes with reg=dst, rm=src. */
 void x86_alu_rr(struct code *c, int op, int dst, int src, int w)
