@@ -1424,12 +1424,14 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
         else if (mlen == 3 && strncmp(m, "inw", 3) == 0) {
             code[n++] = 0x66; code[n++] = 0xed;
         } else if (mlen == 3 && strncmp(m, "inl", 3) == 0) { code[n++] = 0xed; }
-        /* ---- pop/push %N (64-bit) ---- */
-        else if (mlen == 3 && strncmp(m, "pop", 3) == 0) {
+        /* ---- pop/push %N (64-bit; the `q` suffix is the same encoding) ---- */
+        else if ((mlen == 3 && strncmp(m, "pop", 3) == 0) ||
+                 (mlen == 4 && strncmp(m, "popq", 4) == 0)) {
             if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
             if (reg >= 8) code[n++] = 0x41;                /* REX.B */
             code[n++] = (unsigned char)(0x58 | (reg & 7));
-        } else if (mlen == 4 && strncmp(m, "push", 4) == 0) {
+        } else if ((mlen == 4 && strncmp(m, "push", 4) == 0) ||
+                   (mlen == 5 && strncmp(m, "pushq", 5) == 0)) {
             if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
             if (reg >= 8) code[n++] = 0x41;
             code[n++] = (unsigned char)(0x50 | (reg & 7));
