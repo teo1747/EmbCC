@@ -39,6 +39,13 @@ u16  f_str(void){ u16 t; __asm__ volatile("str %0":"=r"(t)); return t; }
 void f_ltr(u16 s){ __asm__ volatile("ltr %0"::"r"(s):"memory"); }
 void f_store(void*d){ __asm__ volatile("movdqa %%xmm0, (%0)"::"r"(d):"memory"); }
 void f_load(const void*s){ __asm__ volatile("movdqa (%0), %%xmm0"::"r"(s):"memory"); }
+/* a multi-instruction, newline-separated block: every instruction must be
+ * assembled (not truncated after the first), with reg->named, imm->named,
+ * push imm, and iretq. */
+void f_enter(u64 e,u64 sp,u64 a){
+    __asm__ volatile("movq %2, %%rdi\n" "mov $1, %%rax\n"
+                     "pushq %0\n" "pushq $0x202\n" "pushq %1\n" "iretq\n"
+                     :: "r"(sp),"r"(e),"r"(a) : "rdi","rax","memory"); }
 int main(void){ return 42; }
 EOF
 
@@ -56,7 +63,7 @@ fi
 # every expected mnemonic must be present, exactly as the reference decodes it
 for want in cli sti hlt pause mfence lfence sfence wbinvd rdtsc rdmsr wrmsr \
             pushf 'mov +%rax,%cr0' 'mov +%cr2,%rax' 'out +%al' 'in +.*%al' \
-            invlpg lidt lgdt str ltr movdqa; do
+            invlpg lidt lgdt str ltr movdqa iretq 'mov +\$0x1,%rax'; do
     printf '%s\n' "$dis" | grep -Eq "$want" || {
         echo "missing expected instruction: $want"; exit 1; }
 done
