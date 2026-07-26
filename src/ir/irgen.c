@@ -1807,6 +1807,58 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
     ia->codelen = n;
 }
 
+/* Map a hard-register spelling (any width: rax/eax/ax/al/ah, r8/r8d/r8w/r8b,
+ * …) of length `len` to its physical number 0..15, or -1 if it is not a GPR
+ * (e.g. "cc", "memory", an xmm name). Used to EXCLUDE clobbered and
+ * template-written registers from the operand allocator's free set. */
+static int asm_phys_reg(const char *nm, int len)
+{
+    static const struct { const char *n; int r; } regs[] = {
+        {"rax",0},{"eax",0},{"ax",0},{"al",0},{"ah",0},
+        {"rcx",1},{"ecx",1},{"cx",1},{"cl",1},{"ch",1},
+        {"rdx",2},{"edx",2},{"dx",2},{"dl",2},{"dh",2},
+        {"rbx",3},{"ebx",3},{"bx",3},{"bl",3},{"bh",3},
+        {"rsp",4},{"esp",4},{"sp",4},{"spl",4},
+        {"rbp",5},{"ebp",5},{"bp",5},{"bpl",5},
+        {"rsi",6},{"esi",6},{"si",6},{"sil",6},
+        {"rdi",7},{"edi",7},{"di",7},{"dil",7},
+        {"r8",8},{"r8d",8},{"r8w",8},{"r8b",8},
+        {"r9",9},{"r9d",9},{"r9w",9},{"r9b",9},
+        {"r10",10},{"r10d",10},{"r10w",10},{"r10b",10},
+        {"r11",11},{"r11d",11},{"r11w",11},{"r11b",11},
+        {"r12",12},{"r12d",12},{"r12w",12},{"r12b",12},
+        {"r13",13},{"r13d",13},{"r13w",13},{"r13b",13},
+        {"r14",14},{"r14d",14},{"r14w",14},{"r14b",14},
+        {"r15",15},{"r15d",15},{"r15w",15},{"r15b",15},
+    };
+    for (unsigned i = 0; i < sizeof regs / sizeof regs[0]; i++)
+        if ((int)strlen(regs[i].n) == len &&
+            strncmp(regs[i].n, nm, (size_t)len) == 0)
+            return regs[i].r;
+    return -1;
+}
+
+/* Mark every hard register the template writes/reads as `%%reg` as used, so an
+ * allocatable operand is never assigned one the asm's own instructions touch.
+ * Conservative on purpose (a read-only `%%reg` is excluded too) — always sound,
+ * only ever shrinks the free set. This is what stops a "r" operand from landing
+ * in, say, %%rsi when the template does `movq %N,%%rsi` (K12). */
+static void asm_mark_template_regs(const char *tmpl, int *used)
+{
+    for (const char *p = tmpl; *p; ) {
+        if (p[0] == '%' && p[1] == '%') {
+            p += 2;
+            const char *q = p;
+            while ((*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9')) q++;
+            int r = asm_phys_reg(p, (int)(q - p));
+            if (r >= 0) used[r] = 1;
+            p = q;
+        } else {
+            p++;
+        }
+    }
+}
+
 /* Assign a free register to an operand whose constraint is allocatable
  * (reg == -2). The pool prefers the low, byte-addressable registers so a
  * setc destination needs no REX. */
@@ -1937,6 +1989,16 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
                 if (a->in[i].reg >= 16) xused[a->in[i].reg - 16] = 1;
                 else if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
             }
+            /* Exclude clobbered registers, and any hard register the template
+             * writes explicitly, from the allocatable pool (K12): otherwise an
+             * allocatable "r" operand can land in a register the asm destroys
+             * before it is used (e.g. %2 -> rdx while the template does
+             * `movq %6,%%rdx`), silently corrupting the operand. */
+            for (int i = 0; i < a->nclob; i++) {
+                int r = asm_phys_reg(a->clob[i], (int)strlen(a->clob[i]));
+                if (r >= 0) used[r] = 1;
+            }
+            asm_mark_template_regs(a->tmpl, used);
             int opregs[2 * MAX_PARAMS], nops = 0;
             const char *opnames[2 * MAX_PARAMS];
             for (int i = 0; i < a->nout; i++) {

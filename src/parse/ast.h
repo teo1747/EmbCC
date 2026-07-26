@@ -145,6 +145,12 @@ struct asm_stmt {
     int nout;
     struct asm_operand *in;
     int nin;
+    /* Clobbered registers (e.g. "rdx"), kept so the operand allocator can
+     * EXCLUDE them — an allocatable "r" operand must never land in a register
+     * the template destroys. "cc"/"memory" are stored too and simply don't
+     * name a GPR. */
+    const char **clob;
+    int nclob;
     int is_volatile;
 };
 

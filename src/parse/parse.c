@@ -1468,12 +1468,21 @@ static struct stmt *parse_asm_stmt(struct parser *ps)
         parse_asm_operands(ps, &a->in, &a->nin);
     }
     if (cur(ps)->kind == TOK_COLON) {
-        /* clobbers: string literals, parsed and discarded — EmbCC keeps
-         * every value in a stack slot, so a clobbered register holds no
-         * live value to preserve. */
+        /* clobbers: string literals. Kept (not discarded): a clobbered
+         * register holds no live value ACROSS statements — EmbCC spills
+         * everything — but WITHIN this asm the template destroys it, so the
+         * operand allocator must not place an allocatable "r" operand there
+         * (see irgen STMT_ASM). "cc"/"memory" are kept too and simply name
+         * no GPR. */
         advance(ps);
+        int cap = 0;
         while (cur(ps)->kind == TOK_STR) {
-            (void)parse_str_literal(ps, "a clobber");
+            const char *c = parse_str_literal(ps, "a clobber");
+            if (a->nclob == cap) {
+                cap = cap ? cap * 2 : 4;
+                a->clob = xrealloc(a->clob, (size_t)cap * sizeof *a->clob);
+            }
+            a->clob[a->nclob++] = c;
             if (cur(ps)->kind != TOK_COMMA)
                 break;
             advance(ps);

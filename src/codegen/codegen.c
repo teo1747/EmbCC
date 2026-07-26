@@ -40,17 +40,23 @@ static int *layout_frame(struct ir_func *fn, int *frame_out,
     for (int i = 0; i < f->nvars; i++) {
         int sz = (ty_size(f->var_tys[i]) + 7) & ~7;
         running += sz;
-        /* __attribute__((aligned(N))) on a local: its base is rbp-running,
-         * and rbp is 16-aligned on entry, so rounding running up to N makes
-         * the base N-aligned — for N <= 16. A larger request would need the
-         * stack realigned dynamically (rbp can't promise it); refuse loudly
-         * rather than silently under-align (THE RULE). */
+        /* Alignment of a local's stack slot: the greater of its type's natural
+         * alignment (a struct with an aligned(16) member, e.g. struct thread's
+         * fpu_state, is itself 16-aligned) and any __attribute__((aligned(N)))
+         * on the declarator. The base is rbp-running and rbp is 16-aligned on
+         * entry, so rounding running up to N makes the base N-aligned — for
+         * N <= 16. A larger request would need the stack realigned dynamically
+         * (rbp can't promise it); refuse loudly rather than silently
+         * under-align (THE RULE). */
         int al = f->var_aligns ? f->var_aligns[i] : 0;
+        int tal = ty_align(f->var_tys[i]);
+        if (tal > al) al = tal;
         if (al > 1) {
             if (al > 16)
                 diag_fatal(f->file, f->line,
-                           "aligned(%d) on a local in '%s' exceeds the 16-byte "
-                           "stack alignment EmbCC can guarantee", al, f->name);
+                           "a local in '%s' needs %d-byte alignment, exceeding "
+                           "the 16-byte stack alignment EmbCC can guarantee",
+                           f->name, al);
             running = (running + al - 1) & ~(al - 1);
         }
         disp[i] = -running;

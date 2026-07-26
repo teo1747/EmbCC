@@ -200,7 +200,23 @@ between the self-compiled kernel and reaching the desktop.
 
 </details>
 
-### K12 — inline-asm operand allocator must EXCLUDE clobbered registers (next blocker)
+### K12 — inline-asm operand allocator must EXCLUDE clobbered registers — **DONE**
+
+**RESOLVED (branch Teo).** The `"r"` operand allocator now removes from its free
+set (a) every register in the **clobber list** (kept in the AST now, no longer
+discarded) and (b) every hard register the **template writes/reads as `%%reg`**
+(any width — `rdi`/`edi`/`di`/`dil`…, mapped by `asm_phys_reg`; conservative,
+a read-only mention is excluded too — always sound). So no allocatable operand
+can land in a register the asm destroys. Verified on the REAL kernel: both
+`iretq` trampolines in process.c now load argc/argv/envp into rdi/rsi/rdx via
+r9/r10/r11 and push operands from rax/rcx/rbx/r8 — none template-written;
+gcc-refereed exec test `tests/exec/asm-clobber.c` (clobber-list AND
+template-written paths) passes. Suite 88/88, self-host holds, kernel 89/89.
+Alongside, K11 got a refinement: a local whose *type* is over-aligned (a struct
+with an aligned member) now also gets its stack slot rounded to the type's
+natural alignment (`ty_align`), not just the declarator attribute.
+
+<details><summary>original triage (kept for context)</summary>
 
 *With aligned(N) honored (K11), the self-compiled kernel boots even further —
 past the first context switch — then `#GP`s on the `iretq` that launches the
@@ -239,8 +255,11 @@ explicitly, e.g. `%%rdi`/`%%rsi`/`%%rdx` here) from the operand allocator's free
 set, so no `"r"` operand is ever placed in one. This is the last thing between
 the self-compiled kernel and userspace / the desktop.
 
-*(Minor K1 follow-up spotted alongside: `addq` — and presumably other ALU ops —
-aren't accepted in inline asm yet. Not on the boot path; note for later.)*
+*(Minor K1 follow-ups spotted alongside, not on the boot path — note for later:
+`addq`/other ALU ops aren't accepted in inline asm yet, and neither is the
+`movq %reg, (%mem)` store form — an operand register into a memory operand.)*
+
+</details>
 
 ---
 
