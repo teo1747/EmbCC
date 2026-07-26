@@ -423,6 +423,35 @@ static struct type *parse_stars(struct parser *ps, struct type *t)
  * compile-time integer constants) in constant expressions like array sizes. */
 static struct unit *g_fold_unit;
 
+/* Locals declared so far in the current function, so `sizeof(var)` in a later
+ * array size — `char buf[sizeof payload]` — resolves at parse time. Flat and
+ * reset per top-level item, matching EmbCC's flat local scope. */
+static struct { const char *name; struct type *ty; } g_fold_locals[512];
+static int g_nfold_locals;
+
+static void fold_local_add(const char *name, struct type *ty)
+{
+    if (name && ty && g_nfold_locals < 512) {
+        g_fold_locals[g_nfold_locals].name = name;
+        g_fold_locals[g_nfold_locals].ty = ty;
+        g_nfold_locals++;
+    }
+}
+
+/* The type of a named variable for sizeof folding: a local in scope, else a
+ * file-scope global. */
+static struct type *fold_var_type(const char *name)
+{
+    for (int i = g_nfold_locals - 1; i >= 0; i--)
+        if (strcmp(g_fold_locals[i].name, name) == 0)
+            return g_fold_locals[i].ty;
+    for (struct global *g = g_fold_unit ? g_fold_unit->globals : NULL;
+         g; g = g->next)
+        if (g->name && strcmp(g->name, name) == 0)
+            return g->ty;
+    return NULL;
+}
+
 /* The type of a constant-expression subset — enough to fold sizeof(EXPR) in
  * an integer-constant-expression: a cast fixes the type, `->`/`.` reach a
  * member, `*` dereferences. `sizeof(((struct V*)0)->field)` is the shape the
@@ -430,6 +459,8 @@ static struct unit *g_fold_unit;
 static struct type *ce_type(const struct expr *e)
 {
     switch (e->kind) {
+    case EXPR_VAR:
+        return fold_var_type(e->name);
     case EXPR_CAST:
         return e->cast_ty;
     case EXPR_DEREF: {
@@ -1578,6 +1609,21 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                 advance(ps);
                 s->expr = parse_initializer(ps);
             }
+            /* Record this local's type for a later `sizeof(name)`, inferring
+             * an omitted array size from a string or brace initializer (as
+             * sema does for codegen) so the size is available now. */
+            {
+                struct type *ft = s->dty;
+                if (ft->kind == TY_ARRAY && ft->count == 0 && s->expr) {
+                    if (s->expr->kind == EXPR_STR &&
+                        ft->pointee->kind == TY_CHAR)
+                        ft = ty_array(ft->pointee, (int)s->expr->num);
+                    else if (s->expr->kind == EXPR_INITLIST)
+                        ft = ty_array(ft->pointee,
+                                      initlist_array_count(s->expr));
+                }
+                fold_local_add(dname, ft);
+            }
             /* checked AFTER the initializer, because `char a[] = "..."`
              * takes its size from the literal */
             /* an omitted array size is filled in by sema from the
@@ -1849,6 +1895,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                       struct func ***ftail, struct global ***gtail,
                       int seq)
 {
+    g_nfold_locals = 0;   /* a fresh local scope for sizeof(var) folding */
     if (cur(ps)->kind == TOK_KW_STATIC_ASSERT) {
         parse_static_assert(ps);
         return;
