@@ -375,9 +375,23 @@ pointers/structs/narrow types) agrees with gcc at `-O0`/`-O1`/`-O2`; codegen is
 deterministic; EmbCC self-compiles at `-O2` and links (and the `-O2` compiler is
 *smaller* — fewer load/stores); the kernel compiles 89/89 at `-O2`. Memory
 traffic drops materially — a counted loop went 35→15 rbp accesses, an 8-param
-call 68→40, a value-live-across-calls function 30→12. Suite 91/91. *(Further
-still: precolour/coalesce moves, spill-cost heuristics, and a Briggs-style
-optimistic colouring order beyond the current greedy first-order.)*
+call 68→40, a value-live-across-calls function 30→12. Suite 91/91.
+
+**Follow-up (same session) — move coalescing + a stronger residency cache.**
+Three additions on top: (a) the interference graph is now split PRECISELY into
+live-in and live-out groups (a value dying at an instruction and one born there
+never interfere), which both improves allocation and enables (b) MOVE
+COALESCING — a copy `dst = a` (IR_MOV / IR_STVAR, and a plain non-extending
+IR_LDVAR) records a preference edge, biased colouring gives the pair one
+register, and codegen drops the now-identical self-move; and (c) the RAX
+residency cache runs at `-O2` alongside the allocator (keyed on vreg so it also
+elides reloads of register-resident values), with a zero-extend-aware relaxation
+so a 4-byte store then 8-byte reload (the `IR_MOV` round-trip) is elided.
+Result: whole-kernel `-O2` .text is **23% smaller than `-O0`** (2.42 MB →
+1.84 MB); a copy-heavy function fell 39→24 movs. Still 91/91, deterministic,
+`-O0`/`-O1` byte-identical, kernel 89/89. *(Further still: spill-cost heuristics
+and Briggs-style optimistic colouring; strength reduction; value numbering to
+thin the temp-heavy IR that still emits redundant copies.)*
 
 ---
 

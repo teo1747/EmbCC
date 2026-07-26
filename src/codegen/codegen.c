@@ -194,6 +194,15 @@ static int ins_def(const struct ir_ins *in)
     }
 }
 
+/* Is an IR_LDVAR (dst = extend(local a)) a PLAIN register move — no sign/zero
+ * extension emitted — so dst and a may share a register (and the load vanish)?
+ * True for a full 8-byte load, or a 4-byte load that isn't a signed widen to 64
+ * (a narrow char/short load always movsx/movzx-extends, so never plain). */
+static int ldvar_plain(int size, int sign, int w)
+{
+    return size == 8 || (size == 4 && !(sign && w == 8));
+}
+
 /* Backward liveness dataflow. Fills first[v]/last[v] with the min/max
  * instruction index at which vreg v is live — a sound over-approximation of its
  * live range that spans loop back-edges (a naive first/last-appearance interval
@@ -425,44 +434,71 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     int ew = (E + 63) / 64;
     unsigned long *adj = E ? xcalloc((size_t)E * ew, sizeof *adj) : NULL;
     int *members = xmalloc((size_t)(E ? E : 1) * sizeof *members);
-    char *seen = xcalloc((size_t)(E ? E : 1), 1);   /* de-dup within one insn */
-    for (int i = 0; liveout && i < nins; i++) {
-        /* Everything live DURING instruction i — at its entry (live_in) or exit
-         * (live_out) — plus its def (which clobbers a register even if the value
-         * is dead). live_in matters: a value whose only appearance is a last use
-         * (e.g. a param consumed once) is in live_in but no live_out, yet is
-         * simultaneously live with the others there and must interfere. */
-        int m = 0;
-        unsigned long *ii = livein + (size_t)i * lwords;
-        unsigned long *oi = liveout + (size_t)i * lwords;
-        for (int w = 0; w < lwords; w++) {
-            unsigned long bits = ii[w] | oi[w];
-            while (bits) {
-                int b = 0; unsigned long t = bits;
-                while (!(t & 1)) { t >>= 1; b++; }
-                int v = w * 64 + b;
-                if (v < nvr && eof[v] >= 0 && !seen[eof[v]]) {
-                    seen[eof[v]] = 1; members[m++] = eof[v];
+    /* Vregs simultaneously live interfere. Precisely: those live at an
+     * instruction's ENTRY (live_in) are mutually live, and those live at its
+     * EXIT (live_out, plus a dead def that still clobbers a register) are
+     * mutually live — but a value dying at i (live_in only) and one born at i
+     * (the def, live_out only) are NOT simultaneously live, so no edge crosses
+     * the two groups. That precision is what lets a copy's source (which dies)
+     * share a register with its result (move coalescing, below). */
+    for (int pass = 0; adj && pass < 2; pass++) {
+        for (int i = 0; i < nins; i++) {
+            unsigned long *grp = (pass == 0 ? livein : liveout)
+                                 + (size_t)i * lwords;
+            int m = 0;
+            for (int w = 0; w < lwords; w++) {
+                unsigned long bits = grp[w];
+                while (bits) {
+                    int b = 0; unsigned long t = bits;
+                    while (!(t & 1)) { t >>= 1; b++; }
+                    int v = w * 64 + b;
+                    if (v < nvr && eof[v] >= 0) members[m++] = eof[v];
+                    bits &= bits - 1;
                 }
-                bits &= bits - 1;
             }
-        }
-        int dv = defv[i];
-        if (dv >= 0 && dv < nvr && eof[dv] >= 0 && !seen[eof[dv]]) {
-            seen[eof[dv]] = 1; members[m++] = eof[dv];
-        }
-        for (int j = 0; j < m; j++) seen[members[j]] = 0;   /* reset */
-        for (int p = 0; p < m; p++)
-            for (int q = p + 1; q < m; q++) {
-                int a = members[p], b = members[q];
-                adj[(size_t)a * ew + (b >> 6)] |= 1UL << (b & 63);
-                adj[(size_t)b * ew + (a >> 6)] |= 1UL << (a & 63);
+            if (pass == 1) {   /* a dead def joins the live-out group */
+                int dv = defv[i];
+                if (dv >= 0 && dv < nvr && eof[dv] >= 0) {
+                    int had = 0;
+                    for (int j = 0; j < m; j++) if (members[j] == eof[dv]) had = 1;
+                    if (!had) members[m++] = eof[dv];
+                }
             }
+            for (int p = 0; p < m; p++)
+                for (int q = p + 1; q < m; q++) {
+                    int a = members[p], b = members[q];
+                    adj[(size_t)a * ew + (b >> 6)] |= 1UL << (b & 63);
+                    adj[(size_t)b * ew + (a >> 6)] |= 1UL << (a & 63);
+                }
+        }
+    }
+
+    /* Move-preference (coalescing) graph: a plain copy `dst = a` costs nothing
+     * if dst and a share a register, so record a preference edge between them
+     * when they do NOT interfere. Colouring then biases each vreg toward a
+     * move-partner's colour and codegen drops the now-identical self-move. Only
+     * IR_MOV and IR_STVAR are always plain copies; an IR_LDVAR only when it
+     * emits no extension (ldvar_plain) — a narrow or signed-widening load must
+     * keep its movsx/movzx. */
+    unsigned long *pref = E ? xcalloc((size_t)E * ew, sizeof *pref) : NULL;
+    for (int i = 0; pref && i < nins; i++) {
+        struct ir_ins *in = &fn->ins[i];
+        enum ir_op op = in->op;
+        if (op != IR_MOV && op != IR_STVAR &&
+            !(op == IR_LDVAR && ldvar_plain(in->size, in->sign, in->w)))
+            continue;
+        int d = fn->ins[i].dst, a = fn->ins[i].a;
+        if (d < 0 || d >= nvr || a < 0 || a >= nvr) continue;
+        int ed = eof[d], ea = eof[a];
+        if (ed < 0 || ea < 0 || ed == ea) continue;
+        if (adj[(size_t)ed * ew + (ea >> 6)] & (1UL << (ea & 63))) continue;
+        pref[(size_t)ed * ew + (ea >> 6)] |= 1UL << (ea & 63);
+        pref[(size_t)ea * ew + (ed >> 6)] |= 1UL << (ed & 63);
     }
 
     /* Greedy colouring in first-appearance order (deterministic): give each vreg
-     * the lowest callee register no already-coloured neighbour uses; spill (stay
-     * in memory) if all NCALLEE are taken. */
+     * a register no interfering neighbour uses, preferring one a move-partner
+     * already has (coalescing); spill (stay in memory) if all NCALLEE are taken. */
     int *order = xmalloc((size_t)(E ? E : 1) * sizeof *order);
     {   /* bucket by first[] so the order is first-asc, ties by vreg index */
         int *head = xmalloc((size_t)(nins + 1) * sizeof *head);
@@ -497,9 +533,31 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 bits &= bits - 1;
             }
         }
-        for (int k = 0; k < NCALLEE; k++)
-            if (!(taken & (1 << k))) { loc[eidx[e]] = CALLEE_POOL[k];
-                                       reg_used[k] = 1; break; }
+        /* preferred colours: registers a colored, non-interfering move-partner
+         * already holds (and that are still free) */
+        int want = 0;
+        unsigned long *prow = pref + (size_t)e * ew;
+        for (int w = 0; w < ew; w++) {
+            unsigned long bits = prow[w];
+            while (bits) {
+                int b = 0; unsigned long t = bits;
+                while (!(t & 1)) { t >>= 1; b++; }
+                int pe = w * 64 + b;
+                int pl = loc[eidx[pe]];
+                if (pl >= 0)
+                    for (int k = 0; k < NCALLEE; k++)
+                        if (CALLEE_POOL[k] == pl && !(taken & (1 << k)))
+                            want |= 1 << k;
+                bits &= bits - 1;
+            }
+        }
+        int pick = -1;
+        for (int k = 0; k < NCALLEE; k++)             /* a free preferred reg */
+            if ((want & (1 << k)) && !(taken & (1 << k))) { pick = k; break; }
+        if (pick < 0)
+            for (int k = 0; k < NCALLEE; k++)          /* else lowest free */
+                if (!(taken & (1 << k))) { pick = k; break; }
+        if (pick >= 0) { loc[eidx[e]] = CALLEE_POOL[pick]; reg_used[pick] = 1; }
     }
 
     int nu = 0;
@@ -508,7 +566,8 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     *nused_out = nu;
 
     free(first); free(last); free(elig);
-    free(eof); free(eidx); free(adj); free(members); free(seen); free(order);
+    free(eof); free(eidx); free(adj); free(pref);
+    free(members); free(order);
     free(liveout); free(livein); free(defv);
     return loc;
 }
@@ -687,6 +746,10 @@ static int g_regcache;        /* enabled only when optimizing */
 static int rc_nvars;          /* vregs < this are locals/params (aliasable) */
 static int rc_vreg = -1;      /* the temp whose value RAX holds, or -1 */
 static int rc_size, rc_sign, rc_w;   /* the exact shape RAX holds it in */
+/* -O2 relaxation: when rc_zx, RAX holds the value ZERO-extended above its low
+ * rc_vw bytes, so any zero-extending read of at least rc_vw bytes reproduces it
+ * (e.g. a 4-byte store then an 8-byte reload — the IR_MOV round-trip). */
+static int rc_vw, rc_zx;
 
 /* ---- register allocation (the -O2 codegen step) ----
  *
@@ -702,15 +765,30 @@ static int rc_size, rc_sign, rc_w;   /* the exact shape RAX holds it in */
 static int g_regalloc;        /* enabled only at -O2 */
 static const int *g_loc;      /* per-vreg physical register, or -1; NULL when off */
 
-static void cg_reset(void) { rc_vreg = -1; }
+static void cg_reset(void) { rc_vreg = -1; rc_zx = 0; }
 
 static int in_reg(int vreg) { return g_regalloc && g_loc[vreg] >= 0; }
 
-/* Load vreg into RAX, eliding the load when RAX already holds it. A
- * register-resident vreg is a reg-reg move (with the right extension). */
+/* Is vreg cacheable in RAX? Register-resident vregs and memory TEMPS are (their
+ * value is never aliased through memory); a memory LOCAL is not (a store through
+ * a pointer could change its slot behind RAX's back). */
+static int cacheable(int vreg) { return in_reg(vreg) || vreg >= rc_nvars; }
+
+/* Load vreg into RAX, eliding the load when RAX already holds it in this shape
+ * (the residency cache — now covering register-resident vregs too, which is
+ * where the store-then-reload round-trips came from). A register-resident vreg
+ * is a reg-reg move with the right extension; a memory one a slot load. */
 static void cg_load(struct code *text, const int *sd, int vreg,
                     int size, int sign, int w)
 {
+    if (g_regcache && rc_vreg == vreg) {
+        if (rc_size == size && rc_sign == sign && rc_w == w)
+            return;                               /* exact: RAX already holds it */
+        /* -O2: RAX holds the value zero-extended above rc_vw bytes; a
+         * zero-extending read of at least that many bytes reproduces it. */
+        if (g_regalloc && rc_zx && sign == 0 && size >= rc_vw)
+            return;
+    }
     if (in_reg(vreg)) {
         int R = g_loc[vreg];
         if (size == 1 || size == 2)
@@ -719,31 +797,30 @@ static void cg_load(struct code *text, const int *sd, int vreg,
             x86_movsxd_rr(text, REG_RAX, R);      /* signed int -> 64 */
         else
             x86_mov_rr_w(text, REG_RAX, R, size == 8 ? 8 : w);
-        return;                                   /* regcache is off at -O2 */
-    }
-    if (g_regcache && vreg >= rc_nvars && rc_vreg == vreg &&
-        rc_size == size && rc_sign == sign && rc_w == w)
-        return;
-    x86_load_slot(text, sd[vreg], size, sign, w);
-    if (g_regcache && vreg >= rc_nvars) {
-        rc_vreg = vreg; rc_size = size; rc_sign = sign; rc_w = w;
     } else {
-        cg_reset();               /* a local (or cache off): do not cache */
+        x86_load_slot(text, sd[vreg], size, sign, w);
+    }
+    if (g_regcache && cacheable(vreg)) {
+        rc_vreg = vreg; rc_size = size; rc_sign = sign; rc_w = w;
+        rc_zx = (sign == 0); rc_vw = size;        /* zero-ext read: low `size` valid */
+    } else {
+        cg_reset();               /* a memory local (or cache off): don't cache */
     }
 }
 
 /* Store RAX to vreg. A register-resident vreg gets a reg-reg move sized to
- * valw (4-byte writes zero the upper half, keeping the narrow-value invariant).
- * A memory vreg is stored 8 bytes (a 32-bit result is zero-extended). */
+ * valw (4-byte writes zero the upper half, keeping the narrow-value invariant);
+ * a memory vreg is stored 8 bytes (a 32-bit result is zero-extended). Either
+ * way RAX still holds the value, so record it for the residency cache. */
 static void cg_store(struct code *text, const int *sd, int vreg, int valw)
 {
-    if (in_reg(vreg)) {
+    if (in_reg(vreg))
         x86_mov_rr_w(text, g_loc[vreg], REG_RAX, valw);
-        return;
-    }
-    x86_store_slot(text, sd[vreg], 8);
-    if (g_regcache) {
+    else
+        x86_store_slot(text, sd[vreg], 8);
+    if (g_regcache && cacheable(vreg)) {
         rc_vreg = vreg; rc_size = valw; rc_sign = 0; rc_w = valw;
+        rc_zx = 1; rc_vw = valw;   /* the result is zero-extended to 8 in RAX */
     }
 }
 
@@ -946,6 +1023,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_MOV:
+            /* a coalesced copy whose source and dest share a register is a
+             * no-op — emit nothing (move coalescing). */
+            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst])
+                break;
             cg_load(text, sd, i->a, 8, 0, 8);
             cg_store(text, sd, i->dst, 8);
             break;
@@ -1066,10 +1147,20 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_movs_store(text, 0, sd[i->dst], i->w);
             break;
         case IR_LDVAR:
+            /* coalesced plain load whose local and temp share a register: no-op
+             * (only when no extension is emitted — see ldvar_plain). */
+            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst] &&
+                ldvar_plain(i->size, i->sign, i->w))
+                break;
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STVAR:
+            /* coalesced self-copy (local and value share a register): no-op. The
+             * shared low bytes already carry the (truncated) value; a later read
+             * of the local movsx/movzx-extends from them. */
+            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst])
+                break;
             cg_load(text, sd, i->a, 8, 0, 8);
             if (in_reg(i->dst))                          /* register-resident local */
                 x86_mov_rr_w(text, g_loc[i->dst], REG_RAX, i->size);
@@ -1513,11 +1604,12 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
 {
     struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     g_want_debug = want_debug;
-    /* -O2 turns on register allocation; the RAX residency cache is then off,
-     * since register-resident values would make its RAX-tracking stale. -O0/-O1
-     * are unchanged (regalloc off), so their output stays byte-identical. */
+    /* -O2 turns on register allocation; the RAX residency cache runs alongside
+     * it (keyed on vreg, so it also elides reloads of register-resident values —
+     * the store-then-reload round-trips). -O0/-O1 are unchanged (regalloc off),
+     * so their output stays byte-identical. */
     g_regalloc = regalloc;
-    g_regcache = optimize && !regalloc;
+    g_regcache = optimize;
     g_no_sse = no_sse;
 
     for (int n = 0; n < iu->nfuncs; n++)
