@@ -128,6 +128,7 @@ enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
  * fixed-register letters a/b/c/d/S/D and 'r' (bound via a register-asm
  * variable) — enough for EmbLinkOS's int-$0x80 syscall stubs. */
 struct asm_operand {
+    const char *name;    /* a `[name]` symbolic operand, referenced as %[name] */
     const char *constraint;
     struct expr *expr;
     int reg;              /* the fixed register (0-15), resolved by sema */

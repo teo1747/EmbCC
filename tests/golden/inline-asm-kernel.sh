@@ -52,6 +52,16 @@ void f_reload(void){
     __asm__ volatile("pushq $0x08\n" "leaq 1f(%%rip), %%rax\n" "pushq %%rax\n"
                      "lretq\n" "1:\n" "mov $0x10, %%ax\n" "mov %%ax, %%ds\n"
                      "mov %%ax, %%es\n" "mov %%ax, %%ss\n" ::: "rax","memory"); }
+/* named `%[operand]`s with the "i" (immediate) constraint: EmbCC computes
+ * the value/address into a register, so `movabs %[m]` becomes a reg move —
+ * correct, if not gcc's exact encoding — and the syscall issues. */
+long f_syscall(void){
+    static const char m[] = "hi\n"; long r;
+    __asm__ volatile("mov $1, %%rax\n" "movabs %[b], %%rsi\n"
+                     "mov %[n], %%rdx\n" "int $0x80\n"
+                     : "=a"(r) : [b]"i"(&m[0]), [n]"i"(sizeof m - 1)
+                     : "rsi","rdx","rcx","r11","memory");
+    return r; }
 int main(void){ return 42; }
 EOF
 
@@ -70,7 +80,8 @@ fi
 for want in cli sti hlt pause mfence lfence sfence wbinvd rdtsc rdmsr wrmsr \
             pushf 'mov +%rax,%cr0' 'mov +%cr2,%rax' 'out +%al' 'in +.*%al' \
             invlpg lidt lgdt str ltr movdqa iretq 'mov +\$0x1,%rax' \
-            lretq 'lea +0x3\(%rip\)' 'mov +\$0x10,%ax' 'mov +%eax,%ds'; do
+            lretq 'lea +0x3\(%rip\)' 'mov +\$0x10,%ax' 'mov +%eax,%ds' \
+            'int +\$0x80'; do
     printf '%s\n' "$dis" | grep -Eq "$want" || {
         echo "missing expected instruction: $want"; exit 1; }
 done

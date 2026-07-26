@@ -1516,7 +1516,12 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
             return r;
     }
     for (const char *p = c; *p; p++)             /* else allocate a register */
-        if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R')
+        if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R' ||
+            *p == 'i' || *p == 'n')
+            /* an immediate ('i'/'n'): EmbCC has no way to substitute a literal
+             * (a symbol address needs a relocation), so it computes the value
+             * into a register and the template's mov uses that register — the
+             * result is identical, only the encoding differs from gcc's. */
             return -2;
     for (const char *p = c; *p; p++)             /* an SSE/XMM ('x') operand */
         if (*p == 'x')

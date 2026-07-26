@@ -1235,14 +1235,35 @@ static void a_ws(const char **p)
         (*p)++;
 }
 
-/* Read a numbered operand `%N`, returning its register (opregs[N]). */
-static int a_opreg(const char **p, const int *opregs, int nops,
+/* Read an operand reference — numbered `%N` or symbolic `%[name]` — and
+ * return its register (opregs[the operand's index]). */
+static int a_opreg(const char **p, const int *opregs,
+                   const char *const *opnames, int nops,
                    const char *file, int line, const char *tmpl)
 {
     a_ws(p);
-    if (**p != '%' || !((*p)[1] >= '0' && (*p)[1] <= '9'))
+    if (**p != '%')
         diag_fatal(file, line, "asm: expected a %%N operand in \"%s\"", tmpl);
     (*p)++;
+    if (**p == '[') {                       /* %[name] */
+        (*p)++;
+        const char *nm = *p;
+        while (**p && **p != ']')
+            (*p)++;
+        int len = (int)(*p - nm);
+        if (**p != ']')
+            diag_fatal(file, line, "asm: unterminated %%[name] in \"%s\"",
+                       tmpl);
+        (*p)++;
+        for (int i = 0; i < nops; i++)
+            if (opnames[i] && (int)strlen(opnames[i]) == len &&
+                strncmp(opnames[i], nm, (size_t)len) == 0)
+                return opregs[i];
+        diag_fatal(file, line, "asm: unknown operand %%[%.*s] in \"%s\"",
+                   len, nm, tmpl);
+    }
+    if (!(**p >= '0' && **p <= '9'))
+        diag_fatal(file, line, "asm: expected a %%N operand in \"%s\"", tmpl);
     int idx = 0;
     while (**p >= '0' && **p <= '9')
         idx = idx * 10 + (*(*p)++ - '0');
@@ -1329,7 +1350,8 @@ static long a_imm(const char **p, const char *file, int line, const char *tmpl)
 }
 
 /* Read a memory operand `(%N)`, returning the base register (opregs[N]). */
-static int a_memreg(const char **p, const int *opregs, int nops,
+static int a_memreg(const char **p, const int *opregs,
+                    const char *const *opnames, int nops,
                     const char *file, int line, const char *tmpl)
 {
     a_ws(p);
@@ -1337,7 +1359,7 @@ static int a_memreg(const char **p, const int *opregs, int nops,
         diag_fatal(file, line, "asm: expected a `(%%N)` memory operand in "
                    "\"%s\"", tmpl);
     (*p)++;
-    int r = a_opreg(p, opregs, nops, file, line, tmpl);
+    int r = a_opreg(p, opregs, opnames, nops, file, line, tmpl);
     a_ws(p);
     if (**p != ')')
         diag_fatal(file, line, "asm: unterminated `(%%N)` in \"%s\"", tmpl);
@@ -1355,7 +1377,8 @@ static int a_memreg(const char **p, const int *opregs, int nops,
  * kernel's hardware instructions (port I/O, control/segment/MSR access,
  * fences, TLB, descriptor tables). Anything else is refused loudly. */
 static void asm_assemble(struct ir_func *fn, struct stmt *s,
-                         const int *opregs, int nops, struct ir_asm *ia)
+                         const int *opregs, const char *const *opnames,
+                         int nops, struct ir_asm *ia)
 {
     const char *file = fn->src->file;
     int line = s->line;
@@ -1537,7 +1560,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                 a_ws(&p);
                 reg = (p[0] == '%' && p[1] == '%')
                     ? a_regname(&p, file, line, tmpl)
-                    : a_opreg(&p, opregs, nops, file, line, tmpl);
+                    : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
             }
             if (reg >= 8) code[n++] = 0x41;                /* REX.B */
             code[n++] = (unsigned char)(0x58 | (reg & 7));
@@ -1553,7 +1576,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                 if (reg < 0)
                     reg = (p[0] == '%' && p[1] == '%')
                         ? a_regname(&p, file, line, tmpl)
-                        : a_opreg(&p, opregs, nops, file, line, tmpl);
+                        : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
                 if (reg >= 8) code[n++] = 0x41;
                 code[n++] = (unsigned char)(0x50 | (reg & 7));
             }
@@ -1588,12 +1611,12 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
         }
         /* ---- str/ltr %N (task register; r/m16) ---- */
         else if (mlen == 3 && strncmp(m, "str", 3) == 0) {
-            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg < 0) reg = a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
             if (reg >= 8) code[n++] = 0x41;
             code[n++] = 0x0f; code[n++] = 0x00;
             code[n++] = (unsigned char)(0xc8 | (reg & 7));   /* /1 */
         } else if (mlen == 3 && strncmp(m, "ltr", 3) == 0) {
-            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg < 0) reg = a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
             if (reg >= 8) code[n++] = 0x41;
             code[n++] = 0x0f; code[n++] = 0x00;
             code[n++] = (unsigned char)(0xd8 | (reg & 7));   /* /3 */
@@ -1656,7 +1679,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                     a_ws(&p);
                     int gpr = (p[0] == '%' && p[1] == '%')
                             ? a_regname(&p, file, line, tmpl)
-                            : a_opreg(&p, opregs, nops, file, line, tmpl);
+                            : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
                     int rex = 0x40 | (gpr >= 8) | (cr >= 8 ? 4 : 0);
                     if (rex != 0x40) code[n++] = (unsigned char)rex;
                     code[n++] = 0x0f; code[n++] = 0x20;
@@ -1666,7 +1689,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                 } else if (p[0] == '%' && p[1] == '%') {
                     src_reg = a_regname(&p, file, line, tmpl);
                 } else {
-                    src_reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+                    src_reg = a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
                 }
             }
             a_comma(&p, file, line, tmpl);
@@ -1682,7 +1705,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             } else {
                 int dst = (p[0] == '%' && p[1] == '%')
                         ? a_regname(&p, file, line, tmpl)
-                        : a_opreg(&p, opregs, nops, file, line, tmpl);
+                        : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
                 if (src_imm_valid) {
                     int wide = mlen == 6 ||                 /* movabs, or */
                                src_imm > 0x7fffffffL ||     /* > imm32 */
@@ -1713,18 +1736,18 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
          * is the register the "m"/"r" operand landed in ---- */
         else if (mlen == 4 && strncmp(m, "lgdt", 4) == 0) {
             int r = reg >= 0 ? reg
-                  : a_opreg(&p, opregs, nops, file, line, tmpl);
+                  : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
             if (r >= 8) code[n++] = 0x41;
             code[n++] = 0x0f; code[n++] = 0x01;
             code[n++] = (unsigned char)(0x10 | (r & 7));     /* /2 (%r) */
         } else if (mlen == 4 && strncmp(m, "lidt", 4) == 0) {
             int r = reg >= 0 ? reg
-                  : a_opreg(&p, opregs, nops, file, line, tmpl);
+                  : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
             if (r >= 8) code[n++] = 0x41;
             code[n++] = 0x0f; code[n++] = 0x01;
             code[n++] = (unsigned char)(0x18 | (r & 7));     /* /3 (%r) */
         } else if (mlen == 6 && strncmp(m, "invlpg", 6) == 0) {
-            int r = a_memreg(&p, opregs, nops, file, line, tmpl);
+            int r = a_memreg(&p, opregs, opnames, nops, file, line, tmpl);
             if (r >= 8) code[n++] = 0x41;
             code[n++] = 0x0f; code[n++] = 0x01;
             code[n++] = (unsigned char)(0x38 | (r & 7));     /* /7 (%r) */
@@ -1740,9 +1763,9 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                                "%%%%xmm0 in \"%s\"", tmpl);
                 p += 6;
                 a_comma(&p, file, line, tmpl);
-                r = a_memreg(&p, opregs, nops, file, line, tmpl);
+                r = a_memreg(&p, opregs, opnames, nops, file, line, tmpl);
             } else {                                   /* movdqa (%N),%%xmm0 */
-                r = a_memreg(&p, opregs, nops, file, line, tmpl);
+                r = a_memreg(&p, opregs, opnames, nops, file, line, tmpl);
                 a_comma(&p, file, line, tmpl);
                 a_ws(&p);
                 if (strncmp(p, "%%xmm0", 6) != 0)
@@ -1915,11 +1938,13 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
                 else if (a->in[i].reg >= 0) used[a->in[i].reg] = 1;
             }
             int opregs[2 * MAX_PARAMS], nops = 0;
+            const char *opnames[2 * MAX_PARAMS];
             for (int i = 0; i < a->nout; i++) {
                 int r = a->out[i].reg;
                 if (r == -2)      r = asm_alloc_reg(used, fn->src->file, s->line);
                 else if (r == -3) r = asm_alloc_xmm(xused, fn->src->file, s->line);
                 ia->out[i].reg = r;
+                opnames[nops] = a->out[i].name;
                 opregs[nops++] = r;
             }
             for (int i = 0; i < a->nin; i++) {
@@ -1927,9 +1952,10 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
                 if (r == -2)      r = asm_alloc_reg(used, fn->src->file, s->line);
                 else if (r == -3) r = asm_alloc_xmm(xused, fn->src->file, s->line);
                 ia->in[i].reg = r;
+                opnames[nops] = a->in[i].name;
                 opregs[nops++] = r;
             }
-            asm_assemble(fn, s, opregs, nops, ia);
+            asm_assemble(fn, s, opregs, opnames, nops, ia);
             /* An input carries its VALUE; an output the ADDRESS of its
              * lvalue. An xmm ('x') input is moved with movss/movsd, so its
              * size is the operand's own float width. */

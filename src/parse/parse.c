@@ -1423,6 +1423,16 @@ static void parse_asm_operands(struct parser *ps, struct asm_operand **out,
             *out = xrealloc(*out, (size_t)cap * sizeof **out);
         }
         struct asm_operand *op = &(*out)[(*nout)++];
+        op->name = NULL;
+        if (cur(ps)->kind == TOK_LBRACKET) {  /* a `[name]` symbolic operand */
+            advance(ps);
+            if (cur(ps)->kind != TOK_IDENT)
+                diag_fatal(ps->lx.file, cur(ps)->line,
+                           "expected a name in an asm `[name]` operand");
+            op->name = cur(ps)->text;
+            advance(ps);
+            expect(ps, TOK_RBRACKET, "']' after an asm operand name");
+        }
         op->constraint = parse_str_literal(ps, "an asm constraint");
         expect(ps, TOK_LPAREN, "'(' after an asm constraint");
         op->expr = parse_expr(ps);
