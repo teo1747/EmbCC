@@ -129,6 +129,12 @@ struct brsite {
  * sound; codegen_unit sets it from want_debug. */
 static int g_want_debug;
 
+/* -mno-sse: never emit an SSE/xmm instruction. A kernel built before it turns
+ * on CR4.OSFXSR needs this — any SSE op #UDs. Set by codegen_unit; the varargs
+ * prologue skips its xmm spill, and a float operation is refused loudly rather
+ * than silently emitting a faulting instruction (THE RULE). */
+static int g_no_sse;
+
 /* ---- local register (RAX) residency cache (the -O codegen step) ----
  *
  * Every vreg still owns a stack slot, but a value just computed into RAX
@@ -225,8 +231,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
         for (int r = 0; r < 6; r++)
             x86_store_mem_reg(text, REG_RBP, va_save + r * 8,
                               x86_argreg(r), 8);
-        for (int r = 0; r < 8; r++)
-            x86_movs_store_base(text, REG_RBP, va_save + 48 + r * 16, r, 8);
+        /* The SSE half of the save area is skipped under -mno-sse (the xmm
+         * spill would #UD before CR4.OSFXSR is set). Sound because a callee
+         * built -mno-sse takes no floating varargs, so va_arg never reads it;
+         * callers must likewise pass al=0 (they do — no float args exist). */
+        if (!g_no_sse)
+            for (int r = 0; r < 8; r++)
+                x86_movs_store_base(text, REG_RBP, va_save + 48 + r * 16,
+                                    r, 8);
     }
     {   /* The same two-file split, in reverse. A hidden return pointer
          * (sret) consumes rdi BEFORE any real parameter, and MEMORY
@@ -315,6 +327,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 fn->nlines++;
             }
         }
+        /* -mno-sse: an operation that would touch an xmm register (float
+         * math, an int<->float conversion) has no non-SSE lowering — refuse
+         * it rather than emit a #UD. The kernel reaches this never (it has no
+         * float math); if a caller does, the diagnostic names why. */
+        if (g_no_sse && (i->flt || i->op == IR_I2F || i->op == IR_F2I ||
+                         i->op == IR_F2F))
+            diag_fatal(fn->src->file, i->line,
+                       "floating point needs SSE, which -mno-sse forbids");
         switch (i->op) {
         case IR_CONST:
             x86_mov_eax_imm(text, i->imm, i->w);
@@ -844,11 +864,13 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct extcall **ext, int *next,
                   struct strsite **strs, int *nstrs,
                   struct gsite **gs, int *ngs,
-                  struct fsite **fs, int *nfs, int want_debug, int optimize)
+                  struct fsite **fs, int *nfs, int want_debug, int optimize,
+                  int no_sse)
 {
     struct sites st = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     g_want_debug = want_debug;
     g_regcache = optimize;
+    g_no_sse = no_sse;
 
     for (int n = 0; n < iu->nfuncs; n++)
         gen_func(&iu->funcs[n], text, &st);

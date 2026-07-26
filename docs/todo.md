@@ -102,7 +102,22 @@ yet honored on a stack slot).
 An empty translation unit yields a valid empty object.
 *(A freestanding `<string.h>` on the path is an integration matter.)*
 
-### K10 — `-mno-sse` codegen (the ONE runtime blocker; kernel builds+links, then #UDs)
+### K10 — `-mno-sse` codegen — **DONE** (kernel now compiles + links + boots + runs)
+
+**RESOLVED (branch Teo).** EmbCC gained a `-mno-sse` mode (also spelled
+`-mno-sse2` / `-mgeneral-regs-only`; `-mno-mmx` / `-mno-red-zone` / `-mno-80387`
+/ `-mcmodel=` accepted as no-ops). Under it the varargs prologue skips the
+`xmm0..7` register-save spill entirely, and any float op / `IR_I2F` / `IR_F2I`
+/ `IR_F2F` is **refused loudly** (THE RULE — no silent SSE). Verified:
+the `#UD` site `kprintf` disassembles to **0 SSE**; whole-kernel codegen under
+`-mno-sse` emits **0 SSE** (the only 2 `movdqa` kernel-wide are the kernel's own
+deliberate SSE-context-switch selftest inline asm in `process.c`, which runs
+*after* `fpu_init` sets `CR4.OSFXSR`); integer varargs still run correctly;
+default (no-flag) path is byte-identical (self-host holds, suite 87/87). The
+2 `movdqa` in the original triage were miscounted as a struct-copy lowering —
+they were always the kernel's own inline asm, not codegen.
+
+<details><summary>original triage (kept for context)</summary>
 
 *Empirically confirmed: all 88 kernel TUs compile, LINK with the kernel linker
 script into a valid higher-half `EXEC` (entry `0xffffffff8037bde0`), and it BOOTS
@@ -131,6 +146,8 @@ comes first; worth confirming once SSE is off, since the kernel takes interrupts
 
 *Repro (from `myos/`): compile every `KERNEL_SRC` with `embcc -c … -Ikernel`,
 link `x86_64-elf-ld -T kernel/linker.ld` with the nasm objects, boot.*
+
+</details>
 
 ---
 
