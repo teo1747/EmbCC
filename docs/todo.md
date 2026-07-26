@@ -149,6 +149,39 @@ link `x86_64-elf-ld -T kernel/linker.ld` with the nasm objects, boot.*
 
 </details>
 
+### K11 — honor `__attribute__((aligned(N)))` in LAYOUT (the next runtime blocker)
+
+*With `-mno-sse` in, the self-compiled kernel now boots much further — PMM (512 MB),
+VMM direct map, ACPI, EMBKFS mounted, VFS at `/`, ksym loaded — then takes a
+`#GP` at the **first context switch**:*
+
+```
+Vector 0x0D (#GP)  RIP 0xFFFFFFFF8037BC90 = kernel_ctx_switch:  fxsave (%rdx)
+```
+
+`fxsave` **#GPs unless its memory operand is 16-byte aligned**. The buffer is the
+process struct's FPU save area:
+
+```c
+/* kernel/process/process.h:153 — the comment says "aligned(16) is load-bearing" */
+unsigned char fpu_state[512] __attribute__((aligned(16)));
+```
+
+EmbCC **parses** `aligned(N)` (K8) but does not **apply** it to layout, so
+`fpu_state` lands at a non-16 offset and `fxsave` faults. Minimal host repro —
+this `_Static_assert` **fails** under embcc, passes under gcc:
+
+```c
+struct s { char c; char buf[512] __attribute__((aligned(16))); };
+_Static_assert(__builtin_offsetof(struct s, buf) % 16 == 0, "buf 16-aligned");
+```
+
+**Fix: apply `aligned(N)` to layout** — (a) round a struct **field**'s offset up
+to `N`, (b) raise the **struct's** own alignment/size to a multiple of `N`, and
+(c) align **stack slots** for locals carrying the attribute (e.g.
+`uint8_t observed[16] __attribute__((aligned(16)))`). This is the one thing
+between the self-compiled kernel and reaching the desktop.
+
 ---
 
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
