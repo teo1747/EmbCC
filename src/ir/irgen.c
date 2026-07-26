@@ -1071,6 +1071,47 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         }
         if (e->name && strcmp(e->name, "__builtin_va_end") == 0)
             return -1;
+        if (e->name && strncmp(e->name, "__builtin_bswap", 15) == 0) {
+            int v = gen_expr(fn, e->args[0]);
+            struct ir_ins *i = emit(fn);
+            i->op = IR_BSWAP;
+            i->a = v;
+            i->size = ty_size(e->ty);
+            i->w = ty_w(e->ty);
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
+        if (e->name && strcmp(e->name, "__sync_synchronize") == 0) {
+            emit(fn)->op = IR_FENCE;
+            return -1;
+        }
+        if (e->name && strcmp(e->name, "__builtin_unreachable") == 0) {
+            emit(fn)->op = IR_UD2;
+            return -1;
+        }
+        if (e->name && strcmp(e->name, "__atomic_load_n") == 0) {
+            int addr = gen_expr(fn, e->args[0]);
+            return emit_load(fn, addr, e->ty);   /* aligned load is atomic */
+        }
+        if (e->name && strcmp(e->name, "__atomic_store_n") == 0) {
+            int addr = gen_expr(fn, e->args[0]);
+            int val = gen_expr(fn, e->args[1]);
+            emit_store(fn, addr, val, e->args[0]->ty->pointee);
+            emit(fn)->op = IR_FENCE;             /* seq_cst: publish the store */
+            return -1;
+        }
+        if (e->name && strcmp(e->name, "__atomic_exchange_n") == 0) {
+            int addr = gen_expr(fn, e->args[0]);
+            int val = gen_expr(fn, e->args[1]);
+            struct ir_ins *i = emit(fn);
+            i->op = IR_XCHG;
+            i->a = addr;
+            i->b = val;
+            i->size = ty_size(e->ty);
+            i->w = ty_w(e->ty);
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
         int args[MAX_PARAMS];
         int fptemp = -1;
         if (!e->callee) /* through a pointer: evaluate the callee */

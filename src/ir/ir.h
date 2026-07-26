@@ -58,6 +58,10 @@ enum ir_op {
     IR_BRNZ,  /* if (a != 0) goto label  (w) */
     IR_VA_START, /* init the va_list whose ADDRESS is in temp a (SysV:
                   * fill a __va_list_tag on the frame, point *a at it) */
+    IR_BSWAP, /* dst = byteswap(a)   (size: 2/4/8; __builtin_bswapN) */
+    IR_FENCE, /* a full memory barrier (mfence; __sync_synchronize) */
+    IR_UD2,   /* the undefined instruction (ud2; __builtin_unreachable) */
+    IR_XCHG,  /* dst = *(temp a); *(temp a) = b   (atomic; size) */
     IR_ASM    /* extended asm: load inputs to fixed registers, assemble the
                * template, store outputs. Detail in ir_ins.asm_ir */
 };

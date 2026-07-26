@@ -484,6 +484,54 @@ void x86_neg_eax(struct code *c, int w)
     code_byte(c, 0xd8);
 }
 
+/* Byte-swap the low `size` bytes of rax/eax/ax in place. bswap has no
+ * 16-bit form, so a 2-byte swap is `rol $8, %ax`. */
+void x86_bswap(struct code *c, int size)
+{
+    if (size == 2) {
+        code_byte(c, 0x66);   /* operand-size prefix: 16-bit */
+        code_byte(c, 0xc1);   /* rol r/m16, imm8 */
+        code_byte(c, 0xc0);   /* mod=11 /0 reg=ax */
+        code_byte(c, 0x08);
+        return;
+    }
+    if (size == 8)
+        code_byte(c, 0x48);   /* REX.W: bswap %rax */
+    code_byte(c, 0x0f);
+    code_byte(c, 0xc8);       /* bswap eax/rax */
+}
+
+/* mfence — a full memory barrier (__sync_synchronize). */
+void x86_mfence(struct code *c)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0xae);
+    code_byte(c, 0xf0);
+}
+
+/* ud2 — the guaranteed-undefined instruction (__builtin_unreachable). */
+void x86_ud2(struct code *c)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0x0b);
+}
+
+/* xchg rax/eax/ax/al with [rcx] — the memory operand makes it implicitly
+ * LOCKed, i.e. atomic. RAX ends holding the old value at [rcx]. */
+void x86_xchg_rax_mem_rcx(struct code *c, int size)
+{
+    switch (size) {
+    case 1: code_byte(c, 0x86); break;
+    case 2: code_byte(c, 0x66); code_byte(c, 0x87); break;
+    case 4: code_byte(c, 0x87); break;
+    case 8: code_byte(c, 0x48); code_byte(c, 0x87); break;
+    default:
+        fprintf(stderr, "embcc: internal: bad xchg size %d\n", size);
+        exit(1);
+    }
+    code_byte(c, 0x01); /* ModRM: [rcx] <-> eax/rax */
+}
+
 void x86_not_eax(struct code *c, int w)
 {
     rexw(c, w);

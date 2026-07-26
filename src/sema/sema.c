@@ -896,6 +896,62 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             if (strcmp(bn, "memcpy") == 0 || strcmp(bn, "memmove") == 0 ||
                 strcmp(bn, "memset") == 0)
                 e->lhs->name = bn;   /* fall through to normal call handling */
+            /* byte swaps -> a single instruction; the result is the argument's
+             * width as an unsigned integer. */
+            else if (strcmp(bn, "bswap16") == 0 || strcmp(bn, "bswap32") == 0 ||
+                     strcmp(bn, "bswap64") == 0) {
+                if (e->nargs != 1)
+                    diag_fatal(u->file, e->line, "%s takes one argument",
+                               e->lhs->name);
+                check_expr(u, f, sc, e->args[0]);
+                need_integer(u, e->args[0], "__builtin_bswap");
+                e->name = e->lhs->name;
+                e->ty = ty_base(bn[5] == '1' ? TY_SHORT :
+                                bn[5] == '3' ? TY_INT : TY_LONG, 1);
+                break;
+            }
+            /* the value IS the first argument; the hint is discarded */
+            else if (strcmp(bn, "expect") == 0) {
+                if (e->nargs < 1)
+                    diag_fatal(u->file, e->line,
+                               "__builtin_expect takes two arguments");
+                for (int i = 0; i < e->nargs; i++)
+                    check_expr(u, f, sc, e->args[i]);
+                *e = *e->args[0];
+                break;
+            }
+            /* control never reaches here -> a trap (ud2) */
+            else if (strcmp(bn, "unreachable") == 0) {
+                e->name = e->lhs->name;
+                e->ty = ty_base(TY_VOID, 0);
+                break;
+            }
+        }
+        /* a full memory barrier (not spelled __builtin_) */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            strcmp(e->lhs->name, "__sync_synchronize") == 0) {
+            e->name = e->lhs->name;
+            e->ty = ty_base(TY_VOID, 0);
+            break;
+        }
+        /* __atomic_load_n / store_n / exchange_n. The first argument is a
+         * pointer; x86 makes an aligned scalar load/store atomic on its own,
+         * exchange is a locked xchg, and a store gets a trailing fence for
+         * seq_cst. The memory-order argument is checked and then ignored. */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            (strcmp(e->lhs->name, "__atomic_load_n") == 0 ||
+             strcmp(e->lhs->name, "__atomic_store_n") == 0 ||
+             strcmp(e->lhs->name, "__atomic_exchange_n") == 0)) {
+            for (int i = 0; i < e->nargs; i++)
+                check_expr(u, f, sc, e->args[i]);
+            if (e->nargs < 1 || e->args[0]->ty->kind != TY_PTR)
+                diag_fatal(u->file, e->line,
+                           "%s needs a pointer first argument", e->lhs->name);
+            e->name = e->lhs->name;
+            e->ty = strcmp(e->lhs->name, "__atomic_store_n") == 0
+                    ? ty_base(TY_VOID, 0)
+                    : e->args[0]->ty->pointee;
+            break;
         }
         /* Direct when the callee is a name that is not a variable in
          * scope and names a function; otherwise a call through a
@@ -1722,6 +1778,7 @@ static int is_noreturn_call(const struct expr *e)
         return 0;
     static const char *const nr[] = {
         "exit", "abort", "_Exit", "diag_fatal",
+        "__builtin_unreachable", "__builtin_trap",
     };
     for (unsigned i = 0; i < sizeof nr / sizeof *nr; i++)
         if (strcmp(e->name, nr[i]) == 0)

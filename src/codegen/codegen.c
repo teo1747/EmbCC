@@ -478,6 +478,25 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
+        case IR_BSWAP:
+            cg_load(text, sd, i->a, i->size, 0, i->size == 8 ? 8 : 4);
+            x86_bswap(text, i->size);
+            cg_store(text, sd, i->dst, i->w);
+            break;
+        case IR_FENCE:
+            x86_mfence(text);   /* leaves RAX untouched: cache stays valid */
+            break;
+        case IR_UD2:
+            x86_ud2(text);
+            break;
+        case IR_XCHG:
+            cg_reset();
+            x86_mov_rcx_slot(text, sd[i->a]);            /* address -> rcx */
+            x86_load_slot(text, sd[i->b], i->size, 0,
+                          i->size == 8 ? 8 : 4);         /* new value -> rax */
+            x86_xchg_rax_mem_rcx(text, i->size);         /* atomic; rax = old */
+            cg_store(text, sd, i->dst, i->w);
+            break;
         case IR_MEMCPY: {
             /* a struct copy: 8 bytes at a time, then the tail */
             cg_reset();

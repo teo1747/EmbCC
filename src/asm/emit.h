@@ -99,6 +99,10 @@ void x86_mov_reg_reg(struct code *c, int dst, int src);   /* 64-bit */
 /* argument registers by index, for aggregates arriving in pieces */
 int  x86_argreg(int index);
 void x86_not_eax(struct code *c, int w);
+void x86_bswap(struct code *c, int size);
+void x86_mfence(struct code *c);
+void x86_ud2(struct code *c);
+void x86_xchg_rax_mem_rcx(struct code *c, int size);
 
 /* cmp eax/rax with a slot, then set al by condition and zero-extend.
  * cc is the setcc opcode byte (0x92..0x9f), chosen by codegen. */
