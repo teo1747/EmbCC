@@ -101,9 +101,6 @@ check void-variable \
 check array-assign \
     'int main(void) { int a[3]; int b[3]; a = b; return 0; }' \
     "cannot assign to an array"
-check addr-of-array \
-    'int main(void) { int a[3]; return !&a; }' \
-    "already the address"
 check array-scalar-init \
     'int main(void) { int a[3] = 0; return 0; }' \
     "brace initializer or a string"

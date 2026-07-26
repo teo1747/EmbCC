@@ -448,10 +448,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (!is_lvalue(e->rhs))
             diag_fatal(u->file, e->line,
                        "'&' needs a variable or *pointer");
-        if (e->rhs->undecayed)
-            diag_fatal(u->file, e->line,
-                       "'&' on an array is not supported yet (its name "
-                       "is already the address of the first element)");
+        if (e->rhs->undecayed) {
+            /* &arr yields a pointer to the whole ARRAY object, T(*)[N]; its
+             * value is the array's address, which gen_addr already gives. */
+            e->ty = ty_ptr(e->rhs->undecayed);
+            break;
+        }
         if (e->rhs->kind == EXPR_MEMBER && e->rhs->memb &&
             e->rhs->memb->is_bitfield)
             diag_fatal(u->file, e->line,

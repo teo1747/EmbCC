@@ -1459,6 +1459,10 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                 s->asm_reg = parse_str_literal(ps, "a register name");
                 expect(ps, TOK_RPAREN, "')' after the register name");
             }
+            /* `T x[16] __attribute__((aligned(16)))` — a trailing attribute
+             * on a local declarator (accepted; alignment is not yet honored
+             * for a stack slot). */
+            parse_attributes(ps, NULL);
             int was_array = s->dty->kind == TY_ARRAY;
             (void)was_array;
             if (cur(ps)->kind == TOK_ASSIGN) {
@@ -2021,10 +2025,9 @@ struct unit *parse_unit(const char *file, const char *src)
     int seq = 0;
     while (cur(&ps)->kind != TOK_EOF)
         parse_top(&ps, u, &ftail, &gtail, seq++);
-    /* A translation unit of only data (a table of globals, no functions)
-     * is valid C — EmbCC's own predef macro table is exactly that. Refuse
-     * only a unit with nothing at all to emit. */
-    if (!u->funcs && !u->globals && !u->topasm)
-        diag_fatal(file, 0, "no functions or globals in file");
+    /* A translation unit of only data (a table of globals, no functions) is
+     * valid C — EmbCC's own predef macro table is exactly that. An entirely
+     * empty unit is legal too (a header-only .c, a fully #if'd-out file);
+     * it yields a valid, empty object. */
     return u;
 }

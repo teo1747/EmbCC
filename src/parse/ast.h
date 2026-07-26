@@ -12,11 +12,9 @@
 
 #include "../sema/type.h"
 
-/* Prototypes in real headers declare more parameters than fit in
- * registers (newlib's _dtoa_r takes seven), so the DECLARATION limit is
- * generous; what is actually refused is a CALL needing more registers
- * than SysV provides — checked in sema, where the classes are known. */
-#define MAX_PARAMS 12
+/* MAX_PARAMS (the declaration/call arity cap) is defined in type.h, which
+ * this header includes, so struct type's ptypes[] and the AST arrays here
+ * stay the same size. */
 
 enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,

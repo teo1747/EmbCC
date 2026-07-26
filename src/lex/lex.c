@@ -96,6 +96,61 @@ static const struct {
     { "default", TOK_KW_DEFAULT },
 };
 
+static int hex_val(int c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Consume one backslash escape. On entry lx->p is at the character AFTER the
+ * '\'; on return it is past the escape. Returns the byte value (0..255).
+ * The full C set: simple escapes, GNU '\e', hex '\xH...', and octal '\NNN'. */
+static int scan_escape(struct lexer *lx)
+{
+    int c = (unsigned char)*lx->p;
+    switch (c) {
+    case 'n': lx->p++; return '\n';
+    case 't': lx->p++; return '\t';
+    case 'r': lx->p++; return '\r';
+    case 'a': lx->p++; return '\a';
+    case 'b': lx->p++; return '\b';
+    case 'f': lx->p++; return '\f';
+    case 'v': lx->p++; return '\v';
+    case 'e': lx->p++; return 27;      /* GNU extension: ESC */
+    case '\\': lx->p++; return '\\';
+    case '\'': lx->p++; return '\'';
+    case '"': lx->p++; return '"';
+    case '?': lx->p++; return '?';
+    case 'x': {
+        lx->p++;
+        if (hex_val((unsigned char)*lx->p) < 0)
+            diag_fatal(lx->file, lx->line, "\\x used with no following "
+                       "hex digits");
+        int v = 0, d;
+        while ((d = hex_val((unsigned char)*lx->p)) >= 0) {
+            v = v * 16 + d;
+            lx->p++;
+        }
+        return v & 0xff;
+    }
+    default:
+        if (c >= '0' && c <= '7') {     /* octal, at most three digits */
+            int v = 0, i = 0;
+            while (i < 3 && *lx->p >= '0' && *lx->p <= '7') {
+                v = v * 8 + (*lx->p - '0');
+                lx->p++;
+                i++;
+            }
+            return v & 0xff;
+        }
+        diag_fatal(lx->file, lx->line,
+                   "unknown escape '\\%c' in a literal", c);
+        return 0;
+    }
+}
+
 void lex_next(struct lexer *lx)
 {
     struct token *t = &lx->tok;
@@ -338,21 +393,7 @@ void lex_next(struct lexer *lx)
         long v;
         if (*lx->p == '\\') {
             lx->p++;
-            switch (*lx->p) {
-            case 'n': v = '\n'; break;
-            case 't': v = '\t'; break;
-            case 'r': v = '\r'; break;
-            case '0': v = 0; break;
-            case '\\': v = '\\'; break;
-            case '\'': v = '\''; break;
-            case '"': v = '"'; break;
-            default:
-                diag_fatal(lx->file, lx->line,
-                           "unknown escape '\\%c' in character constant",
-                           *lx->p);
-                return;
-            }
-            lx->p++;
+            v = scan_escape(lx);
         } else if (*lx->p && *lx->p != '\'' && *lx->p != '\n') {
             v = (unsigned char)*lx->p;
             lx->p++;
@@ -386,21 +427,7 @@ void lex_next(struct lexer *lx)
             char ch;
             if (*lx->p == '\\') {
                 lx->p++;
-                switch (*lx->p) {
-                case 'n': ch = '\n'; break;
-                case 't': ch = '\t'; break;
-                case 'r': ch = '\r'; break;
-                case '0': ch = 0; break;
-                case '\\': ch = '\\'; break;
-                case '\'': ch = '\''; break;
-                case '"': ch = '"'; break;
-                default:
-                    diag_fatal(lx->file, lx->line,
-                               "unknown escape '\\%c' in string literal",
-                               *lx->p);
-                    return;
-                }
-                lx->p++;
+                ch = (char)scan_escape(lx);
             } else {
                 ch = *lx->p++;
             }
