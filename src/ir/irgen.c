@@ -1189,12 +1189,79 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     return -1; /* unreachable; every kind returns above */
 }
 
+/* ---- small parse helpers for the inline-asm template ---- */
+
+static void a_ws(const char **p)
+{
+    while (**p == ' ' || **p == '\t')
+        (*p)++;
+}
+
+/* Read a numbered operand `%N`, returning its register (opregs[N]). */
+static int a_opreg(const char **p, const int *opregs, int nops,
+                   const char *file, int line, const char *tmpl)
+{
+    a_ws(p);
+    if (**p != '%' || !((*p)[1] >= '0' && (*p)[1] <= '9'))
+        diag_fatal(file, line, "asm: expected a %%N operand in \"%s\"", tmpl);
+    (*p)++;
+    int idx = 0;
+    while (**p >= '0' && **p <= '9')
+        idx = idx * 10 + (*(*p)++ - '0');
+    if (idx >= nops)
+        diag_fatal(file, line, "asm operand %%%d out of range in \"%s\"",
+                   idx, tmpl);
+    return opregs[idx];
+}
+
+/* Read a control register `%%crN`, returning N. */
+static int a_creg(const char **p, const char *file, int line, const char *tmpl)
+{
+    a_ws(p);
+    if ((*p)[0] != '%' || (*p)[1] != '%' || (*p)[2] != 'c' || (*p)[3] != 'r')
+        diag_fatal(file, line, "asm: expected %%%%crN in \"%s\"", tmpl);
+    *p += 4;
+    int n = 0;
+    while (**p >= '0' && **p <= '9')
+        n = n * 10 + (*(*p)++ - '0');
+    return n;
+}
+
+static void a_comma(const char **p, const char *file, int line,
+                    const char *tmpl)
+{
+    a_ws(p);
+    if (**p != ',')
+        diag_fatal(file, line, "asm: expected ',' in \"%s\"", tmpl);
+    (*p)++;
+}
+
+/* Read a memory operand `(%N)`, returning the base register (opregs[N]). */
+static int a_memreg(const char **p, const int *opregs, int nops,
+                    const char *file, int line, const char *tmpl)
+{
+    a_ws(p);
+    if (**p != '(')
+        diag_fatal(file, line, "asm: expected a `(%%N)` memory operand in "
+                   "\"%s\"", tmpl);
+    (*p)++;
+    int r = a_opreg(p, opregs, nops, file, line, tmpl);
+    a_ws(p);
+    if (**p != ')')
+        diag_fatal(file, line, "asm: unterminated `(%%N)` in \"%s\"", tmpl);
+    (*p)++;
+    if ((r & 7) == 4 || (r & 7) == 5)   /* rsp/rbp base needs SIB/disp */
+        diag_fatal(file, line, "asm: memory base %%rsp/%%rbp unsupported "
+                   "in \"%s\"", tmpl);
+    return r;
+}
+
 /* Assemble an extended-asm template into machine bytes, now that every
  * operand has a register (opregs[N] is the register of %N — outputs first,
  * then inputs, as gcc numbers them). EmbCC has no general text assembler,
- * only the small vocabulary real low-level userland C needs: `int $imm`
- * (the syscall trap), `cpuid`, `rdrand %N`, and `setc %N`. Anything else is
- * refused loudly (THE RULE). */
+ * only the vocabulary real low-level C needs — the syscall trap plus the
+ * kernel's hardware instructions (port I/O, control/segment/MSR access,
+ * fences, TLB, descriptor tables). Anything else is refused loudly. */
 static void asm_assemble(struct ir_func *fn, struct stmt *s,
                          const int *opregs, int nops, struct ir_asm *ia)
 {
@@ -1318,11 +1385,141 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             code[n++] = 0x0f;
             code[n++] = 0x51;
             code[n++] = (unsigned char)(0xc0 | ((d & 7) << 3) | (s & 7));
+        }
+        /* ---- fixed-form instructions (no encoded operands) ---- */
+        else if (mlen == 3 && strncmp(m, "cli", 3) == 0) { code[n++] = 0xfa; }
+        else if (mlen == 3 && strncmp(m, "sti", 3) == 0) { code[n++] = 0xfb; }
+        else if (mlen == 3 && strncmp(m, "hlt", 3) == 0) { code[n++] = 0xf4; }
+        else if (mlen == 3 && strncmp(m, "nop", 3) == 0) { code[n++] = 0x90; }
+        else if (mlen == 5 && strncmp(m, "pause", 5) == 0) {
+            code[n++] = 0xf3; code[n++] = 0x90;
+        } else if (mlen == 6 && strncmp(m, "mfence", 6) == 0) {
+            code[n++] = 0x0f; code[n++] = 0xae; code[n++] = 0xf0;
+        } else if (mlen == 6 && strncmp(m, "lfence", 6) == 0) {
+            code[n++] = 0x0f; code[n++] = 0xae; code[n++] = 0xe8;
+        } else if (mlen == 6 && strncmp(m, "sfence", 6) == 0) {
+            code[n++] = 0x0f; code[n++] = 0xae; code[n++] = 0xf8;
+        } else if (mlen == 6 && strncmp(m, "wbinvd", 6) == 0) {
+            code[n++] = 0x0f; code[n++] = 0x09;
+        } else if (mlen == 5 && strncmp(m, "rdtsc", 5) == 0) {
+            code[n++] = 0x0f; code[n++] = 0x31;
+        } else if (mlen == 5 && strncmp(m, "rdmsr", 5) == 0) {
+            code[n++] = 0x0f; code[n++] = 0x32;
+        } else if (mlen == 5 && strncmp(m, "wrmsr", 5) == 0) {
+            code[n++] = 0x0f; code[n++] = 0x30;
+        } else if (mlen == 6 && strncmp(m, "fninit", 6) == 0) {
+            code[n++] = 0xdb; code[n++] = 0xe3;
+        } else if (mlen == 6 && strncmp(m, "pushfq", 6) == 0) {
+            code[n++] = 0x9c;
+        } else if (mlen == 5 && strncmp(m, "popfq", 5) == 0) {
+            code[n++] = 0x9d;
+        }
+        /* ---- port I/O: al/ax/eax with dx, both operands fixed by the
+         * constraints ("a" and "Nd"), so the opcode alone encodes it ---- */
+        else if (mlen == 4 && strncmp(m, "outb", 4) == 0) { code[n++] = 0xee; }
+        else if (mlen == 4 && strncmp(m, "outw", 4) == 0) {
+            code[n++] = 0x66; code[n++] = 0xef;
+        } else if (mlen == 4 && strncmp(m, "outl", 4) == 0) { code[n++] = 0xef; }
+        else if (mlen == 3 && strncmp(m, "inb", 3) == 0) { code[n++] = 0xec; }
+        else if (mlen == 3 && strncmp(m, "inw", 3) == 0) {
+            code[n++] = 0x66; code[n++] = 0xed;
+        } else if (mlen == 3 && strncmp(m, "inl", 3) == 0) { code[n++] = 0xed; }
+        /* ---- pop/push %N (64-bit) ---- */
+        else if (mlen == 3 && strncmp(m, "pop", 3) == 0) {
+            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg >= 8) code[n++] = 0x41;                /* REX.B */
+            code[n++] = (unsigned char)(0x58 | (reg & 7));
+        } else if (mlen == 4 && strncmp(m, "push", 4) == 0) {
+            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg >= 8) code[n++] = 0x41;
+            code[n++] = (unsigned char)(0x50 | (reg & 7));
+        }
+        /* ---- str/ltr %N (task register; r/m16) ---- */
+        else if (mlen == 3 && strncmp(m, "str", 3) == 0) {
+            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg >= 8) code[n++] = 0x41;
+            code[n++] = 0x0f; code[n++] = 0x00;
+            code[n++] = (unsigned char)(0xc8 | (reg & 7));   /* /1 */
+        } else if (mlen == 3 && strncmp(m, "ltr", 3) == 0) {
+            if (reg < 0) reg = a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (reg >= 8) code[n++] = 0x41;
+            code[n++] = 0x0f; code[n++] = 0x00;
+            code[n++] = (unsigned char)(0xd8 | (reg & 7));   /* /3 */
+        }
+        /* ---- mov to/from a control register ---- */
+        else if (mlen == 3 && strncmp(m, "mov", 3) == 0) {
+            int cr, gpr, opcode;
+            if (reg >= 0) {                       /* mov %reg, %%crN */
+                gpr = reg;
+                a_comma(&p, file, line, tmpl);
+                cr = a_creg(&p, file, line, tmpl);
+                opcode = 0x22;                    /* mov crN, reg */
+            } else {                              /* mov %%crN, %reg */
+                cr = a_creg(&p, file, line, tmpl);
+                a_comma(&p, file, line, tmpl);
+                gpr = a_opreg(&p, opregs, nops, file, line, tmpl);
+                opcode = 0x20;                    /* mov reg, crN */
+            }
+            int rex = 0x40 | (gpr >= 8 ? 1 : 0) | (cr >= 8 ? 4 : 0);
+            if (rex != 0x40) code[n++] = (unsigned char)rex;
+            code[n++] = 0x0f;
+            code[n++] = (unsigned char)opcode;
+            code[n++] = (unsigned char)(0xc0 | ((cr & 7) << 3) | (gpr & 7));
+        }
+        /* ---- lgdt/lidt %N and invlpg (%N): a memory operand whose address
+         * is the register the "m"/"r" operand landed in ---- */
+        else if (mlen == 4 && strncmp(m, "lgdt", 4) == 0) {
+            int r = reg >= 0 ? reg
+                  : a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (r >= 8) code[n++] = 0x41;
+            code[n++] = 0x0f; code[n++] = 0x01;
+            code[n++] = (unsigned char)(0x10 | (r & 7));     /* /2 (%r) */
+        } else if (mlen == 4 && strncmp(m, "lidt", 4) == 0) {
+            int r = reg >= 0 ? reg
+                  : a_opreg(&p, opregs, nops, file, line, tmpl);
+            if (r >= 8) code[n++] = 0x41;
+            code[n++] = 0x0f; code[n++] = 0x01;
+            code[n++] = (unsigned char)(0x18 | (r & 7));     /* /3 (%r) */
+        } else if (mlen == 6 && strncmp(m, "invlpg", 6) == 0) {
+            int r = a_memreg(&p, opregs, nops, file, line, tmpl);
+            if (r >= 8) code[n++] = 0x41;
+            code[n++] = 0x0f; code[n++] = 0x01;
+            code[n++] = (unsigned char)(0x38 | (r & 7));     /* /7 (%r) */
+        }
+        /* ---- movdqa between xmm0 and memory (%N) ---- */
+        else if (mlen == 6 && strncmp(m, "movdqa", 6) == 0) {
+            a_ws(&p);
+            int to_mem = p[0] == '%' && p[1] == '%';   /* movdqa %%xmm0,(%N) */
+            int r;
+            if (to_mem) {
+                if (strncmp(p, "%%xmm0", 6) != 0)
+                    diag_fatal(file, line, "asm movdqa source must be "
+                               "%%%%xmm0 in \"%s\"", tmpl);
+                p += 6;
+                a_comma(&p, file, line, tmpl);
+                r = a_memreg(&p, opregs, nops, file, line, tmpl);
+            } else {                                   /* movdqa (%N),%%xmm0 */
+                r = a_memreg(&p, opregs, nops, file, line, tmpl);
+                a_comma(&p, file, line, tmpl);
+                a_ws(&p);
+                if (strncmp(p, "%%xmm0", 6) != 0)
+                    diag_fatal(file, line, "asm movdqa dest must be "
+                               "%%%%xmm0 in \"%s\"", tmpl);
+                p += 6;
+            }
+            code[n++] = 0x66;
+            if (r >= 8) code[n++] = 0x41;
+            code[n++] = 0x0f;
+            code[n++] = (unsigned char)(to_mem ? 0x7f : 0x6f);
+            code[n++] = (unsigned char)(r & 7);        /* mod00 reg=xmm0 rm=r */
         } else {
             diag_fatal(file, line,
-                       "asm instruction \"%.*s\" not supported "
-                       "(EmbCC assembles int/cpuid/rdrand/setc)", mlen, m);
+                       "asm instruction \"%.*s\" not supported", mlen, m);
         }
+        /* discard any operand text this mnemonic did not itself consume
+         * (a fixed-form instruction leaves its %N,%N in place) */
+        while (*p && *p != ';')
+            p++;
     }
     ia->code = code;
     ia->codelen = n;
