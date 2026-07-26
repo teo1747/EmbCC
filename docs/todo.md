@@ -102,13 +102,35 @@ yet honored on a stack slot).
 An empty translation unit yields a valid empty object.
 *(A freestanding `<string.h>` on the path is an integration matter.)*
 
-### Not language gaps, but required for a *bootable* kernel (codegen/ABI)
-The kernel is built with `-mcmodel=kernel -mno-red-zone -mno-sse -mno-mmx`
-(higher-half at `0xFFFFFFFF80000000`; interrupt-safe; no vector regs). EmbCC's
-CLI takes none of these today. The **kernel code model** (RIP-relative into the
-top 2 GB) and **no-red-zone** codegen are hard requirements for a kernel that
-boots — confirm EmbCC's default output already satisfies them, or add the flags.
-(Separate from the language items above.)
+### K10 — `-mno-sse` codegen (the ONE runtime blocker; kernel builds+links, then #UDs)
+
+*Empirically confirmed: all 88 kernel TUs compile, LINK with the kernel linker
+script into a valid higher-half `EXEC` (entry `0xffffffff8037bde0`), and it BOOTS
+and runs ring-0 higher-half code — so `-mcmodel=kernel` already works, no
+relocation or code-model problems. It dies with a `#UD` → triple fault at the
+first varargs call:*
+
+```
+v=06 (#UD) at kprintf+0x20:  f2 0f 11 85 ... movsd %xmm0,-0x130(%rbp)
+```
+
+The kernel is `-mno-sse -mno-mmx`, and SSE is not enabled in CR4 until `fpu_init`
+runs — so any SSE instruction before that faults. EmbCC emits SSE where GCC (with
+`-mno-sse`) does not. Whole-kernel disassembly shows this is **tiny and targeted
+— 18 SSE instructions total, zero float math**:
+- **16 `movsd`**: the System V varargs prologue spilling `xmm0..7` into the
+  register-save area (in `kprintf` and one other varargs fn). Under `-mno-sse`
+  this whole XMM save area is skipped (and callers must not set `AL`=xmm-count).
+- **2 `movdqa`**: a 16-byte aligned move (a struct/`memcpy` lowering) — should use
+  general-purpose `mov`s under `-mno-sse`.
+
+**Fix: a `-mno-sse` mode** (a) no XMM spill in the varargs prologue, (b) never
+lower struct copies / anything to SSE. That's the last thing between EmbCC and a
+booting self-compiled kernel. (`-mno-red-zone` not yet exercised — the `#UD`
+comes first; worth confirming once SSE is off, since the kernel takes interrupts.)
+
+*Repro (from `myos/`): compile every `KERNEL_SRC` with `embcc -c … -Ikernel`,
+link `x86_64-elf-ld -T kernel/linker.ld` with the nasm objects, boot.*
 
 ---
 
