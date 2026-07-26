@@ -255,9 +255,15 @@ explicitly, e.g. `%%rdi`/`%%rsi`/`%%rdx` here) from the operand allocator's free
 set, so no `"r"` operand is ever placed in one. This is the last thing between
 the self-compiled kernel and userspace / the desktop.
 
-*(Minor K1 follow-ups spotted alongside, not on the boot path — note for later:
-`addq`/other ALU ops aren't accepted in inline asm yet, and neither is the
-`movq %reg, (%mem)` store form — an operand register into a memory operand.)*
+*(K1 follow-ups spotted alongside — **now DONE**: inline-asm memory operands
+`movq disp(%base), %dst` and the store reverse `movq %src, disp(%base)` (incl.
+rbp/rsp/r12/r13 SIB / forced-disp bases), plus the ALU ops add/sub/and/or/xor/
+cmp in `%src,%dst` and `$imm,%dst` (imm8/imm32, 64- and 32-bit) forms. Every
+encoding byte-compared to gas; gcc-refereed exec test `tests/exec/asm-mem-alu.c`
++ extended `tests/golden/inline-asm-kernel.sh`. Remaining known gap, NOT on the
+boot path: a `+r` read-write operand's read side isn't wired — sema accepts `+`
+but treats it as output-only, so the initial value isn't loaded. The kernel
+uses no `+` constraints; deferred.)*
 
 </details>
 

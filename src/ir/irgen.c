@@ -1324,6 +1324,28 @@ static int a_regname(const char **p, const char *file, int line,
     return best;
 }
 
+static int asm_phys_reg(const char *nm, int len);   /* fwd: any-width mapper */
+
+/* Read a `%%reg` of ANY width (rax/eax/ax/al, r8/r8d/r8w/r8b, …), returning
+ * its physical number 0..15. Unlike a_regname (64-bit spellings only) this is
+ * for instructions whose operand size comes from a suffix, not the reg name
+ * (the ALU ops' 'l'/'q' forms). */
+static int a_reg_any(const char **p, const char *file, int line,
+                     const char *tmpl)
+{
+    a_ws(p);
+    if ((*p)[0] != '%' || (*p)[1] != '%')
+        diag_fatal(file, line, "asm: expected a %%%%register in \"%s\"", tmpl);
+    const char *q = *p + 2;
+    const char *e = q;
+    while ((*e >= 'a' && *e <= 'z') || (*e >= '0' && *e <= '9')) e++;
+    int r = asm_phys_reg(q, (int)(e - q));
+    if (r < 0)
+        diag_fatal(file, line, "asm: unsupported register in \"%s\"", tmpl);
+    *p = e;
+    return r;
+}
+
 /* Read an immediate `$N` (decimal or 0x hex), returning its value. */
 static long a_imm(const char **p, const char *file, int line, const char *tmpl)
 {
@@ -1370,6 +1392,114 @@ static int a_memreg(const char **p, const int *opregs,
     return r;
 }
 
+/* Is the operand at *p a memory reference (`disp(%base)` / `(%base)`) rather
+ * than a register/immediate? True iff a '(' appears before the operand ends
+ * — a %N, %%reg, or $imm never contains one. */
+static int a_is_mem(const char *p)
+{
+    while (*p == ' ' || *p == '\t') p++;
+    for (; *p && *p != ',' && *p != '\n' && *p != '\r' && *p != ';'; p++)
+        if (*p == '(') return 1;
+    return 0;
+}
+
+/* Parse `disp(%base)` (disp optional, decimal or 0x-hex, optional sign); base
+ * is %N or %%regname. Returns the base register, displacement via *disp_out. */
+static int a_mem(const char **p, const int *opregs, const char *const *opnames,
+                 int nops, const char *file, int line, const char *tmpl,
+                 long *disp_out)
+{
+    a_ws(p);
+    long disp = 0;
+    if (**p != '(') {
+        int neg = 0;
+        if (**p == '-') { neg = 1; (*p)++; }
+        else if (**p == '+') (*p)++;
+        int base = 10;
+        if ((*p)[0] == '0' && ((*p)[1] == 'x' || (*p)[1] == 'X')) {
+            base = 16; *p += 2;
+        }
+        int got = 0;
+        for (;; (*p)++) {
+            int d;
+            if (**p >= '0' && **p <= '9') d = **p - '0';
+            else if (base == 16 && **p >= 'a' && **p <= 'f') d = **p - 'a' + 10;
+            else if (base == 16 && **p >= 'A' && **p <= 'F') d = **p - 'A' + 10;
+            else break;
+            disp = disp * base + d; got = 1;
+        }
+        if (!got)
+            diag_fatal(file, line, "asm: expected a displacement or `(` in "
+                       "\"%s\"", tmpl);
+        if (neg) disp = -disp;
+        a_ws(p);
+    }
+    if (**p != '(')
+        diag_fatal(file, line, "asm: expected `(%%base)` in \"%s\"", tmpl);
+    (*p)++;
+    a_ws(p);
+    int r = (**p == '%' && (*p)[1] == '%')
+          ? a_regname(p, file, line, tmpl)
+          : a_opreg(p, opregs, opnames, nops, file, line, tmpl);
+    a_ws(p);
+    if (**p != ')')
+        diag_fatal(file, line, "asm: unterminated `(%%base)` in \"%s\"", tmpl);
+    (*p)++;
+    *disp_out = disp;
+    return r;
+}
+
+/* Emit ModRM (+SIB +disp) for a memory operand [base+disp] with `reg_field`
+ * (0..15; only its low 3 bits go in ModRM, the caller puts bit 3 in REX.R).
+ * Handles rsp/r12 (needs a SIB) and rbp/r13 (has no disp-less form). Returns
+ * the new code length. REX is emitted by the caller. */
+static int emit_mem_modrm(unsigned char *code, int n, int reg_field,
+                          int base, long disp)
+{
+    int b = base & 7;
+    int need_sib   = (b == 4);   /* rsp/r12: escape to SIB */
+    int force_disp = (b == 5);   /* rbp/r13: no mod=00 form, use disp8=0 */
+    int mod;
+    if (disp == 0 && !force_disp)          mod = 0;
+    else if (disp >= -128 && disp <= 127)  mod = 1;
+    else                                   mod = 2;
+    code[n++] = (unsigned char)((mod << 6) | ((reg_field & 7) << 3) |
+                                (need_sib ? 4 : b));
+    if (need_sib)   /* scale=0, index=none(4), base=b */
+        code[n++] = (unsigned char)((0 << 6) | (4 << 3) | b);
+    if (mod == 1)
+        code[n++] = (unsigned char)disp;
+    else if (mod == 2)
+        for (int i = 0; i < 4; i++)
+            code[n++] = (unsigned char)(disp >> (8 * i));
+    return n;
+}
+
+/* Match an ALU mnemonic (add/sub/and/or/xor/cmp, optional 'q'/'l' suffix).
+ * On a hit fills *rr (the reg,reg opcode), *ext (the /digit for the $imm form)
+ * and *w (1 = 64-bit REX.W, 0 = 32-bit) and returns 1; else returns 0. */
+static int asm_alu_lookup(const char *m, int mlen, int *rr, int *ext, int *w)
+{
+    static const struct { const char *n; int rr, ext; } alu[] = {
+        {"add",0x01,0}, {"or",0x09,1}, {"and",0x21,4},
+        {"sub",0x29,5}, {"xor",0x31,6}, {"cmp",0x39,7},
+    };
+    for (unsigned i = 0; i < sizeof alu / sizeof alu[0]; i++) {
+        int ln = (int)strlen(alu[i].n);
+        int width = -1;
+        if (mlen == ln && strncmp(m, alu[i].n, (size_t)ln) == 0)
+            width = 1;
+        else if (mlen == ln + 1 && strncmp(m, alu[i].n, (size_t)ln) == 0) {
+            if (m[ln] == 'q') width = 1;
+            else if (m[ln] == 'l') width = 0;
+        }
+        if (width < 0) continue;
+        *rr = alu[i].rr; *ext = alu[i].ext; *w = width;
+        return 1;
+    }
+    return 0;
+}
+
 /* Assemble an extended-asm template into machine bytes, now that every
  * operand has a register (opregs[N] is the register of %N — outputs first,
  * then inputs, as gcc numbers them). EmbCC has no general text assembler,
@@ -1407,6 +1537,7 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
 
         /* one operand reg for the instructions that take a %N */
         int reg = -1;
+        int alu_rr = 0, alu_ext = 0, alu_w = 0;  /* filled by asm_alu_lookup */
         if (*p == '%' && p[1] >= '0' && p[1] <= '9') {
             p++;
             int idx = 0;
@@ -1669,6 +1800,21 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                 src_reg = reg;                        /* pre-parsed %N */
             } else {
                 a_ws(&p);
+                if (a_is_mem(p)) {                    /* mov disp(%base), %dst */
+                    long disp;
+                    int base = a_mem(&p, opregs, opnames, nops, file, line,
+                                     tmpl, &disp);
+                    a_comma(&p, file, line, tmpl);
+                    a_ws(&p);
+                    int dst = (p[0] == '%' && p[1] == '%')
+                            ? a_regname(&p, file, line, tmpl)
+                            : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
+                    code[n++] = (unsigned char)(0x48 | (dst >= 8 ? 4 : 0) |
+                                                (base >= 8 ? 1 : 0));
+                    code[n++] = 0x8b;                 /* mov r64, r/m64 (load) */
+                    n = emit_mem_modrm(code, n, dst, base, disp);
+                    goto asm_next;
+                }
                 if (p[0] == '$') {
                     src_imm = a_imm(&p, file, line, tmpl);
                     src_imm_valid = 1;
@@ -1694,8 +1840,19 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
             }
             a_comma(&p, file, line, tmpl);
             a_ws(&p);
-            /* --- destination: a control register, or a GPR --- */
-            if (p[0] == '%' && p[1] == '%' && p[2] == 'c' && p[3] == 'r') {
+            /* --- destination: memory, a control register, or a GPR --- */
+            if (a_is_mem(p)) {                        /* mov %src, disp(%base) */
+                if (src_imm_valid)
+                    diag_fatal(file, line, "asm: mov $imm to memory unsupported "
+                               "in \"%s\"", tmpl);
+                long disp;
+                int base = a_mem(&p, opregs, opnames, nops, file, line, tmpl,
+                                 &disp);
+                code[n++] = (unsigned char)(0x48 | (src_reg >= 8 ? 4 : 0) |
+                                            (base >= 8 ? 1 : 0));
+                code[n++] = 0x89;                     /* mov r/m64, r64 (store) */
+                n = emit_mem_modrm(code, n, src_reg, base, disp);
+            } else if (p[0] == '%' && p[1] == '%' && p[2] == 'c' && p[3] == 'r') {
                 int cr = a_creg(&p, file, line, tmpl);      /* mov %reg,%%crN */
                 int rex = 0x40 | (src_reg >= 8) | (cr >= 8 ? 4 : 0);
                 if (rex != 0x40) code[n++] = (unsigned char)rex;
@@ -1731,6 +1888,46 @@ static void asm_assemble(struct ir_func *fn, struct stmt *s,
                 }
             }
             asm_next: ;
+        }
+        /* ---- ALU ops: add/sub/and/or/xor/cmp, `%src,%dst` or `$imm,%dst`.
+         * Suffix 'q' or none = 64-bit (REX.W); 'l' = 32-bit. Register operands
+         * only (no memory form yet — kernel inline asm doesn't need it). ---- */
+        else if (asm_alu_lookup(m, mlen, &alu_rr, &alu_ext, &alu_w)) {
+            a_ws(&p);
+            /* `reg` holds a leading %N already consumed by the top-level
+             * pre-parse; a $imm source leaves reg == -1. */
+            if (reg < 0 && p[0] == '$') {             /* op $imm, %dst */
+                long imm = a_imm(&p, file, line, tmpl);
+                a_comma(&p, file, line, tmpl);
+                a_ws(&p);
+                int dst = (p[0] == '%' && p[1] == '%')
+                        ? a_reg_any(&p, file, line, tmpl)
+                        : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
+                int use8 = imm >= -128 && imm <= 127;
+                int rex = (alu_w ? 0x48 : 0x40) | (dst >= 8 ? 1 : 0);
+                if (alu_w || dst >= 8) code[n++] = (unsigned char)rex;
+                code[n++] = (unsigned char)(use8 ? 0x83 : 0x81);
+                code[n++] = (unsigned char)(0xc0 | (alu_ext << 3) | (dst & 7));
+                if (use8) code[n++] = (unsigned char)imm;
+                else for (int b = 0; b < 4; b++)
+                    code[n++] = (unsigned char)(imm >> (8 * b));
+            } else {                                  /* op %src, %dst */
+                int src = reg >= 0 ? reg
+                        : (p[0] == '%' && p[1] == '%')
+                        ? a_reg_any(&p, file, line, tmpl)
+                        : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
+                a_comma(&p, file, line, tmpl);
+                a_ws(&p);
+                int dst = (p[0] == '%' && p[1] == '%')
+                        ? a_reg_any(&p, file, line, tmpl)
+                        : a_opreg(&p, opregs, opnames, nops, file, line, tmpl);
+                int rex = (alu_w ? 0x48 : 0x40) | (src >= 8 ? 4 : 0) |
+                          (dst >= 8 ? 1 : 0);
+                if (alu_w || src >= 8 || dst >= 8)
+                    code[n++] = (unsigned char)rex;
+                code[n++] = (unsigned char)alu_rr;
+                code[n++] = (unsigned char)(0xc0 | ((src & 7) << 3) | (dst & 7));
+            }
         }
         /* ---- lgdt/lidt %N and invlpg (%N): a memory operand whose address
          * is the register the "m"/"r" operand landed in ---- */

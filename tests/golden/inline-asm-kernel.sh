@@ -62,6 +62,16 @@ long f_syscall(void){
                      : "=a"(r) : [b]"i"(&m[0]), [n]"i"(sizeof m - 1)
                      : "rsi","rdx","rcx","r11","memory");
     return r; }
+/* memory operand loads/stores: `movq disp(%base), %dst` and the reverse,
+ * including rbp/rsp/r12/r13 bases (SIB / forced-disp encodings). */
+u64  f_memld(u64 *p){ u64 r; __asm__ volatile("movq 8(%1), %0":"=r"(r):"r"(p)); return r; }
+void f_memst(u64 *p,u64 v){ __asm__ volatile("movq %1, 16(%0)"::"r"(p),"r"(v):"memory"); }
+/* ALU ops: reg,reg and $imm,reg (imm8 and imm32), 64- and 32-bit. */
+u64  f_alu(u64 a,u64 b){ u64 r=a;
+    __asm__ volatile("addq %1, %0\n" "subq %1, %0\n" "andq %1, %0\n"
+                     "orq %1, %0\n" "xorq %1, %0\n" "cmpq %1, %0\n"
+                     "addq $7, %0\n" "addq $0x12345, %0\n"
+                     :"+r"(r):"r"(b)); return r; }
 int main(void){ return 42; }
 EOF
 
@@ -81,7 +91,9 @@ for want in cli sti hlt pause mfence lfence sfence wbinvd rdtsc rdmsr wrmsr \
             pushf 'mov +%rax,%cr0' 'mov +%cr2,%rax' 'out +%al' 'in +.*%al' \
             invlpg lidt lgdt str ltr movdqa iretq 'mov +\$0x1,%rax' \
             lretq 'lea +0x3\(%rip\)' 'mov +\$0x10,%ax' 'mov +%eax,%ds' \
-            'int +\$0x80'; do
+            'int +\$0x80' 'mov +0x8\(%r..\),%r' 'mov +%r.*,0x10\(%r' \
+            'add +%r' 'sub +%r' 'and +%r' 'xor +%r' 'cmp +%r' \
+            'add +\$0x7,' 'add +\$0x12345,'; do
     printf '%s\n' "$dis" | grep -Eq "$want" || {
         echo "missing expected instruction: $want"; exit 1; }
 done
