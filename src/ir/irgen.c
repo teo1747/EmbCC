@@ -313,6 +313,10 @@ static int emit_cmp(struct ir_func *fn, enum binop pred, int a, int b,
 
 static int gen_expr(struct ir_func *fn, struct expr *e);
 static int gen_complit(struct ir_func *fn, struct expr *e);
+struct loopctx;
+static void gen_stmt(struct ir_func *fn, struct stmt *s,
+                     const struct loopctx *loop);
+static int gen_stmtexpr(struct ir_func *fn, struct expr *e);
 
 /* va_arg(ap, T) for an INTEGER-class T (SysV). ap's value is a pointer to
  * a __va_list_tag { gp_offset u32, fp_offset u32, overflow_arg_area ptr,
@@ -851,6 +855,8 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
     }
     case EXPR_SIZEOF:
         break; /* folded to EXPR_NUM by sema; unreachable */
+    case EXPR_STMTEXPR:
+        return gen_stmtexpr(fn, e);
     case EXPR_VA_ARG:
         return gen_va_arg(fn, e);
     case EXPR_BINOP: {
@@ -1855,6 +1861,32 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             break;
         }
     }
+}
+
+/* A GNU statement expression `({ s1; s2; ...; last })`: emit every statement,
+ * and if the last is an expression statement yield its VALUE (a plain
+ * STMT_EXPR would discard it). break/continue at the block's own level were
+ * rejected by sema, so a dummy loop context suffices for the prefix. */
+static int gen_stmtexpr(struct ir_func *fn, struct expr *e)
+{
+    static const struct loopctx none = { -1, -1 };
+    struct stmt *body = e->body->body;   /* the block's statement list */
+    struct stmt *last = NULL, *prev = NULL;
+    for (struct stmt *s = body; s; s = s->next) {
+        if (s->next)
+            prev = s;
+        last = s;
+    }
+    if (last && last != body) {          /* emit all but the last statement */
+        prev->next = NULL;
+        gen_stmt(fn, body, &none);
+        prev->next = last;
+    }
+    if (last && last->kind == STMT_EXPR && last->expr)
+        return gen_expr(fn, last->expr); /* the block's value */
+    if (last)
+        gen_stmt(fn, last, &none);       /* a non-value last statement */
+    return -1;
 }
 
 /* -g: record one source variable. Skips the unnamed (prototype params never

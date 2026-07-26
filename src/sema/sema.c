@@ -266,6 +266,9 @@ static void lower_static_bytes(struct unit *u, int line, int size,
                                struct initelem *v, int n,
                                const char **out_bytes,
                                struct greloc **out_rel, int *out_nrel);
+static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
+                       struct stmt *s, int in_loop, int in_switch,
+                       int at_sw_level);
 
 /* Nonzero while lowering a static initializer (a file-scope global or a
  * static local). A compound literal met here has static storage: it becomes
@@ -541,6 +544,18 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         } else {
             e->ty = ty;
         }
+        break;
+    }
+    case EXPR_STMTEXPR: {
+        /* GNU statement expression: check the block, then its value is the
+         * last statement when that is an expression statement, else void.
+         * The block shares the function's flat scope (as any block does). */
+        check_stmt(u, f, sc, e->body, 0, 0, 0);
+        struct stmt *last = NULL;
+        for (struct stmt *s = e->body->body; s; s = s->next)
+            last = s;
+        e->ty = (last && last->kind == STMT_EXPR && last->expr)
+              ? last->expr->ty : ty_base(TY_VOID, 0);
         break;
     }
     case EXPR_GENERIC: {

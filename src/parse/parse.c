@@ -120,6 +120,7 @@ static struct type *parse_array_dims(struct parser *ps, struct type *t);
 static struct type *parse_type_spec(struct parser *ps, int allow_body);
 static void parse_static_assert(struct parser *ps);
 static struct expr *parse_initializer(struct parser *ps);
+static struct stmt *parse_block(struct parser *ps);
 
 /* Declarator over a base type: leading stars, then either the function-
  * pointer form '( * [*...] [name] [dims] ) ( params )' or a plain
@@ -844,6 +845,14 @@ static struct expr *parse_primary(struct parser *ps)
     }
     case TOK_LPAREN:
         advance(ps);
+        if (cur(ps)->kind == TOK_LBRACE) {
+            /* GNU statement expression `({ ... })`: the block's value is its
+             * last statement when that is an expression statement. */
+            e = new_expr(EXPR_STMTEXPR, t->line);
+            e->body = parse_block(ps);
+            expect(ps, TOK_RPAREN, "')' to close a statement expression");
+            return e;
+        }
         e = parse_comma(ps);
         expect(ps, TOK_RPAREN, "')'");
         return e;
