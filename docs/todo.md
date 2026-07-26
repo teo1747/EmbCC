@@ -288,6 +288,20 @@ correctly leaves alone). Deep overflow path now tiny: `vfs_read` 160 B,
 `ata_read_dma` 144 B. Suite 90/90 (incl. new gcc-refereed `slot-reuse.c` stress
 test at -O0 and -O1), self-host deterministic, kernel 89/89 compile clean.
 
+🎉 **END-TO-END CONFIRMED (myos):** the self-compiled kernel now boots to the
+**home desktop in the STOCK 16 KiB kernel stack** — `home.elf` pid 4, compositor
+window, Clock widget first frame — with **zero kernel changes** (the diagnostic
+KSTACK bump was reverted). *"Self-hosting for C, but the kernel wants GCC"* is
+retired: the OS's own compiler compiles the OS's kernel and it runs.
+
+*Residual tail (NOT on the boot path — desktop is fine): a few mega-functions
+still carry EmbCC frames 3–5× GCC's, so those specific ops would overflow if
+called deep — `shell_handle_process_command` embcc 82 KB vs gcc 16.5 KB,
+`selftests_handle_command` 25 KB vs 8 KB. (`tui_lines_procs` is genuine: gcc
+`0x3f08` ≈ embcc `0x3fd0`.) Coalescing helps most functions but leaves these huge
+ones — likely needs cross-block coalescing or light register allocation. Not
+blocking; the boot-to-desktop path runs stock.*
+
 <details><summary>original triage (kept for context)</summary>
 
 *With K12 in, the self-compiled kernel boots ALL the way through init, the
