@@ -200,6 +200,48 @@ between the self-compiled kernel and reaching the desktop.
 
 </details>
 
+### K12 — inline-asm operand allocator must EXCLUDE clobbered registers (next blocker)
+
+*With aligned(N) honored (K11), the self-compiled kernel boots even further —
+past the first context switch — then `#GP`s on the `iretq` that launches the
+first ring-3 process (`process_trampoline`), i.e. right as it would start
+`init`/`home`.*
+
+Root cause: an inline-asm `"r"` operand is allocated to a register named in the
+**clobber list**, and the asm's own instructions destroy it before it's used.
+`process_trampoline` builds the iret frame with 7 `"r"` operands and clobbers
+`rdi`,`rdx`:
+
+```c
+"movq %6, %%rdx\n"     /* envp -> rdx (rdx is clobbered) */
+"pushq %2\n"           /* cs=0x23 ... but %2 was allocated to rdx! */
+"iretq\n"
+: : ... "r"((uint64_t)(0x20|3)) /*=%2 cs*/ ... "r"(envp) /*=%6*/
+: "rdi", "rdx", "memory"
+```
+
+EmbCC put `%2` (cs) in `rdx`; the `movq %6,%%rdx` overwrites it with `envp`, so
+`push %2` pushes `envp` as **CS** → `iretq` faults. Minimal host repro (7 ops,
+clobber `rdi`/`rdx`) — EmbCC emits `push %rdx` for the operand despite the
+clobber; gcc never does:
+
+```c
+void f(unsigned long o0,unsigned long o1,unsigned long o2,unsigned long o3,
+       unsigned long o4,unsigned long o5,unsigned long o6){
+  __asm__ volatile("movq %4,%%rdi\n movq %5,%%rsi\n movq %6,%%rdx\n"
+                   "pushq %0\n pushq %1\n pushq %2\n pushq %3\n"
+   : : "r"(o0),"r"(o1),"r"(o2),"r"(o3),"r"(o4),"r"(o5),"r"(o6)
+   : "rdi","rdx","memory"); }        /* embcc: 'push %rdx' for %2 — the bug */
+```
+
+**Fix:** remove clobber-list registers (and any register the template writes
+explicitly, e.g. `%%rdi`/`%%rsi`/`%%rdx` here) from the operand allocator's free
+set, so no `"r"` operand is ever placed in one. This is the last thing between
+the self-compiled kernel and userspace / the desktop.
+
+*(Minor K1 follow-up spotted alongside: `addq` — and presumably other ALU ops —
+aren't accepted in inline asm yet. Not on the boot path; note for later.)*
+
 ---
 
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
