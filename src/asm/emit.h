@@ -103,6 +103,8 @@ void x86_bswap(struct code *c, int size);
 void x86_mfence(struct code *c);
 void x86_ud2(struct code *c);
 void x86_xchg_rax_mem_rcx(struct code *c, int size);
+void x86_lock_xadd_rcx(struct code *c, int size);
+void x86_lock_cmpxchg_rcx(struct code *c, int size);
 
 /* cmp eax/rax with a slot, then set al by condition and zero-extend.
  * cc is the setcc opcode byte (0x92..0x9f), chosen by codegen. */

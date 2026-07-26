@@ -532,6 +532,29 @@ void x86_xchg_rax_mem_rcx(struct code *c, int size)
     code_byte(c, 0x01); /* ModRM: [rcx] <-> eax/rax */
 }
 
+/* lock xadd %rax/eax/ax/al, (%rcx): atomically *rcx += rax, rax = old *rcx. */
+void x86_lock_xadd_rcx(struct code *c, int size)
+{
+    code_byte(c, 0xf0);                       /* LOCK */
+    if (size == 2) code_byte(c, 0x66);
+    if (size == 8) code_byte(c, 0x48);        /* REX.W */
+    code_byte(c, 0x0f);
+    code_byte(c, size == 1 ? 0xc0 : 0xc1);
+    code_byte(c, 0x01);                       /* ModRM: reg=rax, [rcx] */
+}
+
+/* lock cmpxchg %rdx/edx/dx/dl, (%rcx): compare RAX with *rcx; if equal set
+ * *rcx = RDX and ZF, else load *rcx into RAX and clear ZF. Atomic. */
+void x86_lock_cmpxchg_rcx(struct code *c, int size)
+{
+    code_byte(c, 0xf0);                       /* LOCK */
+    if (size == 2) code_byte(c, 0x66);
+    if (size == 8) code_byte(c, 0x48);        /* REX.W */
+    code_byte(c, 0x0f);
+    code_byte(c, size == 1 ? 0xb0 : 0xb1);
+    code_byte(c, 0x11);                       /* ModRM: reg=rdx, [rcx] */
+}
+
 void x86_not_eax(struct code *c, int w)
 {
     rexw(c, w);

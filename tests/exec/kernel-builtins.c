@@ -26,6 +26,19 @@ int main(void) {
     long b = 7;
     if (__atomic_exchange_n(&b, 9, 5) != 7 || b != 9) return 8;
 
+    /* fetch-add/sub return the OLD value and update in place */
+    int cnt = 10;
+    if (__atomic_fetch_add(&cnt, 5, 5) != 10 || cnt != 15) return 9;
+    if (__atomic_fetch_sub(&cnt, 3, 5) != 15 || cnt != 12) return 10;
+
+    /* compare-exchange: swap on match (true), else load actual into expected */
+    int v = 12, exp = 12;
+    if (!__atomic_compare_exchange_n(&v, &exp, 99, 0, 5, 5) ||
+        v != 99 || exp != 12) return 11;
+    exp = 50;
+    if (__atomic_compare_exchange_n(&v, &exp, 7, 0, 5, 5) ||
+        v != 99 || exp != 99) return 12;
+
     __sync_synchronize();
     return 42;
 }

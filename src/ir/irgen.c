@@ -1112,6 +1112,38 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
             i->dst = new_temp(fn);
             return i->dst;
         }
+        if (e->name && (strcmp(e->name, "__atomic_fetch_add") == 0 ||
+                        strcmp(e->name, "__atomic_fetch_sub") == 0)) {
+            int w = ty_w(e->ty);
+            int addr = gen_expr(fn, e->args[0]);
+            int val = gen_expr(fn, e->args[1]);
+            if (strcmp(e->name, "__atomic_fetch_sub") == 0)  /* add of -val */
+                val = emit_bin(fn, IR_SUB, emit_const(fn, 0, w), val, w, 1);
+            struct ir_ins *i = emit(fn);
+            i->op = IR_XADD;
+            i->a = addr;
+            i->b = val;
+            i->size = ty_size(e->ty);
+            i->w = w;
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
+        if (e->name && strcmp(e->name, "__atomic_compare_exchange_n") == 0) {
+            /* evaluate the operands BEFORE emitting the instruction that
+             * consumes them (emit() reserves the slot in stream order) */
+            int obj = gen_expr(fn, e->args[0]);   /* the object pointer */
+            int exp = gen_expr(fn, e->args[1]);   /* &expected */
+            int des = gen_expr(fn, e->args[2]);   /* desired value */
+            struct ir_ins *i = emit(fn);
+            i->op = IR_CMPXCHG;
+            i->a = obj;
+            i->b = exp;
+            i->c = des;
+            i->size = ty_size(e->args[0]->ty->pointee);
+            i->w = ty_w(e->args[0]->ty->pointee);
+            i->dst = new_temp(fn);
+            return i->dst;
+        }
         int args[MAX_PARAMS];
         int fptemp = -1;
         if (!e->callee) /* through a pointer: evaluate the callee */

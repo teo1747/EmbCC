@@ -62,6 +62,10 @@ enum ir_op {
     IR_FENCE, /* a full memory barrier (mfence; __sync_synchronize) */
     IR_UD2,   /* the undefined instruction (ud2; __builtin_unreachable) */
     IR_XCHG,  /* dst = *(temp a); *(temp a) = b   (atomic; size) */
+    IR_XADD,  /* dst = *(temp a); *(temp a) += b  (lock xadd; size) */
+    IR_CMPXCHG, /* CAS at *(a): compare against *(b), set to c on match;
+                 * dst = matched?1:0, and *(b) updated to the seen value.
+                 * (lock cmpxchg; size) */
     IR_ASM    /* extended asm: load inputs to fixed registers, assemble the
                * template, store outputs. Detail in ir_ins.asm_ir */
 };
@@ -90,6 +94,7 @@ struct ir_ins {
                               * if none — stamped by irgen, read only by the
                               * -g line-table pass in codegen */
     int dst, a, b;
+    int c;                   /* IR_CMPXCHG: the third operand (desired value) */
     int w;                   /* 4 or 8: operation width class */
     int size;                /* 1/2/4/8: memory width for LD/ST/EXT */
     int sign;                /* signed variant of the op */

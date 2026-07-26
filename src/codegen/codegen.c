@@ -497,6 +497,28 @@ static void gen_func(struct ir_func *fn, struct code *text,
             x86_xchg_rax_mem_rcx(text, i->size);         /* atomic; rax = old */
             cg_store(text, sd, i->dst, i->w);
             break;
+        case IR_XADD:
+            cg_reset();
+            x86_mov_rcx_slot(text, sd[i->a]);            /* address -> rcx */
+            x86_load_slot(text, sd[i->b], i->size, 0,
+                          i->size == 8 ? 8 : 4);         /* addend -> rax */
+            x86_lock_xadd_rcx(text, i->size);            /* atomic; rax = old */
+            cg_store(text, sd, i->dst, i->w);
+            break;
+        case IR_CMPXCHG:
+            cg_reset();
+            x86_load_slot(text, sd[i->c], i->size, 0,
+                          i->size == 8 ? 8 : 4);         /* desired -> rax.. */
+            x86_mov_reg_reg(text, REG_RDX, REG_RAX);     /* ..-> rdx */
+            x86_mov_rcx_slot(text, sd[i->a]);            /* object ptr -> rcx */
+            x86_load_slot(text, sd[i->b], 8, 0, 8);      /* &expected -> rax */
+            x86_mov_reg_reg(text, REG_RSI, REG_RAX);     /* save in rsi */
+            x86_load_reg_mem(text, REG_RAX, REG_RSI, 0, i->size); /* rax=*exp */
+            x86_lock_cmpxchg_rcx(text, i->size);         /* CAS; ZF=matched */
+            x86_store_mem_reg(text, REG_RSI, 0, REG_RAX, i->size);/* *exp=seen */
+            x86_setcc_eax(text, 0x94);                   /* setz: dst = matched */
+            cg_store(text, sd, i->dst, 4);
+            break;
         case IR_MEMCPY: {
             /* a struct copy: 8 bytes at a time, then the tail */
             cg_reset();

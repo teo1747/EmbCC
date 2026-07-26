@@ -941,16 +941,23 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
             (strcmp(e->lhs->name, "__atomic_load_n") == 0 ||
              strcmp(e->lhs->name, "__atomic_store_n") == 0 ||
-             strcmp(e->lhs->name, "__atomic_exchange_n") == 0)) {
+             strcmp(e->lhs->name, "__atomic_exchange_n") == 0 ||
+             strcmp(e->lhs->name, "__atomic_fetch_add") == 0 ||
+             strcmp(e->lhs->name, "__atomic_fetch_sub") == 0 ||
+             strcmp(e->lhs->name, "__atomic_compare_exchange_n") == 0)) {
             for (int i = 0; i < e->nargs; i++)
                 check_expr(u, f, sc, e->args[i]);
             if (e->nargs < 1 || e->args[0]->ty->kind != TY_PTR)
                 diag_fatal(u->file, e->line,
                            "%s needs a pointer first argument", e->lhs->name);
             e->name = e->lhs->name;
-            e->ty = strcmp(e->lhs->name, "__atomic_store_n") == 0
-                    ? ty_base(TY_VOID, 0)
-                    : e->args[0]->ty->pointee;
+            if (strcmp(e->lhs->name, "__atomic_store_n") == 0)
+                e->ty = ty_base(TY_VOID, 0);
+            else if (strcmp(e->lhs->name,
+                            "__atomic_compare_exchange_n") == 0)
+                e->ty = ty_base(TY_BOOL, 0);       /* did the swap happen? */
+            else
+                e->ty = e->args[0]->ty->pointee;
             break;
         }
         /* Direct when the callee is a name that is not a variable in

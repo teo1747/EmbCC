@@ -26,6 +26,7 @@ static int writes_temp(enum ir_op op)
     case IR_LDVAR: case IR_ADDR: case IR_STRADDR: case IR_GADDR:
     case IR_FADDR: case IR_LOAD: case IR_EXT: case IR_BSWAP:
     case IR_I2F: case IR_F2I: case IR_F2F: case IR_CALL: case IR_XCHG:
+    case IR_XADD: case IR_CMPXCHG:
         return 1;
     default:
         return 0;
@@ -75,8 +76,14 @@ static void each_read(struct ir_ins *i, void (*cb)(int *, void *), void *ctx)
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
     case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SHR:
     case IR_CMP: case IR_STORE: case IR_MEMCPY: case IR_XCHG:
+    case IR_XADD:
         cb(&i->a, ctx);
         cb(&i->b, ctx);
+        break;
+    case IR_CMPXCHG:
+        cb(&i->a, ctx);
+        cb(&i->b, ctx);
+        cb(&i->c, ctx);
         break;
     case IR_BRZ: case IR_BRNZ:
         cb(&i->a, ctx);
