@@ -267,7 +267,28 @@ uses no `+` constraints; deferred.)*
 
 </details>
 
-### K13 — stack usage: `-O0` frames are ~18× GCC's, overflowing the kernel stack
+### K13 — stack usage: `-O0` frames ~18× GCC's — **DONE** (temp slot coalescing)
+
+**RESOLVED (branch Teo).** EmbCC gave every temporary (vreg ≥ nvars) its own
+8-byte slot, never reused — so a deep call chain overflowed the 16 KiB kernel
+stack. Added **temporary stack-slot coalescing** in codegen (`coalesce_temps`):
+temps whose live ranges don't overlap share one slot. A temp is coalescable only
+when its whole live range lies in ONE basic block; such temps are packed by a
+linear scan over their `[first,last]` appearance interval (sound even across
+loop back-edges — each is reborn in its block per iteration). Temps that cross a
+block boundary (`?:`/`&&`/`||` results) keep a unique slot. The interval is the
+span of EVERY operand appearance via a blind field scan — over-counting only
+reduces reuse, never makes it unsound, so there's no per-op operand table to get
+wrong. Deterministic (self-host fixed point holds).
+
+Results: **`ata_read_dma` 1760 B → 144 B** (gcc: 96 B), **frames > 1 KB:
+331 → 46** (the rest are real local buffers — e.g. `sys_chan_recv`'s
+`uint8_t kbuf[CHAN_MSG_MAX_BYTES]` — which gcc sizes identically and coalescing
+correctly leaves alone). Deep overflow path now tiny: `vfs_read` 160 B,
+`ata_read_dma` 144 B. Suite 90/90 (incl. new gcc-refereed `slot-reuse.c` stress
+test at -O0 and -O1), self-host deterministic, kernel 89/89 compile clean.
+
+<details><summary>original triage (kept for context)</summary>
 
 *With K12 in, the self-compiled kernel boots ALL the way through init, the
 dynamic linker runs, and **userspace launches** (`home: launched
@@ -298,6 +319,8 @@ the same 16 KiB the GCC kernel uses.
 committed, per "don't change the kernel for an EmbCC gap": with a larger stack
 the self-compiled kernel runs past this. So this is the last codegen item; once
 EmbCC's stack usage drops, no kernel change is needed.)*
+
+</details>
 
 ---
 

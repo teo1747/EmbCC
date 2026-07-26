@@ -15,9 +15,147 @@
 
 #include "../driver/util.h"
 
+/* K13 — temporary stack-slot coalescing. At -O0 every temp (vreg >= nvars)
+ * otherwise gets its own 8-byte slot, never reused, so a deep call chain's
+ * frames overflow the kernel stack. This assigns each temp a 0-based index
+ * into a SHARED pool, letting temps whose live ranges don't overlap reuse one
+ * slot. *npool_out receives the pool size (distinct slots). Returns a malloc'd
+ * per-temp index array (length nvregs-nvars), or NULL if there are no temps.
+ *
+ * Soundness. A temp is "coalescable" only when its whole live range lies within
+ * ONE basic block (block ids below). For such temps a value defined at d and
+ * last used at u is dead everywhere outside [d,u] within a straight-line run,
+ * so two coalescable temps with disjoint [first,last] index ranges are never
+ * simultaneously live — even across loop back-edges (each is reborn inside its
+ * block every iteration). Temps that cross a block boundary (a `?:`/`&&`/`||`
+ * result, say) are NOT coalesced: they keep a unique slot. The interval is the
+ * span of EVERY appearance of the temp in ANY operand field — over-counting a
+ * range only shrinks reuse, never makes it unsound, so a blind field scan (no
+ * per-op operand table to get wrong) is deliberately used. Deterministic, which
+ * the self-host fixed point requires. */
+static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
+{
+    int nins = fn->nins, nvr = fn->nvregs;
+    int ntemp = nvr - nvars;
+    *npool_out = 0;
+    if (ntemp <= 0)
+        return NULL;
+
+    /* basic-block id per instruction: a new block begins at a label and after
+     * any branch/jump/return/ud2. */
+    int *blk = xmalloc((size_t)(nins ? nins : 1) * sizeof *blk);
+    int b = 0;
+    for (int i = 0; i < nins; i++) {
+        enum ir_op op = fn->ins[i].op;
+        if (op == IR_LABEL) b++;
+        blk[i] = b;
+        if (op == IR_JMP || op == IR_BRZ || op == IR_BRNZ ||
+            op == IR_RET || op == IR_UD2)
+            b++;
+    }
+
+    /* [first,last] instruction index over every appearance of each temp. */
+    int *first = xmalloc((size_t)ntemp * sizeof *first);
+    int *last  = xmalloc((size_t)ntemp * sizeof *last);
+    for (int k = 0; k < ntemp; k++) { first[k] = -1; last[k] = -1; }
+    for (int i = 0; i < nins; i++) {
+        struct ir_ins *in = &fn->ins[i];
+        int vs[4]; int nv = 0;
+        vs[nv++] = in->dst; vs[nv++] = in->a; vs[nv++] = in->b; vs[nv++] = in->c;
+        for (int j = 0; j < nv; j++) {
+            int v = vs[j];
+            if (v >= nvars && v < nvr) {
+                int k = v - nvars;
+                if (first[k] < 0) first[k] = i;
+                last[k] = i;
+            }
+        }
+        if (in->op == IR_CALL)
+            for (int a = 0; a < in->nargs; a++) {
+                int v = in->argv[a].vreg;
+                if (v >= nvars && v < nvr) {
+                    int k = v - nvars;
+                    if (first[k] < 0) first[k] = i;
+                    last[k] = i;
+                }
+            }
+        if (in->op == IR_ASM && in->asm_ir) {
+            struct ir_asm *ia = in->asm_ir;
+            for (int a = 0; a < ia->nin; a++) {
+                int v = ia->in[a].temp;
+                if (v >= nvars && v < nvr) {
+                    int k = v - nvars;
+                    if (first[k] < 0) first[k] = i;
+                    last[k] = i;
+                }
+            }
+            for (int a = 0; a < ia->nout; a++) {
+                int v = ia->out[a].temp;
+                if (v >= nvars && v < nvr) {
+                    int k = v - nvars;
+                    if (first[k] < 0) first[k] = i;
+                    last[k] = i;
+                }
+            }
+        }
+    }
+
+    /* order temps by first-appearance (ties by temp index), via buckets keyed
+     * on the first index — O(nins+ntemp) and deterministic. Never-appearing
+     * temps bucket at `nins`. */
+    int *head = xmalloc((size_t)(nins + 1) * sizeof *head);
+    for (int i = 0; i <= nins; i++) head[i] = -1;
+    int *nxt = xmalloc((size_t)ntemp * sizeof *nxt);
+    for (int k = ntemp - 1; k >= 0; k--) {
+        int fi = first[k] < 0 ? nins : first[k];
+        nxt[k] = head[fi]; head[fi] = k;
+    }
+
+    /* linear scan: reuse a freed pool index for a coalescable temp once its
+     * previous occupant is dead; a non-coalescable temp takes a fresh index it
+     * never gives back. */
+    int *slot = xmalloc((size_t)ntemp * sizeof *slot);
+    int *freelist = xmalloc((size_t)ntemp * sizeof *freelist);
+    int *act_last = xmalloc((size_t)ntemp * sizeof *act_last);
+    int *act_idx  = xmalloc((size_t)ntemp * sizeof *act_idx);
+    int nfree = 0, nact = 0, pool = 0;
+    for (int i = 0; i <= nins; i++) {
+        for (int k = head[i]; k >= 0; k = nxt[k]) {
+            if (first[k] < 0) {          /* never referenced: throwaway slot */
+                slot[k] = pool++;
+                continue;
+            }
+            int coalescable = (blk[first[k]] == blk[last[k]]);
+            /* expire actives dead before this temp is defined */
+            for (int a = 0; a < nact; ) {
+                if (act_last[a] < first[k]) {
+                    freelist[nfree++] = act_idx[a];
+                    act_last[a] = act_last[nact - 1];
+                    act_idx[a]  = act_idx[nact - 1];
+                    nact--;
+                } else {
+                    a++;
+                }
+            }
+            int idx = (coalescable && nfree > 0) ? freelist[--nfree] : pool++;
+            slot[k] = idx;
+            if (coalescable) {
+                act_last[nact] = last[k];
+                act_idx[nact]  = idx;
+                nact++;
+            }
+        }
+    }
+    *npool_out = pool;
+
+    free(blk); free(first); free(last); free(head); free(nxt);
+    free(freelist); free(act_last); free(act_idx);
+    return slot;
+}
+
 /* Frame layout: variables first, each occupying its real size rounded
- * up to 8, then one 8-byte slot per temporary. Returns the per-vreg
- * displacement table (caller frees). */
+ * up to 8, then a coalesced pool of 8-byte temporary slots (K13). Returns the
+ * per-vreg displacement table (caller frees). */
 static int *layout_frame(struct ir_func *fn, int *frame_out,
                          int *scratch_base_out, int *sret_slot_out,
                          int *va_save_out, int *va_tag_out)
@@ -61,10 +199,15 @@ static int *layout_frame(struct ir_func *fn, int *frame_out,
         }
         disp[i] = -running;
     }
-    for (int t = f->nvars; t < fn->nvregs; t++) {
-        running += 8;
-        disp[t] = -running;
-    }
+    /* Temporaries share a coalesced pool of 8-byte slots (K13) instead of one
+     * slot each — the temp region is `npool` slots wide, not (nvregs-nvars). */
+    int npool = 0;
+    int *tslot = coalesce_temps(fn, f->nvars, &npool);
+    int temp_base = running;
+    for (int t = f->nvars; t < fn->nvregs; t++)
+        disp[t] = -(temp_base + (tslot[t - f->nvars] + 1) * 8);
+    running = temp_base + npool * 8;
+    free(tslot);
     /* struct-return temporaries sit above the outgoing area */
     running += fn->scratch_bytes;
     *scratch_base_out = -running;
