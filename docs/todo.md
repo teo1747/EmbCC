@@ -25,10 +25,12 @@ hardware C — a materially harder corpus than TinyCC/newlib. Repro from `myos/`
 for f in $(find kernel -name '*.c'); do /home/motsou/EmbCC/embcc -c "$f" -Ikernel -o /tmp/x.o; done
 ```
 
-***22 / 89 kernel TUs already compile clean.*** The gaps below are the
-first-error-per-file from that sweep (so each category has more behind it),
-ranked by how much of the kernel they block. No kernel C was changed to work
-around any of these — that's the point; they're EmbCC's to close.
+***41 / 89 kernel TUs now compile clean (was 22).*** K2–K9 are all closed;
+**K1 (the inline-asm assembler) is the one remaining blocker**, gating the
+~29 low-level `arch/`/`drivers/`/`mm/` files. The gaps below are the
+first-error-per-file from the original sweep, ranked by how much of the kernel
+they block. No kernel C was changed to work around any of these — they're
+EmbCC's to close.
 
 ### K1 — inline-asm assembler (THE blocker; touches most of `arch/`, `drivers/`, `mm/`)
 EmbCC currently assembles only `int`/`cpuid`/`rdrand`/`setc`. The kernel is
@@ -42,50 +44,47 @@ rest the kernel uses behind these: `cli`/`sti`, `hlt`, `rdmsr`/`wrmsr`,
 `%0`-style operand refs, and `volatile`. Dominant item — without it the
 low-level kernel can't be built at all.
 
-### K2 — GCC builtins
-- `__builtin_bswap16/32/64` (9 files — network byte order in `kernel/net/`).
-- `__atomic_load_n`, `__atomic_exchange_n`, `__atomic_store_n` (and the rest of
-  the `__atomic_*` compare/fetch family; check `__sync_*` too) — the kernel's
-  spinlock / ksync / block-stat primitives are built on these.
-- Worth checking while here: `__builtin_memcpy/memset`, `__builtin_expect`,
-  `__builtin_unreachable`.
+### K2 — GCC builtins — DONE
+`__builtin_bswap16/32/64` (IR_BSWAP), `__sync_synchronize` (mfence),
+`__builtin_unreachable` (ud2 + noreturn in the return-path check),
+`__builtin_expect` (becomes its first arg), `__atomic_load_n`/`store_n`
+(load / store+mfence) and `__atomic_exchange_n` (locked `xchg`, IR_XCHG).
+`__builtin_memcpy/memset` already resolved to the libc names. Verified vs gcc
+at -O0 and -O1.
 
-### K3 — `sizeof` / `offsetof` as an integer-constant-expression
-`_Static_assert(sizeof(struct T) == 0x50, ...)` and
-`_Static_assert(offsetof(struct T, f) == N, ...)` fail with *"`_Static_assert`
-needs a constant integer expression"* (e.g. `boot_protocol.h:83`, 5 files). The
-constant folder must evaluate `sizeof(type-name)` and `offsetof(...)` in ICE
-context (the kernel uses these to pin ABI struct layouts).
+### K3 — `sizeof` / `offsetof` as an integer-constant-expression — DONE
+`sizeof(type)` already folded; the gap was `offsetof`. Added
+`__builtin_offsetof(type, designator)` folded to a size_t constant at parse
+time (descending `.field`/`[index]`), and pointed `<stddef.h>`'s offsetof at
+it — so `_Static_assert(offsetof(...) == N)` works.
 
-### K4 — raise the parameter / argument cap (currently 12)
-*"more than 12 parameters"* / *"more than 12 call arguments"*
-(`framebuffer.h:78`, `net.c:216`). Several kernel functions exceed 12; raise the
-fixed limit (or make it dynamic).
+### K4 — raise the parameter / argument cap — DONE
+12 → 32. MAX_PARAMS moved to type.h so `struct type`'s `ptypes[]` grows with
+it (the cap in ast.h alone left ptypes[12] to overflow — a heap smash on a
+>12-param function type, found by ASAN).
 
-### K5 — char/string escape sequences
-*"unknown escape '\v' in character constant"* (`ctype.h:44`). The lexer's escape
-table is incomplete — at least `\v`, and almost certainly `\f \a \b \?`, `\xHH`,
-and octal `\NNN` as well.
+### K5 — char/string escape sequences — DONE
+A shared `scan_escape` now handles the full C set: `\a \b \f \v \?`, GNU `\e`,
+hex `\xH...`, and octal `\NNN`, for both char and string literals.
 
-### K6 — `&array` (address-of an array object)
-`(uint64_t)&gdt` where `gdt` is an array type is refused with *"'&' on an array
-is not supported yet"* (`gdt.c:140`, `idt.c:65`). `&arr` is valid C (yields
-`T(*)[N]`); the descriptor-table code relies on it.
+### K6 — `&array` — DONE
+`&arr` yields `T(*)[N]` whose value is the array's address (gen_addr already
+produces it). *(The pointer-to-array `int (*p)[N]` declarator is a separate,
+rarer gap, still open.)*
 
-### K7 — use-before-declaration of a `static` function
-`epfs_lookup` is called before its definition and rejected (*"used before its
-declaration"*, `epfs.c:156`). GCC resolves this within a TU; EmbCC needs a
-forward pass (or to accept a later same-TU `static` definition).
+### K7 — use-before-declaration of a `static` function — DONE
+The call and value paths test `seq <= cur_body_seq` (what the ordered-walk
+`declared` flag encoded) so it also holds during static-initializer lowering —
+a function pointer in a vtable resolves. This closed the "&func in a static
+initializer" seam too: `greloc` grew an `ftarget` the driver relocates.
 
-### K8 — `__attribute__` after a declarator
-`uint8_t observed[16] __attribute__((aligned(16)));` → *"expected ';' before
-'__attribute__'"* (`process.c:2891`). Attributes are accepted in some positions
-but not trailing a local array declarator.
+### K8 — `__attribute__` after a declarator — DONE
+A trailing `__attribute__` on a local declarator is accepted (alignment not
+yet honored on a stack slot).
 
-### K9 — minor / integration
-- An **empty translation unit** errors (*"no functions or globals in file"*,
-  `spawn.c` is 0 lines). An empty TU should yield a valid (empty) object.
-- One TU wants a freestanding `<string.h>` on the include path.
+### K9 — DONE
+An empty translation unit yields a valid empty object.
+*(A freestanding `<string.h>` on the path is an integration matter.)*
 
 ### Not language gaps, but required for a *bootable* kernel (codegen/ABI)
 The kernel is built with `-mcmodel=kernel -mno-red-zone -mno-sse -mno-mmx`
