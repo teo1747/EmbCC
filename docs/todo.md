@@ -25,24 +25,34 @@ hardware C — a materially harder corpus than TinyCC/newlib. Repro from `myos/`
 for f in $(find kernel -name '*.c'); do /home/motsou/EmbCC/embcc -c "$f" -Ikernel -o /tmp/x.o; done
 ```
 
-***41 / 89 kernel TUs now compile clean (was 22).*** K2–K9 are all closed;
-**K1 (the inline-asm assembler) is the one remaining blocker**, gating the
-~29 low-level `arch/`/`drivers/`/`mm/` files. The gaps below are the
-first-error-per-file from the original sweep, ranked by how much of the kernel
-they block. No kernel C was changed to work around any of these — they're
-EmbCC's to close.
+***79 / 89 kernel TUs now compile clean (was 22).*** **K1–K9 are all closed.**
+The remaining 10 are distinct one-off gaps (below, "Remaining"), not the
+lettered blockers. No kernel C was changed to work around any of these.
 
-### K1 — inline-asm assembler (THE blocker; touches most of `arch/`, `drivers/`, `mm/`)
-EmbCC currently assembles only `int`/`cpuid`/`rdrand`/`setc`. The kernel is
-pervasive hardware C and needs a real x86-64 inline-asm path with operand
-constraints. Instructions seen already (first-errors only): `pushfq`/`popfq`,
-`outb`/`outl` (plus `inb`/`inw`/`inl`/`outw`), `mov` to/from **CR0/2/3/4** and
-MSR/segment paths, `rdtsc`, `pause`, `mfence` (and `lfence`/`sfence`), plus the
-rest the kernel uses behind these: `cli`/`sti`, `hlt`, `rdmsr`/`wrmsr`,
-`invlpg`, `lgdt`/`lidt`/`ltr`, `wbinvd`. Also the **constraint grammar**:
-`"=r"`,`"r"`,`"=a"`,`"a"`,`"=m"`,`"m"`,`"N"`(imm), `"memory"`/`"cc"` clobbers,
-`%0`-style operand refs, and `volatile`. Dominant item — without it the
-low-level kernel can't be built at all.
+### K1 — inline-asm assembler — DONE
+EmbCC's extended-asm assembler (irgen.c `asm_assemble`) grew from
+`int`/`cpuid`/`rdrand`/`setc` to the kernel's hardware vocabulary, every
+encoding byte-verified against objdump: fixed-form (`cli`/`sti`/`hlt`/`nop`/
+`pause`/`mfence`/`lfence`/`sfence`/`wbinvd`/`rdtsc`/`rdmsr`/`wrmsr`/`fninit`/
+`pushfq`/`popfq`); port I/O (`outb`/`w`/`l`, `inb`/`w`/`l`); reg operands
+(`pop`/`push`/`popq`/`pushq` `%N`, `str`/`ltr` `%N`); control registers
+(`mov %reg,%%crN` / `mov %%crN,%reg`); memory operands (`lgdt`/`lidt %N`,
+`invlpg (%N)`, `movdqa` ↔ `%%xmm0`). Constraint grammar already covered
+`"=r"`/`"r"`/`"=a"`/`"a"`/`"=m"`/`"m"`/`"N"`/`"x"`, `"memory"`/`"cc"` clobbers,
+`%N` refs, and `volatile`. Small parse helpers read the operand forms; unknown
+mnemonics still refuse loudly. Golden test: tests/golden/inline-asm-kernel.sh.
+
+### Remaining one-offs (each a distinct feature, not a lettered gap)
+Ten TUs still fail, each on something different: a GCC **statement expression**
+`({ ... })` (selftests.c); an **array-range designator** `[a ... b] =`
+(font_8x16.c); a **`static`-init that isn't constant** (keyboard.c); a
+function that ends in a **non-returning asm loop** so the return-path check
+fires (syscall.c `sys_exit`); a **`typedef` form** the parser trips on
+(kprintf.c); an **asm constraint** not yet parsed (usermode.c); the gdt.c
+**segment-reload trampoline** (inline-asm local labels + RIP-relative `leaq` +
+`lretq`); a **`_Static_assert` ICE** (embkfs.c); plus integration
+(a freestanding `<string.h>` for fd.c). The char*/unsigned char* signedness
+mismatch (fat32.c) is now allowed.
 
 ### K2 — GCC builtins — DONE
 `__builtin_bswap16/32/64` (IR_BSWAP), `__sync_synchronize` (mfence),
