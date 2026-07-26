@@ -161,6 +161,7 @@ struct stmt {
     int var_index;        /* STMT_DECL: set by sema */
     const char *asm_reg;  /* STMT_DECL: a register-asm binding, `register T
                            * x __asm__("r10")` — NULL for an ordinary local */
+    int user_align;       /* STMT_DECL: __attribute__((aligned(N))); 0 = none */
     struct asm_stmt *asm_s; /* STMT_ASM */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
     struct expr *cond;    /* IF/WHILE/FOR */
@@ -228,6 +229,8 @@ struct func {
     const char *params[MAX_PARAMS]; /* names; NULL in unnamed prototypes */
     struct type *param_tys[MAX_PARAMS];
     struct type **var_tys;          /* sema: type of every var slot */
+    int *var_aligns;                /* sema: __attribute__((aligned(N))) per
+                                     * var slot (0 = natural); parallels var_tys */
     struct stmt *body;
     int defined;          /* parse: THIS node syntactically had a body
                            * (may be NULL even so: "{ }" — sema rejects

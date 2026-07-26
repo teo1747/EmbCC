@@ -716,13 +716,15 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
                 cap = cap ? cap * 2 : 8;
                 ms = xrealloc(ms, (size_t)cap * sizeof *ms);
             }
-            parse_attributes(ps, NULL); /* member attributes: ignored */
+            struct attrs mat = { 0, 0, 0, 0 };
+            parse_attributes(ps, &mat);  /* T buf[N] __attribute__((aligned(N))) */
             ms[n].name = mname;
             ms[n].ty = mty;
             ms[n].off = 0;
             ms[n].is_bitfield = is_bf;
             ms[n].bit_off = 0;
             ms[n].bit_width = bit_width;
+            ms[n].user_align = mat.aligned;
             n++;
             if (cur(ps)->kind == TOK_COMMA) {
                 advance(ps);
@@ -1610,9 +1612,13 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                 expect(ps, TOK_RPAREN, "')' after the register name");
             }
             /* `T x[16] __attribute__((aligned(16)))` — a trailing attribute
-             * on a local declarator (accepted; alignment is not yet honored
-             * for a stack slot). */
-            parse_attributes(ps, NULL);
+             * on a local declarator; aligned(N) raises the stack slot's
+             * alignment (codegen rounds the frame offset). */
+            {
+                struct attrs lat = { 0, 0, 0, 0 };
+                parse_attributes(ps, &lat);
+                s->user_align = lat.aligned;
+            }
             int was_array = s->dty->kind == TY_ARRAY;
             (void)was_array;
             if (cur(ps)->kind == TOK_ASSIGN) {

@@ -19,6 +19,7 @@ struct vardef {
                          * static storage, not the frame */
     int active;         /* 0 once its block has closed */
     const char *asm_reg; /* a register-asm binding, else NULL */
+    int user_align;     /* __attribute__((aligned(N))) on the local; 0 = none */
 };
 
 /* Block scoping without giving up unique frame slots: entries are never
@@ -61,6 +62,7 @@ static int scope_add(struct scope *sc, const char *name, struct type *ty,
     sc->vars[sc->n].g = g;
     sc->vars[sc->n].active = 1;
     sc->vars[sc->n].asm_reg = NULL;
+    sc->vars[sc->n].user_align = 0;
     return sc->n++;
 }
 
@@ -1662,6 +1664,7 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                            s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
             sc->vars[s->var_index].asm_reg = s->asm_reg;
+            sc->vars[s->var_index].user_align = s->user_align;
             /* A static local has static storage, so a compound literal in its
              * initializer is an anonymous global, not a stack slot. */
             if (s->is_static)
@@ -1957,11 +1960,14 @@ static void check_func(struct unit *u, struct func *f)
 
     f->nvars = sc.n;
     f->var_tys = xmalloc((size_t)(sc.n ? sc.n : 1) * sizeof *f->var_tys);
-    for (int i = 0; i < sc.n; i++)
+    f->var_aligns = xmalloc((size_t)(sc.n ? sc.n : 1) * sizeof *f->var_aligns);
+    for (int i = 0; i < sc.n; i++) {
         /* a static local keeps its scope index but needs no frame
          * storage — give it a pointer's worth and never address it */
         f->var_tys[i] = sc.vars[i].g ? ty_base(TY_LONG, 0)
                                      : sc.vars[i].ty;
+        f->var_aligns[i] = sc.vars[i].g ? 0 : sc.vars[i].user_align;
+    }
     free(sc.vars);
 }
 

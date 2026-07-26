@@ -149,7 +149,23 @@ link `x86_64-elf-ld -T kernel/linker.ld` with the nasm objects, boot.*
 
 </details>
 
-### K11 — honor `__attribute__((aligned(N)))` in LAYOUT (the next runtime blocker)
+### K11 — honor `__attribute__((aligned(N)))` in LAYOUT — **DONE**
+
+**RESOLVED (branch Teo).** `aligned(N)` is now applied to layout, not just
+parsed: (a) a struct **member**'s offset rounds up to `N` and (b) the struct's
+own align/size rise to a multiple of `N` (per-member `user_align` threads
+through `ty_struct_layout`; it overrides `packed`, which only lowers the
+default); (c) a **stack local** carrying the attribute gets its frame slot
+rounded so its rbp-relative base is `N`-aligned (rbp is 16-aligned on entry, so
+`N<=16` is honored; `N>16` would need dynamic stack realignment and is **refused
+loudly** — THE RULE). Verified against the REAL kernel header: `struct thread`
+(the `fxsave` target) lays out byte-identical to gcc — `fpu_state` at offset 80
+(16-aligned) and `sizeof == 848` (16-multiple); the minimal repro static-asserts
+pass; a local `observed[16] aligned(16)` lands on a 16-aligned slot; suite
+87/87, self-host holds, kernel 89/89. This was the last thing between the
+self-compiled kernel and the desktop.
+
+<details><summary>original triage (kept for context)</summary>
 
 *With `-mno-sse` in, the self-compiled kernel now boots much further — PMM (512 MB),
 VMM direct map, ACPI, EMBKFS mounted, VFS at `/`, ksym loaded — then takes a
@@ -181,6 +197,8 @@ to `N`, (b) raise the **struct's** own alignment/size to a multiple of `N`, and
 (c) align **stack slots** for locals carrying the attribute (e.g.
 `uint8_t observed[16] __attribute__((aligned(16)))`). This is the one thing
 between the self-compiled kernel and reaching the desktop.
+
+</details>
 
 ---
 

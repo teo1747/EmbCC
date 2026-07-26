@@ -32,6 +32,7 @@ struct member {
     int is_bitfield;
     int bit_off;          /* bitfield: bit position within the storage unit */
     int bit_width;        /* bitfield: width in bits (0 = zero-width separator) */
+    int user_align;       /* __attribute__((aligned(N))) on the member; 0 = none */
 };
 
 struct type {
