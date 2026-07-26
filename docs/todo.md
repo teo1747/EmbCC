@@ -295,12 +295,18 @@ KSTACK bump was reverted). *"Self-hosting for C, but the kernel wants GCC"* is
 retired: the OS's own compiler compiles the OS's kernel and it runs.
 
 *Residual tail (NOT on the boot path — desktop is fine): a few mega-functions
-still carry EmbCC frames 3–5× GCC's, so those specific ops would overflow if
-called deep — `shell_handle_process_command` embcc 82 KB vs gcc 16.5 KB,
-`selftests_handle_command` 25 KB vs 8 KB. (`tui_lines_procs` is genuine: gcc
-`0x3f08` ≈ embcc `0x3fd0`.) Coalescing helps most functions but leaves these huge
-ones — likely needs cross-block coalescing or light register allocation. Not
-blocking; the boot-to-desktop path runs stock.*
+carried EmbCC frames 3–5× GCC's. **Halved by scope-based local-slot coalescing**
+(this session): locals in DISJOINT lexical scopes now share a stack slot — sound
+because a stack pointer used past its scope is UB (gcc's own model). irgen
+records each local's block instruction-range (`ir_func.var_scope_lo/hi`), and
+codegen interval-colours the slots (`coalesce_locals`), sized/aligned to the
+strictest occupant; `-g` disables it (distinct DWARF locations). Result:
+`shell_handle_process_command` **84 KB → 45 KB**. gcc-refereed by
+`tests/exec/scope-slots.c` (disjoint sibling arrays coalesce; nested/overlapping
+ones must not — validated address-taken). The remaining gap to gcc (16.5 KB) is
+gcc ALSO coalescing SAME-scope locals by liveness — safe for non-address-taken,
+but for the address-taken arrays here it relies on the escaping-pointer UB;
+deferred as riskier for a kernel. Not blocking; boot-to-desktop runs stock.*
 
 <details><summary>original triage (kept for context)</summary>
 

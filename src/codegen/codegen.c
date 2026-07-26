@@ -15,6 +15,11 @@
 
 #include "../driver/util.h"
 
+/* -g: when set, DWARF wants each source variable at a distinct stack location,
+ * so local-slot coalescing is disabled. Defined here (used by coalesce_locals);
+ * codegen_unit sets it from want_debug. Also read by the line-table pass. */
+static int g_want_debug;
+
 /* K13 — temporary stack-slot coalescing. At -O0 every temp (vreg >= nvars)
  * otherwise gets its own 8-byte slot, never reused, so a deep call chain's
  * frames overflow the kernel stack. This assigns each temp a 0-based index
@@ -574,9 +579,54 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
 #undef OPAQUE
 #undef SEEN
 
-/* Frame layout: variables first, each occupying its real size rounded
- * up to 8, then a coalesced pool of 8-byte temporary slots (K13). Returns the
- * per-vreg displacement table (caller frees). */
+/* Coalesce local stack SLOTS by lexical scope: locals whose scope ranges are
+ * disjoint never coexist, so they share a slot (gcc does the same — a stack
+ * pointer used past its scope is UB). Returns a per-local slot id [0..*nslots),
+ * assigned by interval-graph colouring in scope-start order (optimal for
+ * intervals). Params and function-level locals span the whole function, so they
+ * interfere with everything and never coalesce. -g disables it (so each source
+ * variable keeps a distinct DWARF location). Length nvars; caller frees. */
+static int *coalesce_locals(struct ir_func *fn, int *nslots_out)
+{
+    int n = fn->src->nvars;
+    int *slot = xmalloc((size_t)(n ? n : 1) * sizeof *slot);
+    if (n == 0 || g_want_debug || !fn->var_scope_lo) {
+        for (int i = 0; i < n; i++) slot[i] = i;   /* one slot each */
+        *nslots_out = n;
+        return slot;
+    }
+    int *lo = fn->var_scope_lo, *hi = fn->var_scope_hi;
+
+    /* order locals by scope start (ties by index), via buckets over the [0,nins]
+     * instruction range — deterministic. */
+    int nins = fn->nins;
+    int *head = xmalloc((size_t)(nins + 2) * sizeof *head);
+    for (int i = 0; i <= nins + 1; i++) head[i] = -1;
+    int *nxt = xmalloc((size_t)n * sizeof *nxt);
+    for (int i = n - 1; i >= 0; i--) {
+        int b = lo[i]; if (b < 0) b = 0; if (b > nins + 1) b = nins + 1;
+        nxt[i] = head[b]; head[b] = i;
+    }
+
+    int *slot_free = xmalloc((size_t)n * sizeof *slot_free); /* free-after per slot */
+    int ns = 0;
+    for (int b = 0; b <= nins + 1; b++)
+        for (int i = head[b]; i >= 0; i = nxt[i]) {
+            int pick = -1;
+            for (int s = 0; s < ns; s++)
+                if (slot_free[s] <= lo[i]) { pick = s; break; }
+            if (pick < 0) { pick = ns++; }
+            slot[i] = pick;
+            slot_free[pick] = hi[i];   /* busy until this local's scope ends */
+        }
+    *nslots_out = ns;
+    free(head); free(nxt); free(slot_free);
+    return slot;
+}
+
+/* Frame layout: variables first (their slots coalesced by scope), then a
+ * coalesced pool of 8-byte temporary slots (K13). Returns the per-vreg
+ * displacement table (caller frees). */
 static int *layout_frame(struct ir_func *fn, int *frame_out,
                          int *scratch_base_out, int *sret_slot_out,
                          int *va_save_out, int *va_tag_out,
@@ -605,20 +655,32 @@ static int *layout_frame(struct ir_func *fn, int *frame_out,
         *sret_slot_out = -running;
     }
 
+    /* Locals share slots when their scopes are disjoint (coalesce_locals). Each
+     * slot is sized to its largest occupant and aligned to the strictest one. */
+    int nls = 0;
+    int *lslot = coalesce_locals(fn, &nls);
+    int *ssize = xcalloc((size_t)(nls ? nls : 1), sizeof *ssize);
+    int *salign = xcalloc((size_t)(nls ? nls : 1), sizeof *salign);
     for (int i = 0; i < f->nvars; i++) {
+        int s = lslot[i];
         int sz = (ty_size(f->var_tys[i]) + 7) & ~7;
-        running += sz;
+        if (sz > ssize[s]) ssize[s] = sz;
         /* Alignment of a local's stack slot: the greater of its type's natural
          * alignment (a struct with an aligned(16) member, e.g. struct thread's
          * fpu_state, is itself 16-aligned) and any __attribute__((aligned(N)))
-         * on the declarator. The base is rbp-running and rbp is 16-aligned on
-         * entry, so rounding running up to N makes the base N-aligned — for
-         * N <= 16. A larger request would need the stack realigned dynamically
-         * (rbp can't promise it); refuse loudly rather than silently
-         * under-align (THE RULE). */
+         * on the declarator. */
         int al = f->var_aligns ? f->var_aligns[i] : 0;
         int tal = ty_align(f->var_tys[i]);
         if (tal > al) al = tal;
+        if (al > salign[s]) salign[s] = al;
+    }
+    int *soff = xmalloc((size_t)(nls ? nls : 1) * sizeof *soff);
+    for (int s = 0; s < nls; s++) {
+        running += ssize[s];
+        /* rbp is 16-aligned on entry, so rounding `running` up to N makes the
+         * slot base rbp-running N-aligned for N <= 16; a larger request would
+         * need dynamic realignment, so refuse loudly (THE RULE). */
+        int al = salign[s];
         if (al > 1) {
             if (al > 16)
                 diag_fatal(f->file, f->line,
@@ -627,8 +689,11 @@ static int *layout_frame(struct ir_func *fn, int *frame_out,
                            f->name, al);
             running = (running + al - 1) & ~(al - 1);
         }
-        disp[i] = -running;
+        soff[s] = -running;
     }
+    for (int i = 0; i < f->nvars; i++)
+        disp[i] = soff[lslot[i]];
+    free(lslot); free(ssize); free(salign); free(soff);
     /* Temporaries share a coalesced pool of 8-byte slots (K13) instead of one
      * slot each — the temp region is `npool` slots wide, not (nvregs-nvars). */
     int npool = 0;
@@ -715,11 +780,8 @@ struct brsite {
     int label;
 };
 
-/* -g: collect the (offset,line) line table into each ir_func. Off by default
- * so ordinary output is untouched (the self-host fixed point depends on it).
- * codegen runs one unit at a time, single threaded — a file-scope flag is
- * sound; codegen_unit sets it from want_debug. */
-static int g_want_debug;
+/* g_want_debug (the -g flag) is declared near the top of the file — it is read
+ * by coalesce_locals, which appears before this point. */
 
 /* -mno-sse: never emit an SSE/xmm instruction. A kernel built before it turns
  * on CR4.OSFXSR needs this — any SSE op #UDs. Set by codegen_unit; the varargs

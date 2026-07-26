@@ -157,6 +157,12 @@ struct ir_func {
     struct ir_dbgvar *dbgvars; /* -g: params + locals (irgen) */
     int ndbgvars, dbgvarcap;
     int *var_off;            /* -g: rbp-relative slot offset per vreg (codegen) */
+    /* Per-LOCAL lexical scope, as a half-open instruction range [lo, hi) (irgen).
+     * Two locals whose scopes are disjoint never coexist — a stack pointer used
+     * past its scope is UB — so codegen may give them one stack slot. Params and
+     * function-level locals span the whole function; only nested-block locals get
+     * a narrower range. Length nvars; unused (NULL) when there are no locals. */
+    int *var_scope_lo, *var_scope_hi;
 };
 
 /* One .rodata string; offsets are assigned sequentially at collection

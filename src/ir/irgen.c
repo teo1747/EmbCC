@@ -2360,9 +2360,22 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             emit_label(fn, lc.brk);
             break;
         }
-        case STMT_BLOCK:
+        case STMT_BLOCK: {
+            /* Record the block's instruction span, then stamp every local
+             * declared DIRECTLY in it with that scope range [lo, hi). Locals in
+             * disjoint sibling blocks get disjoint ranges and may share a slot
+             * (codegen). Static/extern decls have no frame slot — skip them. */
+            int lo = fn->nins;
             gen_stmt(fn, s->body, loop);
+            int hi = fn->nins;
+            for (struct stmt *c = s->body; c; c = c->next)
+                if (c->kind == STMT_DECL && !c->is_extern && !c->sglob &&
+                    c->var_index >= 0 && c->var_index < fn->src->nvars) {
+                    fn->var_scope_lo[c->var_index] = lo;
+                    fn->var_scope_hi[c->var_index] = hi;
+                }
             break;
+        }
         }
     }
 }
@@ -2458,8 +2471,22 @@ static void gen_func(struct ir_func *fn, struct func *f)
     for (int i = 0; i < f->nparams; i++)
         add_dbgvar(fn, f->params[i], i, 1, f->param_tys[i]);
     collect_locals(fn, f->body);
+    /* Local scope ranges: default to the whole function ([0, +inf), narrowed to
+     * the real end below) so any local not inside a nested block never coalesces
+     * — the safe default. gen_stmt's STMT_BLOCK case narrows nested-block locals. */
+    if (f->nvars > 0) {
+        fn->var_scope_lo = xmalloc((size_t)f->nvars * sizeof *fn->var_scope_lo);
+        fn->var_scope_hi = xmalloc((size_t)f->nvars * sizeof *fn->var_scope_hi);
+        for (int i = 0; i < f->nvars; i++) {
+            fn->var_scope_lo[i] = 0;
+            fn->var_scope_hi[i] = 0x7fffffff;   /* whole function until stamped */
+        }
+    }
     g_nlabels_used = 0;                 /* labels are per-function */
     gen_stmt(fn, f->body, NULL);
+    for (int i = 0; i < f->nvars; i++)  /* clamp the un-narrowed default */
+        if (fn->var_scope_hi[i] == 0x7fffffff)
+            fn->var_scope_hi[i] = fn->nins;
     for (int i = 0; i < g_nlabels_used; i++)
         if (!g_labels[i].defined)
             diag_fatal(fn->src->file, g_labels[i].line,
