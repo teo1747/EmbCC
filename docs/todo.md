@@ -267,6 +267,38 @@ uses no `+` constraints; deferred.)*
 
 </details>
 
+### K13 — stack usage: `-O0` frames are ~18× GCC's, overflowing the kernel stack
+
+*With K12 in, the self-compiled kernel boots ALL the way through init, the
+dynamic linker runs, and **userspace launches** (`home: launched
+/system/bin/home.elf as pid 4`) — then a **Double Fault** at a plain
+`mov %rax,-0x70(%rbp)` in `ata_read_dma`, with a garbled backtrace: the classic
+**kernel-stack-overflow** signature.*
+
+EmbCC at `-O0` spills every local to the stack (no register allocation, no
+slot reuse), so frames are far larger than GCC's, and a deep kernel call chain
+(`syscall → vfs → embkfs → block → ata_read_dma → …`) overflows the **16 KiB**
+per-thread kernel stack (`KSTACK_SIZE`, myos `process.h:37`):
+
+| function | GCC frame | EmbCC frame |
+|---|---|---|
+| `ata_read_dma` | 96 B (`sub $0x60`) | **1760 B** (`sub $0x6e0`) |
+| kernel-wide | — | **331 functions > 1 KB**, biggest ~4 KB |
+
+The code is *correct* — it's just too stack-hungry. This is the first item where
+"compiles + is correct" isn't enough; it's a **codegen-quality** gap.
+
+**Fix (EmbCC side):** cut stack usage — real **register allocation** (the started
+optimizer, `src/opt/opt.c`) so hot locals live in registers, and/or **reuse
+stack slots** for locals whose live ranges don't overlap (today each gets its own
+slot). Getting close to GCC's frame sizes lets the self-compiled kernel run in
+the same 16 KiB the GCC kernel uses.
+
+*(Confirmed by a diagnostic-only KSTACK_SIZE bump on the myos side — NOT
+committed, per "don't change the kernel for an EmbCC gap": with a larger stack
+the self-compiled kernel runs past this. So this is the last codegen item; once
+EmbCC's stack usage drops, no kernel change is needed.)*
+
 ---
 
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
