@@ -81,6 +81,8 @@ struct expr {
                               * NULL when it is positional */
     int desig_index;         /* an initlist element's [index] designator,
                               * -1 when it is positional */
+    int desig_index_hi;      /* GNU range `[lo ... hi]`: the high index, else
+                              * -1 (a plain `[index]` or positional element) */
     const char *asm_reg;  /* EXPR_VAR: a register-asm binding propagated
                            * from the variable's declaration, else NULL */
 };
@@ -213,6 +215,7 @@ struct func {
     int seq;              /* source order (see struct global) */
     int is_static;
     int is_weak;          /* __attribute__((weak)) */
+    int is_noreturn;      /* __attribute__((noreturn)) / _Noreturn */
     int is_varargs;       /* declared with a trailing ", ..." */
     struct type *ret_ty;
     int nparams;

@@ -333,6 +333,13 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     }
     /* a typedef name, when no specifier has appeared */
     if (cur(ps)->kind == TOK_IDENT) {
+        /* __builtin_va_list is `char *` — the same representation EmbCC's
+         * <stdarg.h> gives va_list — so `typedef __builtin_va_list ...`
+         * (as some headers write it) resolves. */
+        if (strcmp(cur(ps)->text, "__builtin_va_list") == 0) {
+            advance(ps);
+            return ty_ptr(ty_base(TY_CHAR, 0));
+        }
         struct type *td = find_typedef(ps, cur(ps)->text);
         if (!td)
             return NULL;
@@ -415,6 +422,35 @@ static struct type *parse_stars(struct parser *ps, struct type *t)
  * compile-time integer constants) in constant expressions like array sizes. */
 static struct unit *g_fold_unit;
 
+/* The type of a constant-expression subset — enough to fold sizeof(EXPR) in
+ * an integer-constant-expression: a cast fixes the type, `->`/`.` reach a
+ * member, `*` dereferences. `sizeof(((struct V*)0)->field)` is the shape the
+ * kernel uses to bound one struct's storage against another's. */
+static struct type *ce_type(const struct expr *e)
+{
+    switch (e->kind) {
+    case EXPR_CAST:
+        return e->cast_ty;
+    case EXPR_DEREF: {
+        struct type *t = ce_type(e->rhs);
+        return t && t->kind == TY_PTR ? t->pointee : NULL;
+    }
+    case EXPR_MEMBER: {
+        struct type *bt = ce_type(e->lhs);
+        if (!bt)
+            return NULL;
+        struct type *st = e->is_arrow
+                        ? (bt->kind == TY_PTR ? bt->pointee : NULL) : bt;
+        if (!st || st->kind != TY_STRUCT || !st->complete)
+            return NULL;
+        struct member *m = ty_find_member(st, e->name);
+        return m ? m->ty : NULL;
+    }
+    default:
+        return NULL;
+    }
+}
+
 static int size_fold(const struct expr *e, long *out)
 {
     long a, b;
@@ -432,11 +468,13 @@ static int size_fold(const struct expr *e, long *out)
                 return 1;
             }
         return 0;
-    case EXPR_SIZEOF:
-        if (!e->cast_ty)
-            return 0; /* sizeof(expr) needs types this pass lacks */
-        *out = ty_size(e->cast_ty);
+    case EXPR_SIZEOF: {
+        struct type *t = e->cast_ty ? e->cast_ty : ce_type(e->rhs);
+        if (!t || ty_size(t) == 0)
+            return 0;   /* sizeof(expr) whose type this pass cannot resolve */
+        *out = ty_size(t);
         return 1;
+    }
     case EXPR_CAST:
         return size_fold(e->rhs, out);
     case EXPR_NEG:
@@ -514,7 +552,7 @@ static struct type *parse_array_dims(struct parser *ps, struct type *t)
 }
 
 /* The GNU attributes EmbCC honors; everything else is parsed and dropped. */
-struct attrs { int packed; int aligned; int weak; };
+struct attrs { int packed; int aligned; int weak; int noreturn; };
 
 /* Match `name`, `__name`, or `__name__` against a base attribute name. */
 static int attr_is(const char *n, const char *base)
@@ -556,6 +594,7 @@ static void parse_attributes(struct parser *ps, struct attrs *out)
             if (name && out) {
                 if (attr_is(name, "packed")) out->packed = 1;
                 else if (attr_is(name, "weak")) out->weak = 1;
+                else if (attr_is(name, "noreturn")) out->noreturn = 1;
                 else if (attr_is(name, "aligned"))
                     out->aligned = arg > 0 ? (int)arg : 16;
             }
@@ -662,7 +701,7 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
         expect(ps, TOK_SEMI, "';'");
     }
     advance(ps); /* '}' */
-    struct attrs at = { 0, 0, 0 };
+    struct attrs at = { 0, 0, 0, 0 };
     parse_attributes(ps, &at);   /* struct {...} __attribute__((packed)) */
     if (n == 0)
         diag_fatal(ps->lx.file, cur(ps)->line,
@@ -723,6 +762,7 @@ static struct expr *new_expr(enum expr_kind kind, int line)
     e->kind = kind;
     e->line = line;
     e->desig_index = -1;      /* positional unless a [i] designator sets it */
+    e->desig_index_hi = -1;
     return e;
 }
 
@@ -1212,6 +1252,8 @@ int initlist_array_count(const struct expr *il)
     for (int i = 0; i < il->nelems; i++) {
         if (il->elems[i]->desig_index >= 0)
             idx = il->elems[i]->desig_index;
+        if (il->elems[i]->desig_index_hi >= 0)  /* `[lo ... hi]` ends at hi */
+            idx = il->elems[i]->desig_index_hi;
         idx++;
         if (idx > max)
             max = idx;
@@ -1236,7 +1278,7 @@ static struct expr *parse_initializer(struct parser *ps)
         /* A designator: struct field `.name =` or array element `[i] =`.
          * One level only (no `[i].f =` chains — no EmbCC source needs it). */
         const char *field = NULL;
-        long index = -1;
+        long index = -1, index_hi = -1;
         if (cur(ps)->kind == TOK_LBRACKET) {
             int iline = cur(ps)->line;
             advance(ps);
@@ -1245,6 +1287,14 @@ static struct expr *parse_initializer(struct parser *ps)
                 diag_fatal(ps->lx.file, iline,
                            "an array designator [index] must be a constant "
                            ">= 0");
+            if (cur(ps)->kind == TOK_ELLIPSIS) {  /* GNU range `[lo ... hi]` */
+                advance(ps);
+                struct expr *he = parse_cond(ps);
+                if (!size_fold(he, &index_hi) || index_hi < index)
+                    diag_fatal(ps->lx.file, iline,
+                               "an array range [lo ... hi] must have "
+                               "constant hi >= lo");
+            }
             expect(ps, TOK_RBRACKET, "']'");
             expect(ps, TOK_ASSIGN, "'=' after an array designator");
         } else if (cur(ps)->kind == TOK_DOT) {
@@ -1264,6 +1314,7 @@ static struct expr *parse_initializer(struct parser *ps)
         struct expr *el = parse_initializer(ps);
         el->desig_field = field;
         el->desig_index = index >= 0 ? (int)index : -1;
+        el->desig_index_hi = (int)index_hi;
         e->elems[e->nelems++] = el;
         if (cur(ps)->kind != TOK_COMMA)
             break;
@@ -1795,7 +1846,7 @@ static void parse_top(struct parser *ps, struct unit *u,
     }
 
     int is_static = 0, is_extern = 0;
-    struct attrs at = { 0, 0, 0 };
+    struct attrs at = { 0, 0, 0, 0 };
     ps->seq = seq;
 
     /* A file-scope `__asm__("...")` block (crt0's _start stub). Basic asm
@@ -1925,6 +1976,7 @@ static void parse_top(struct parser *ps, struct unit *u,
     /* 'extern' on a function is the default linkage — accept, ignore */
     f->is_static = is_static;
     f->is_weak = at.weak;   /* leading __attribute__((weak)) */
+    f->is_noreturn = at.noreturn;
     f->ret_ty = ty;
     f->name = name;
     f->file = ps->lx.file;

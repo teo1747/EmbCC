@@ -1212,12 +1212,20 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                            el->desig_field);
             if (el->desig_index >= 0)
                 ai = el->desig_index;
-            if (ty->count && ai >= ty->count)
+            /* GNU range `[lo ... hi] = v`: place v at every index in the
+             * span. A zero value needs no leaves — the object is already
+             * zero-filled (static bytes start zero; a local is memzeroed) —
+             * which also keeps a huge `[a ... b] = 0` cheap. */
+            int hi = el->desig_index_hi >= 0 ? el->desig_index_hi : ai;
+            if (ty->count && hi >= ty->count)
                 diag_fatal(u->file, el->line,
                            "initializer index %d is past the end of an "
-                           "array of %d", ai, ty->count);
-            flatten_init(u, f, sc, el, ty->pointee, off + ai * esz, out);
-            ai++;
+                           "array of %d", hi, ty->count);
+            int is_zero = el->kind == EXPR_NUM && el->num == 0;
+            for (; ai <= hi; ai++)
+                if (!(el->desig_index_hi >= 0 && is_zero))
+                    flatten_init(u, f, sc, el, ty->pointee,
+                                 off + ai * esz, out);
         }
         return;
     }
@@ -1270,6 +1278,62 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
     flatten_init(u, f, sc, init->elems[0], ty, off, out);
 }
 
+/* Resolve a constant-address expression (the value of a pointer slot in a
+ * static initializer) to a target global/function plus a byte addend:
+ * `&g`, a decayed array/function, `&arr[i]`, `&g.field`, `p + n`. Returns 1
+ * on success, filling *gt or *ft and adding to *add. */
+static int resolve_addr(struct expr *e, struct global **gt,
+                        struct func **ft, long *add)
+{
+    while (e && e->kind == EXPR_CAST)
+        e = e->rhs;
+    if (!e)
+        return 0;
+    if (e->kind == EXPR_VAR && e->gref) { *gt = e->gref; return 1; }
+    if (e->kind == EXPR_VAR && e->fref) { *ft = e->fref; return 1; }
+    if (e->kind == EXPR_BINOP && (e->op == B_ADD || e->op == B_SUB)) {
+        int esz = e->ty && e->ty->kind == TY_PTR
+                ? ty_size(e->ty->pointee) : 1;
+        long k;
+        if (resolve_addr(e->lhs, gt, ft, add) && const_fold(e->rhs, &k)) {
+            *add += (e->op == B_SUB ? -k : k) * esz;
+            return 1;
+        }
+        if (e->op == B_ADD && const_fold(e->lhs, &k) &&
+            resolve_addr(e->rhs, gt, ft, add)) {
+            *add += k * esz;
+            return 1;
+        }
+        return 0;
+    }
+    if (e->kind == EXPR_ADDR) {
+        struct expr *lv = e->rhs;
+        while (lv && lv->kind == EXPR_CAST)
+            lv = lv->rhs;
+        if (!lv)
+            return 0;
+        if (lv->kind == EXPR_DEREF)            /* &*x == x */
+            return resolve_addr(lv->rhs, gt, ft, add);
+        if (lv->kind == EXPR_VAR && lv->gref) { *gt = lv->gref; return 1; }
+        if (lv->kind == EXPR_MEMBER && lv->memb) {
+            struct expr *base = lv->is_arrow ? lv->lhs : NULL;
+            if (lv->is_arrow) {                /* &p->f : p + off */
+                if (!resolve_addr(base, gt, ft, add))
+                    return 0;
+            } else {                           /* &b.f : &b + off */
+                struct expr addr = { 0 };
+                addr.kind = EXPR_ADDR;
+                addr.rhs = lv->lhs;
+                if (!resolve_addr(&addr, gt, ft, add))
+                    return 0;
+            }
+            *add += lv->memb->off;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Lower flattened initializer leaves into a static object's byte image
  * plus a relocation list. Shared by file-scope globals and static locals
  * — both have static storage, so every leaf must reduce to constant
@@ -1291,23 +1355,13 @@ static void lower_static_bytes(struct unit *u, int line, int size,
          * decayed to a pointer (`char **environ = embk_empty_env`). */
         struct global *gt = NULL;
         struct func *ft = NULL;
-        if (core && core->kind == EXPR_VAR && core->gref)
-            gt = core->gref;
-        else if (core && core->kind == EXPR_VAR && core->fref)
-            ft = core->fref;             /* a function address (a vtable) */
-        else if (core && core->kind == EXPR_ADDR) {
-            struct expr *in = core->rhs;
-            while (in && in->kind == EXPR_CAST)
-                in = in->rhs;
-            if (in && in->kind == EXPR_VAR && in->gref)
-                gt = in->gref;
-            else if (in && in->kind == EXPR_VAR && in->fref)
-                ft = in->fref;
-        }
+        long addend = 0;
+        if (core && core->kind != EXPR_STR)
+            resolve_addr(core, &gt, &ft, &addend);
         if ((core && core->kind == EXPR_STR && v[k].ty->kind == TY_PTR) ||
             ((gt || ft) && v[k].ty->kind == TY_PTR)) {
             /* a pointer slot: zero bytes stay, the linker writes the address
-             * of a string literal, a global, or a function. */
+             * of a string literal, a global (+addend), or a function. */
             if (nrel == caprel) {
                 caprel = caprel ? caprel * 2 : 4;
                 rel = xrealloc(rel, (size_t)caprel * sizeof *rel);
@@ -1317,7 +1371,7 @@ static void lower_static_bytes(struct unit *u, int line, int size,
             rel[nrel].str_len = (gt || ft) ? 0 : (int)core->num;
             rel[nrel].gtarget = gt;
             rel[nrel].ftarget = ft;
-            rel[nrel].addend = 0;
+            rel[nrel].addend = addend;
             nrel++;
             continue;
         }
@@ -1790,6 +1844,8 @@ static int is_noreturn_call(const struct expr *e)
 {
     if (e->kind != EXPR_CALL || !e->name)
         return 0;
+    if (e->callee && e->callee->is_noreturn)
+        return 1;                       /* __attribute__((noreturn)) callee */
     static const char *const nr[] = {
         "exit", "abort", "_Exit", "diag_fatal",
         "__builtin_unreachable", "__builtin_trap",
@@ -1926,6 +1982,7 @@ static void merge_decls(struct unit *u)
                 canon->params[i] = f->params[i]; /* definition names win */
         }
         canon->is_weak |= f->is_weak;  /* weak on any declaration is weak */
+        canon->is_noreturn |= f->is_noreturn;  /* noreturn on any wins */
         f->absorbed = 1;
     }
 }
