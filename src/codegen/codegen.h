@@ -46,6 +46,6 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct strsite **strs, int *nstrs,
                   struct gsite **gs, int *ngs,
                   struct fsite **fs, int *nfs, int want_debug, int optimize,
-                  int no_sse);
+                  int no_sse, int regalloc);
 
 #endif

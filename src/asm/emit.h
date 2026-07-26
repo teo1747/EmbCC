@@ -96,6 +96,13 @@ void x86_movs_load_base(struct code *c, int xmm, int base, int disp, int w);
 void x86_movs_store_base(struct code *c, int base, int disp, int xmm, int w);
 void x86_lea_reg_slot(struct code *c, int dst, int disp); /* lea r,[rbp+d] */
 void x86_mov_reg_reg(struct code *c, int dst, int src);   /* 64-bit */
+/* register-register forms for the -O2 register allocator (values live in
+ * callee-saved regs, not memory). All operate on register NUMBERS 0..15. */
+void x86_mov_rr_w(struct code *c, int dst, int src, int w);   /* dst=src, 32/64 */
+void x86_movsxd_rr(struct code *c, int dst, int src);         /* dst64=sext(src32) */
+void x86_alu_rr(struct code *c, int op, int dst, int src, int w); /* dst op= src */
+void x86_cmp_rr(struct code *c, int a, int b, int w);         /* cmp a, b */
+void x86_div_rr(struct code *c, int src, int sign, int w);    /* [rdx:rax]/src */
 /* argument registers by index, for aggregates arriving in pieces */
 int  x86_argreg(int index);
 void x86_not_eax(struct code *c, int w);

@@ -322,6 +322,39 @@ EmbCC's stack usage drops, no kernel change is needed.)*
 
 </details>
 
+### K14 — register allocation (`-O2`) — **DONE**
+
+**RESOLVED (branch Teo).** EmbCC gained a real register allocator at a new
+`-O2`, on top of K13's slot coalescing. Eligible vregs (temps, and scalar
+int/long/pointer locals & params of size 4/8) live in the five callee-saved GPRs
+(rbx, r12–r15) instead of memory, so their loads/stores vanish. Design:
+
+- **Callee-saved only** — such a value survives a call untouched, so there is no
+  spill-around-call machinery; the function saves/restores the regs it uses in
+  dedicated frame slots. Params are synced slot→reg once in the prologue.
+- **Real liveness** — a backward dataflow (`compute_live_intervals`) gives each
+  vreg a live range that correctly spans loop back-edges; a linear scan colours
+  non-interfering ranges with the 5 registers, spilling the rest to memory. (An
+  earlier first/last-appearance interval was unsound across loops — a
+  loop-carried value's register got clobbered mid-loop; the dataflow fixed it.)
+- **Conservative eligibility** — any vreg touching an "opaque" raw-slot site (a
+  float op, an address-of, an atomic/memcpy/store-address/va_start/call-arg, or
+  inline asm — or live across an asm) stays in memory. Missing an exclusion
+  would read a stale slot, so the allocator errs toward memory.
+- **`-O0`/`-O1` untouched** — everything is gated on the regalloc flag, so their
+  output stays byte-identical (the RAX residency cache is disabled at `-O2`,
+  where register-resident values would make its tracking stale).
+
+Verified: all 60 exec programs match gcc's exit + stdout at `-O2`
+(`tests/golden/regalloc-O2.sh`); a stress corpus (values live across calls,
+recursion, register pressure > 5 forcing spills, 8-param calls, div/mod/shift,
+pointers/structs/narrow types) agrees with gcc at `-O0`/`-O1`/`-O2`; codegen is
+deterministic; EmbCC self-compiles at `-O2` and links; the kernel compiles
+89/89 at `-O2`. Memory traffic drops materially — a simple counted loop went
+from 35 to 15 rbp-relative accesses (counter + accumulator now in registers).
+Suite 91/91. *(Next steps if pushed further: allocate call-argument values and
+narrow (char/short) locals; graph-colouring instead of linear scan.)*
+
 ---
 
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)

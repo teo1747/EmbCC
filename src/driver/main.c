@@ -165,7 +165,8 @@ static int compile(const char *in, const char *out, int pp_only)
     struct fsite *fs;
     int next, nstrs, ngs, nfs;
     codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
-                 &fs, &nfs, want_debug, opt_level >= 1, no_sse);
+                 &fs, &nfs, want_debug, opt_level >= 1, no_sse,
+                 opt_level >= 2);
 
     /* Lay out the defined globals: initialized -> .data, zero -> .bss,
      * each aligned to its (element) size. */

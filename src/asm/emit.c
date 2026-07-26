@@ -175,6 +175,59 @@ void x86_mov_reg_reg(struct code *c, int dst, int src)
     code_byte(c, 0xc0 | ((src & 7) << 3) | (dst & 7));
 }
 
+/* dst = src, w-bit. w==4 leaves a 32-bit mov (zeroing the upper half — the
+ * register allocator's "narrow value is zero-extended" invariant); w==8 is a
+ * full 64-bit copy. */
+void x86_mov_rr_w(struct code *c, int dst, int src, int w)
+{
+    rex_rb(c, w == 8, src, dst);
+    code_byte(c, 0x89); /* mov r/m, r : reg=src, rm=dst */
+    code_byte(c, 0xc0 | ((src & 7) << 3) | (dst & 7));
+}
+
+/* dst64 = sign-extend(src's low 32 bits) — movsxd. */
+void x86_movsxd_rr(struct code *c, int dst, int src)
+{
+    rex_rb(c, 1, dst, src);
+    code_byte(c, 0x63); /* movsxd reg, r/m32 : reg=dst, rm=src */
+    code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
+/* dst op= src (+ - * & | ^), w-bit — the reg-reg twin of x86_alu_eax_mem, same
+ * "r, r/m" opcodes with reg=dst, rm=src. */
+void x86_alu_rr(struct code *c, int op, int dst, int src, int w)
+{
+    rex_rb(c, w == 8, dst, src);
+    switch (op) {
+    case '+': code_byte(c, 0x03); break;
+    case '-': code_byte(c, 0x2b); break;
+    case '*': code_byte(c, 0x0f); code_byte(c, 0xaf); break;
+    case '&': code_byte(c, 0x23); break;
+    case '|': code_byte(c, 0x0b); break;
+    case '^': code_byte(c, 0x33); break;
+    default:
+        fprintf(stderr, "embcc: internal: no reg-reg encoding for '%c'\n", op);
+        exit(1);
+    }
+    code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
+/* cmp a, b (computes a - b, sets flags) — reg-reg twin of x86_cmp_eax_mem. */
+void x86_cmp_rr(struct code *c, int a, int b, int w)
+{
+    rex_rb(c, w == 8, a, b);
+    code_byte(c, 0x3b); /* cmp r, r/m : reg=a, rm=b */
+    code_byte(c, 0xc0 | ((a & 7) << 3) | (b & 7));
+}
+
+/* [rdx:rax] / src -> quotient rax, remainder rdx (idiv /7, div /6). */
+void x86_div_rr(struct code *c, int src, int sign, int w)
+{
+    rex_rb(c, w == 8, 0, src);
+    code_byte(c, 0xf7);
+    code_byte(c, 0xc0 | ((sign ? 7 : 6) << 3) | (src & 7));
+}
+
 int x86_argreg(int index)
 {
     static const int regs[6] = { REG_RDI, REG_RSI, REG_RDX, REG_RCX,
