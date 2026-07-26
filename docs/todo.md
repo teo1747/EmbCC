@@ -25,9 +25,8 @@ hardware C — a materially harder corpus than TinyCC/newlib. Repro from `myos/`
 for f in $(find kernel -name '*.c'); do /home/motsou/EmbCC/embcc -c "$f" -Ikernel -o /tmp/x.o; done
 ```
 
-***79 / 89 kernel TUs now compile clean (was 22).*** **K1–K9 are all closed.**
-The remaining 10 are distinct one-off gaps (below, "Remaining"), not the
-lettered blockers. No kernel C was changed to work around any of these.
+***89 / 89 kernel TUs compile clean (was 22) — the whole kernel builds under
+EmbCC.*** K1–K9 and every one-off below are closed. No kernel C was changed.
 
 ### K1 — inline-asm assembler — DONE
 EmbCC's extended-asm assembler (irgen.c `asm_assemble`) grew from
@@ -42,17 +41,24 @@ encoding byte-verified against objdump: fixed-form (`cli`/`sti`/`hlt`/`nop`/
 `%N` refs, and `volatile`. Small parse helpers read the operand forms; unknown
 mnemonics still refuse loudly. Golden test: tests/golden/inline-asm-kernel.sh.
 
-### Remaining one-offs (each a distinct feature, not a lettered gap)
-Ten TUs still fail, each on something different: a GCC **statement expression**
-`({ ... })` (selftests.c); an **array-range designator** `[a ... b] =`
-(font_8x16.c); a **`static`-init that isn't constant** (keyboard.c); a
-function that ends in a **non-returning asm loop** so the return-path check
-fires (syscall.c `sys_exit`); a **`typedef` form** the parser trips on
-(kprintf.c); an **asm constraint** not yet parsed (usermode.c); the gdt.c
-**segment-reload trampoline** (inline-asm local labels + RIP-relative `leaq` +
-`lretq`); a **`_Static_assert` ICE** (embkfs.c); plus integration
-(a freestanding `<string.h>` for fd.c). The char*/unsigned char* signedness
-mismatch (fat32.c) is now allowed.
+### One-offs — ALL DONE
+The ten distinct remaining gaps, each closed and gcc-verified:
+- GCC **statement expressions** `({ ... })` — EXPR_STMTEXPR (selftests.c).
+- GNU **array-range designators** `[lo ... hi] = v` (font_8x16.c).
+- **`__attribute__((noreturn))`** honored in the return-path check (syscall.c).
+- **`__builtin_va_list`** accepted as `char *` (kprintf.c).
+- **`&global` at a constant offset** in a static initializer — `&arr[i]`,
+  `&g.field`, `p+n` — via a recursive resolve_addr filling greloc's addend
+  (keyboard.c).
+- **`sizeof(EXPR)`** folded in an ICE when the type is resolvable
+  (`sizeof(((T*)0)->f)`, embkfs.c) and **`sizeof(local/global var)`** (fd.c).
+- freestanding **`<string.h>`** (fd.c); **char\*/unsigned char\*** signedness.
+- inline asm the three low-level TUs need: `mov` reg/imm↔GPR and segment
+  registers, `pushq $imm`, `iretq`/`lretq`, a local-label RIP-relative `leaq`
+  (the gdt trampoline), and named `%[operand]`s with the "i" constraint
+  (process.c, gdt.c, usermode.c). **CRITICAL fix along the way:** the
+  per-instruction operand-skip stopped only at `;`, silently dropping every
+  instruction after the first in a `\n`-separated template — now stops at `\n`.
 
 ### K2 — GCC builtins — DONE
 `__builtin_bswap16/32/64` (IR_BSWAP), `__sync_synchronize` (mfence),
