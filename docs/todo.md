@@ -401,6 +401,48 @@ thin the temp-heavy IR that still emits redundant copies.)*
 
 ---
 
+## EmbLD — linking the kernel (the LINK side of self-host)
+
+*With the compile side done (K1–K13), the next step is linking the kernel with
+**EmbLD** instead of `x86_64-elf-ld`, so the whole toolchain is owned. Tried it —
+and it very nearly just works.*
+
+***🎉 Proven: an EmbCC-compiled, EmbLD-linked kernel boots to the home desktop***
+*(EMBKFS mounted, `home.elf` pid 4, compositor window, Clock first frame). No GCC,
+no `ld` in the loop.* EmbLD already produces a correct higher-half kernel: the
+`.text` LOAD at vaddr `0xffffffff80100000`, a page-aligned second LOAD for
+`.data`/`.bss`, the entry point from `-e _start`, and program headers the
+bootloader loads. Invocation:
+
+```
+embld -e _start -Ttext 0xFFFFFFFF80100000 -o kernel.elf <all .o> <nasm .o>
+```
+
+### L1 — linker-defined symbols (`kernel_end`) — the ONE blocker
+The kernel's linker script ends with `kernel_end = .;` and `pmm.c` places the PMM
+bitmap at `kernel_end`. EmbLD has no `-T`/symbol-assignment, so:
+
+```
+embld: undefined symbol 'kernel_end' (referenced by …/pmm.c.o)
+```
+
+It's the **only** thing missing — a diagnostic stub (`kernel_end equ <addr past
+the image>`) let the link succeed and the kernel boot to the desktop. **Fix
+options:** (a) minimal `-T` linker-script support handling `SYM = .` assignments
+(the general answer — also subsumes `-Ttext`/`-e`/`ENTRY()`); or (b) implicitly
+define end-of-image symbols and let the kernel script alias `kernel_end` to one.
+Once EmbLD defines `kernel_end` at the true end of `.bss`, the stub goes and the
+kernel links with **zero** external tools.
+
+### L2 — cosmetic: `AT()` LMA (p_paddr) — not a blocker
+EmbLD sets `p_paddr = p_vaddr` (no `AT()` load-address split), so the LOAD
+segments report a higher-half `PhysAddr`. Both loaders (stage2 and the UEFI
+loader) derive the physical destination from `p_vaddr − KERNEL_VIRTUAL_BASE` and
+ignore `p_paddr`, so it boots fine — but a correct `p_paddr` (real LMA `0x100000`)
+would be nicer for a general kernel ELF. Low priority.
+
+---
+
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
 
 *Status: both landed. On the TinyCC 0.9.27 corpus (24 files) the block-scope
