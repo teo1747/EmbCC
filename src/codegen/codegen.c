@@ -595,32 +595,60 @@ static int *coalesce_locals(struct ir_func *fn, int *nslots_out)
         *nslots_out = n;
         return slot;
     }
-    int *lo = fn->var_scope_lo, *hi = fn->var_scope_hi;
-
-    /* order locals by scope start (ties by index), via buckets over the [0,nins]
-     * instruction range — deterministic. */
     int nins = fn->nins;
+
+    /* Per-local lifetime range [rlo, rhi): an ADDRESS-TAKEN local (its address
+     * could reach a pointer we don't track) is bounded by its lexical SCOPE
+     * (sound — a stack pointer past its scope is UB); a non-address-taken local,
+     * accessed only by direct LDVAR/STVAR, uses its precise LIVENESS range,
+     * which is tighter and lets two same-scope locals with disjoint lifetimes
+     * share a slot (gcc does the same). */
+    char *at = xcalloc((size_t)n, 1);
+    for (int i = 0; i < nins; i++)
+        if (fn->ins[i].op == IR_ADDR) {
+            int v = fn->ins[i].a;
+            if (v >= 0 && v < n) at[v] = 1;
+        }
+    int *lf = xmalloc((size_t)fn->nvregs * sizeof *lf);
+    int *ll = xmalloc((size_t)fn->nvregs * sizeof *ll);
+    unsigned long *lin = NULL, *lout = NULL; int *dv = NULL, lw = 0;
+    lout = compute_live_intervals(fn, lf, ll, &lin, &dv, &lw);
+
+    int *rlo = xmalloc((size_t)n * sizeof *rlo);
+    int *rhi = xmalloc((size_t)n * sizeof *rhi);
+    for (int i = 0; i < n; i++) {
+        if (at[i] || lf[i] < 0) {           /* scope-bounded (or never referenced) */
+            rlo[i] = fn->var_scope_lo[i];
+            rhi[i] = fn->var_scope_hi[i];
+        } else {                             /* tighter: precise liveness */
+            rlo[i] = lf[i];
+            rhi[i] = ll[i] + 1;              /* half-open */
+        }
+    }
+    free(at); free(lf); free(ll); free(lout); free(lin); free(dv);
+
+    /* interval-graph colouring in range-start order (optimal for intervals):
+     * reuse a slot once its occupant's range ends at or before this one starts. */
     int *head = xmalloc((size_t)(nins + 2) * sizeof *head);
     for (int i = 0; i <= nins + 1; i++) head[i] = -1;
     int *nxt = xmalloc((size_t)n * sizeof *nxt);
     for (int i = n - 1; i >= 0; i--) {
-        int b = lo[i]; if (b < 0) b = 0; if (b > nins + 1) b = nins + 1;
+        int b = rlo[i]; if (b < 0) b = 0; if (b > nins + 1) b = nins + 1;
         nxt[i] = head[b]; head[b] = i;
     }
-
-    int *slot_free = xmalloc((size_t)n * sizeof *slot_free); /* free-after per slot */
+    int *slot_free = xmalloc((size_t)n * sizeof *slot_free);
     int ns = 0;
     for (int b = 0; b <= nins + 1; b++)
         for (int i = head[b]; i >= 0; i = nxt[i]) {
             int pick = -1;
             for (int s = 0; s < ns; s++)
-                if (slot_free[s] <= lo[i]) { pick = s; break; }
+                if (slot_free[s] <= rlo[i]) { pick = s; break; }
             if (pick < 0) { pick = ns++; }
             slot[i] = pick;
-            slot_free[pick] = hi[i];   /* busy until this local's scope ends */
+            slot_free[pick] = rhi[i];
         }
     *nslots_out = ns;
-    free(head); free(nxt); free(slot_free);
+    free(head); free(nxt); free(slot_free); free(rlo); free(rhi);
     return slot;
 }
 
