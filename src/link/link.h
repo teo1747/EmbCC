@@ -20,6 +20,10 @@ struct link_opts {
     unsigned long base;     /* text load address; 0 = 0x400000 (TARGET_ABI) */
     int emit_embx;          /* 1 = write a native EMBX binary instead of ELF */
     unsigned long long caps;/* EMBX capability bitmask (bit == cap_id); 0 = none */
+    /* L2: physical load address (p_paddr) = vaddr - lma_offset, for a
+     * higher-half kernel whose LMA is its VMA minus KERNEL_VIRTUAL_BASE.
+     * 0 = p_paddr == p_vaddr (the ordinary case). */
+    unsigned long long lma_offset;
 };
 
 /* Links inputs[0..n) into an ET_EXEC at `out`. Inputs are object files

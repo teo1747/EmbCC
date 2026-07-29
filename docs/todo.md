@@ -477,9 +477,9 @@ those two myos docs; only the EmbCC/EmbLD/assembler work is tracked here.*
 
 | # | Gap | State | Unlocks |
 |---|-----|-------|---------|
-| **L1** | EmbLD linker-defined symbols (`kernel_end`) | open — see the EmbLD section above | kernel links with **no `ld` and no stub** |
+| **L1** | EmbLD linker-defined symbols (`kernel_end`) | **DONE** — `define_end_symbols` auto-provides `kernel_end`/`_end`/`end`/`__bss_end` at the image end (only if referenced; a real def wins; a genuinely-undefined symbol still errors) | kernel links with **no `ld` and no stub** |
 | **A1** | EmbCC standalone `.asm` assembler (NASM/Intel front-end) | **in progress** (the active frontier) | drops **nasm** — EmbCC = compiler+assembler; `EmbBuild`-builds-the-kernel (KM1) |
-| **L2** | EmbLD `AT()` LMA (`p_paddr`) | open, low priority | cosmetically-correct kernel ELF |
+| **L2** | EmbLD `AT()` LMA (`p_paddr`) | **DONE** — `embld --lma-offset OFFSET` sets `p_paddr = p_vaddr - OFFSET` (higher-half kernel LMA); default keeps `p_paddr == p_vaddr` | cosmetically-correct kernel ELF |
 | **X1** | EMBX emission driven by a build manifest (+ inline namespace, `build_id`) | forward-looking (packaging is design-only) | EmbCC/EmbLD become the **SDK producer** (packaging PK2) |
 
 ### A1 — a standalone assembler (grow EmbCC into compiler+assembler)
