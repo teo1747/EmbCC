@@ -443,6 +443,80 @@ would be nicer for a general kernel ELF. Low priority.
 
 ---
 
+## Toolchain frontier — owning the whole build (consolidated)
+
+*Added 2026-07-29 from the OS side (myos `docs/BUILD.md` §12 + `docs/PACKAGING_AND_SDK.md`).
+Compile is done (K1–K14); these are the remaining pieces to a build with **zero
+external tools**, and then to being the **SDK's producer**. OS-side context lives in
+those two myos docs; only the EmbCC/EmbLD/assembler work is tracked here.*
+
+| # | Gap | State | Unlocks |
+|---|-----|-------|---------|
+| **L1** | EmbLD linker-defined symbols (`kernel_end`) | open — see the EmbLD section above | kernel links with **no `ld` and no stub** |
+| **A1** | EmbCC standalone `.asm` assembler (NASM/Intel front-end) | **in progress** (the active frontier) | drops **nasm** — EmbCC = compiler+assembler; `EmbBuild`-builds-the-kernel (KM1) |
+| **L2** | EmbLD `AT()` LMA (`p_paddr`) | open, low priority | cosmetically-correct kernel ELF |
+| **X1** | EMBX emission driven by a build manifest (+ inline namespace, `build_id`) | forward-looking (packaging is design-only) | EmbCC/EmbLD become the **SDK producer** (packaging PK2) |
+
+### A1 — a standalone assembler (grow EmbCC into compiler+assembler)
+
+The last external tool in the kernel build is **nasm**: the 6 kernel `.asm`
+(+ `stage1.asm`/`stage2.asm`) are NASM syntax, and TCC's integrated assembler is
+GAS/AT&T, so nothing on the image assembles them. Recommendation (from BUILD.md
+§12): **not** porting nasm — grow EmbCC a standalone assembler front-end over the
+encoder K1 already built, so EmbCC becomes compiler+assembler (like TCC is
+compiler+assembler+linker in one), fully owned, and the kernel `.asm` stay
+**untouched** (EmbCC learns their syntax).
+
+The corpus is small and bounded — **621 lines, 11 directives, ~23 mnemonics**:
+
+- **Directives (~8 distinct):** `global`/`extern`, `section`, `align`,
+  `db`/`dw`/`dd`/`dq`/`resb`, `%macro`, `incbin`.
+- **Front-end:** an **Intel-syntax** file-level parser (the K1 assembler is AT&T,
+  inline-asm-shaped — this is the new part): instruction parser + operand table,
+  the ~8 directives, one `%macro` expander (the `isr0..255` stub is the only real
+  macro user), `incbin` (`ap_trampoline_blob`), and **ELF-object emission with
+  relocations** so EmbLD links the output.
+- **Encoder:** add the ~10 mnemonics the K1 encoder is missing (most of the ~23
+  are already there).
+
+*Green:* `embcc --asm foo.asm -o foo.o` (or an assemble mode) produces objects
+byte-runnable when EmbLD-linked; the 6 kernel `.asm` assemble and the resulting
+kernel boots. This is the one genuinely new subsystem (a real port/feature, not a
+codegen tweak) and it is **THE blocker** for `EmbBuild`-builds-the-kernel (myos
+BUILD.md §12, KM1). *Porting nasm stays the fallback.*
+
+### X1 — EMBX emission as the SDK producer (forward-looking, not yet needed)
+
+EmbCC/EmbLD already emit EMBX with a declared capability set
+(`embld --embx --cap NAME`). The OS's packaging + SDK design
+(myos `docs/PACKAGING_AND_SDK.md`, phase **PK2**) wants the toolchain to be the
+single producer of an app's declared authority — *when packaging work starts*, not
+now (packaging is design-only). The EmbCC-side asks:
+
+1. **Drive the EMBX capability table from the build manifest** (`build.ebm` package
+   stanza) instead of only command-line `--cap`, so declaring authority is part of
+   building.
+2. **Optional inline namespace section** in EMBX beside the capability table, so an
+   EMBX binary can carry its own namespace declaration (today ELF apps ship a
+   sidecar `<name>.ns`; this is the EMBX-native equivalent noted in the packaging
+   doc §4 / userspace UP4).
+3. **Fill the header fields the packager verifies** — `build_id[32]` = SHA-256 of
+   the image, `header_checksum` (CRC32C), `abi_version` — so `pkg install` can
+   verify a bundle by content. *(Confirm which EmbLD already stamps; fill the rest.)*
+
+*No action until PK1/PK2 begin on the OS side; recorded so the producer end is
+scoped when it does.*
+
+### Codegen — verify the large-frame tail is closed
+
+K14 (register allocation, `-O2`) is done; confirm it closed the residual K13 tail
+(a few userspace **mega-functions** were 3–5× GCC frames — e.g. the shell's
+`shell_handle_process_command` at ~82 KB vs 16.5 KB — which would overflow a
+16 KiB stack; the *boot path* was already fine). Not a new gap if `-O2` covers it —
+just a check to retire the note.
+
+---
+
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
 
 *Status: both landed. On the TinyCC 0.9.27 corpus (24 files) the block-scope
