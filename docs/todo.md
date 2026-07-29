@@ -395,9 +395,34 @@ elides reloads of register-resident values), with a zero-extend-aware relaxation
 so a 4-byte store then 8-byte reload (the `IR_MOV` round-trip) is elided.
 Result: whole-kernel `-O2` .text is **23% smaller than `-O0`** (2.42 MB →
 1.84 MB); a copy-heavy function fell 39→24 movs. Still 91/91, deterministic,
-`-O0`/`-O1` byte-identical, kernel 89/89. *(Further still: spill-cost heuristics
-and Briggs-style optimistic colouring; strength reduction; value numbering to
-thin the temp-heavy IR that still emits redundant copies.)*
+`-O0`/`-O1` byte-identical, kernel 89/89.
+
+**Follow-up 2 (same session) — the deferred optimizer list, ALL done:**
+- **`volatile` tracking** (a latent correctness fix — EmbCC ignored it, so ANY
+  memory optimization would have broken MMIO): `type.is_volatile` → IR
+  load/store/ldvar/stvar `vol`; a member of a volatile struct is itself volatile
+  (ehci/ohci register structs). `ty_volatile` copies the type; struct identity
+  equality follows a `canon` back-pointer.
+- **Local value numbering (CSE)**, `pass_lvn`: pure ops, address arithmetic,
+  constants, and non-volatile loads are numbered within a basic block (loads
+  memory-versioned so a store forces a reload; volatile never numbered).
+- **Strength reduction**: `x*2^k`→`x<<k`, unsigned `/2^k`→`>>k`, `%2^k`→`&(2^k-1)`
+  (signed div stays idiv).
+- **Same-scope local coalescing by liveness**: a non-address-taken local uses
+  its precise liveness range (address-taken stay scope-bounded), so same-scope
+  disjoint-lifetime locals share a slot.
+- **Chaitin-Briggs optimistic register colouring** (simplify/select, spill the
+  most-constrained node).
+
+Net effect: `a[i]+a[i]`→one load+multiply; `poly()` 119→80 insns; **whole-kernel
+`-O2` .text 2.42 MB → 1.47 MB (39% under `-O0`)**; `shell_handle_process_command`
+frame 84 KB → 30.6 KB (gcc 16.5 KB). Correctness: gcc-refereed tests
+(`cse.c`/`strength.c`/`same-scope.c`), the stress corpus, volatile-MMIO
+preservation, suite **95/95**, self-host deterministic, kernel 89/89 at -O0/-O2.
+*(Remaining gap to gcc on leaf compute loops is codegen-architectural: EmbCC
+hardcodes rax/rcx/rdx as scratch, so only the 5 callee-saved regs are
+allocatable where gcc uses all 15; and same-scope ADDRESS-TAKEN arrays still need
+alias analysis to coalesce like gcc.)*
 
 ---
 
