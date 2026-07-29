@@ -62,7 +62,10 @@ turns out to be painful in C and obvious in the other language.
 at the bottom triggered.** The original decision (emit ELF, native format only
 as an ELF superset) and its reasoning are kept below because the reasoning is
 still correct; what changed is the conclusion, and honestly so — see the
-revision block.
+revision block. **Realized 2026-07-26:** EmbLD emits EMBX natively (`embld
+--embx --cap NAME`) — byte-identical to the reference producer, on the host and
+on the OS — so the revised conclusion is not just decided but produced by the
+toolchain (ELF stays the porting substrate; the dual loader is unchanged).
 
 EmbCC emits ELF in the exact shape EmbLinkOS's in-kernel loader accepts
 (see TARGET_ABI.md). It does **not** invent a container format.
@@ -234,10 +237,14 @@ values language — the gate is unchanged, only the expectation is.
 
 ## D-009 — Own libc: **emlibc**, non-POSIX, EmbLink-shaped
 
-**Decided:** 2026-07-23. **Status:** current intent, deferred; requirements
-written (`myos/docs/EMLIBC_Requirements.md`), no implementation.
+**Decided:** 2026-07-23. **Status:** REALIZED (2026-07-26). emlibc is implemented
+(`myos/user/emlibc/`), EmbCC compiles it on the OS **floating point included**
+(real `fdlibm` math), and it self-hosts and ships as EMBX — the closed loop the
+last paragraph below names, reached: `test emlibc math selfhost` has the OS
+build the whole libc with EmbCC + EmbLD and run it. Requirements:
+`myos/docs/EMLIBC_Requirements.md`.
 
-EmbCC's eventual link target is **emlibc**, EmbLinkOS's own C library, not
+EmbCC's link target is **emlibc**, EmbLinkOS's own C library, not
 newlib (nor musl/glibc). The requirements doc is the OS-side artifact; EmbCC
 consumes its contract, the same relationship it has with the EMBX format spec.
 
@@ -275,15 +282,17 @@ here answers to.
 
 ## D-010 — Debug info: **DWARF as the bridge, native `.embdbg` derived last**
 
-**Decided:** 2026-07-24. **Status:** current intent, deferred; requirements
-written (`docs/EMBDBG_Requirements.md`), no byte layout on this side, no
-implementation. **Update (same day):** the OS side now carries the byte-exact
-format AND the kernel debugging contract (`myos/docs/EMBDBG_Specification.md`) —
-which supplies the consumer and invariants this decision said `.embdbg` must be
-derived from. It does not revise D-010: DWARF stays the host bridge, and the
-producer finding is that the LINKER (EmbLD), not the compiler, emits the
-absolute-addressed `.embdbg` — EmbCC's ET_REL objects carry only *relocatable*
-line info (the EMBX finding, one channel over; see EMBDBG_Requirements.md).
+**Decided:** 2026-07-24. **Status:** landing as predicted. Requirements written
+(`docs/EMBDBG_Requirements.md`); the OS side carries the byte-exact format AND
+the kernel debugging contract (`myos/docs/EMBDBG_Specification.md`) — the
+consumer and invariants this decision said `.embdbg` must be derived from.
+**Realized 2026-07-26:** EmbCC emits **DWARF line info** (`-g`, the host bridge),
+and **EmbLD emits the native `.embdbg`** at link time (`emit_embdbg`) — exactly
+the split this decision predicted: the LINKER, not the compiler, produces the
+absolute-addressed sidecar, because EmbCC's ET_REL objects carry only
+*relocatable* line info (the EMBX finding, one channel over). DWARF stays the
+bridge; the `.embdbg` byte layout was still derived from what EmbDBG actually
+needs, not ahead of it.
 
 EmbCC's first debug output will be **minimal DWARF line info**, because it is
 debuggable by tools that already exist (gdb/lldb) on the host, the day it lands

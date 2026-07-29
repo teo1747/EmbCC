@@ -101,9 +101,6 @@ check void-variable \
 check array-assign \
     'int main(void) { int a[3]; int b[3]; a = b; return 0; }' \
     "cannot assign to an array"
-check addr-of-array \
-    'int main(void) { int a[3]; return !&a; }' \
-    "already the address"
 check array-scalar-init \
     'int main(void) { int a[3] = 0; return 0; }' \
     "brace initializer or a string"
@@ -296,7 +293,7 @@ check asm-bad-constraint \
     'int main(void) { int x; __asm__("int $0x80" : "=t"(x)); return x; }' \
     "is not supported"
 check asm-bad-template \
-    'int main(void) { __asm__("nop"); return 0; }' \
+    'int main(void) { __asm__("vzeroall"); return 0; }' \
     "not supported"
 check asm-out-not-lvalue \
     'int main(void) { __asm__("int $0x80" : "=a"(1 + 2)); return 0; }' \

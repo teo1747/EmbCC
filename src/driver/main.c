@@ -120,6 +120,12 @@ static int want_debug;
  * as before — the property the self-host fixed point rests on. */
 static int opt_level;
 
+/* -mno-sse: never emit an SSE/xmm instruction (no varargs xmm spill, no SSE
+ * struct/float lowering). A kernel built before it enables CR4.OSFXSR needs
+ * this — any SSE op faults with #UD. Off by default, so ordinary output is
+ * unchanged. */
+static int no_sse;
+
 static int compile(const char *in, const char *out, int pp_only)
 {
     char *src = read_file(in);
@@ -159,7 +165,8 @@ static int compile(const char *in, const char *out, int pp_only)
     struct fsite *fs;
     int next, nstrs, ngs, nfs;
     codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
-                 &fs, &nfs, want_debug, opt_level >= 1);
+                 &fs, &nfs, want_debug, opt_level >= 1, no_sse,
+                 opt_level >= 2);
 
     /* Lay out the defined globals: initialized -> .data, zero -> .bss,
      * each aligned to its (element) size. */
@@ -396,10 +403,26 @@ static int compile(const char *in, const char *out, int pp_only)
         if (g->absorbed || !g->defined || g->in_bss)
             continue;
         for (int i = 0; i < g->nrelocs; i++) {
-            int sym = g->relocs[i].gtarget ? g->relocs[i].gtarget->sym_ndx
-                                           : rodata_sym;
-            long add = g->relocs[i].gtarget ? g->relocs[i].addend
-                       : g->relocs[i].str_off + g->relocs[i].addend;
+            struct func *ft = g->relocs[i].ftarget;
+            int sym;
+            long add;
+            if (ft) {
+                /* a function pointer (a vtable): resolve to the function's
+                 * symbol; an external, never-called one needs an UNDEF. */
+                if (!ft->sym_ndx)
+                    ft->sym_ndx = elfw_add_symbol(
+                        w, ft->name, 0, 0,
+                        ELF64_ST_INFO(ft->is_weak ? STB_WEAK : STB_GLOBAL,
+                                      STT_NOTYPE), SHN_UNDEF);
+                sym = ft->sym_ndx;
+                add = g->relocs[i].addend;
+            } else if (g->relocs[i].gtarget) {
+                sym = g->relocs[i].gtarget->sym_ndx;
+                add = g->relocs[i].addend;
+            } else {
+                sym = rodata_sym;
+                add = g->relocs[i].str_off + g->relocs[i].addend;
+            }
             elfw_add_rela(w, data_ndx,
                           (Elf64_Addr)(g->off + g->relocs[i].off),
                           sym, R_X86_64_64, add);
@@ -492,6 +515,16 @@ int main(int argc, char **argv)
                         argv[i]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "-mno-sse") == 0 ||
+                   strcmp(argv[i], "-mno-sse2") == 0 ||
+                   strcmp(argv[i], "-mgeneral-regs-only") == 0) {
+            no_sse = 1;   /* -mno-mmx / -mno-80387 imply it too, below */
+        } else if (strcmp(argv[i], "-mno-mmx") == 0 ||
+                   strcmp(argv[i], "-mno-red-zone") == 0 ||
+                   strcmp(argv[i], "-mno-80387") == 0 ||
+                   strncmp(argv[i], "-mcmodel=", 9) == 0) {
+            /* accepted: EmbCC never uses MMX or the red zone, and its default
+             * code model already suits the kernel's higher-half link. */
         } else if (strncmp(argv[i], "-I", 2) == 0) {
             const char *dir = argv[i][2] ? argv[i] + 2
                                          : (i + 1 < argc ? argv[++i] : 0);

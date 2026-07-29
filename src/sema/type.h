@@ -15,6 +15,12 @@
 #ifndef EMBCC_SEMA_TYPE_H
 #define EMBCC_SEMA_TYPE_H
 
+/* The most parameters/arguments a function type, prototype, or call carries.
+ * Defined here (not ast.h) because struct type's ptypes[] lives here and
+ * ast.h includes this header — the two must agree or a >N-param function
+ * type overflows ptypes[]. */
+#define MAX_PARAMS 32
+
 enum ty_kind { TY_VOID, TY_BOOL, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
                TY_FLOAT, TY_DOUBLE, TY_PTR,
                TY_ARRAY, TY_STRUCT, TY_FUNC };
@@ -26,6 +32,7 @@ struct member {
     int is_bitfield;
     int bit_off;          /* bitfield: bit position within the storage unit */
     int bit_width;        /* bitfield: width in bits (0 = zero-width separator) */
+    int user_align;       /* __attribute__((aligned(N))) on the member; 0 = none */
 };
 
 struct type {
@@ -42,7 +49,7 @@ struct type {
     int size, align;        /* SysV layout, computed when completed */
     /* TY_FUNC (always behind a pointer in this subset): */
     struct type *ret;
-    struct type *ptypes[12];
+    struct type *ptypes[MAX_PARAMS];
     int nptypes;
     int is_varargs;
 };

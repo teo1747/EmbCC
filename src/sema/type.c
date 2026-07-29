@@ -81,6 +81,11 @@ void ty_struct_layout(struct type *t, struct member *members, int n,
     for (int i = 0; i < n; i++) {
         struct member *m = &members[i];
         int ma = packed ? 1 : ty_align(m->ty);
+        /* An explicit __attribute__((aligned(N))) on the member raises its
+         * alignment (and, through `align` below, the struct's) — it overrides
+         * even `packed`, which only lowers the *default* alignment. */
+        if (m->user_align > ma)
+            ma = m->user_align;
 
         if (m->is_bitfield) {
             int unit = 8 * ty_size(m->ty);   /* storage-unit width, bits */

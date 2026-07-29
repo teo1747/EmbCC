@@ -175,6 +175,72 @@ void x86_mov_reg_reg(struct code *c, int dst, int src)
     code_byte(c, 0xc0 | ((src & 7) << 3) | (dst & 7));
 }
 
+/* dst = src, w-bit. w==4 leaves a 32-bit mov (zeroing the upper half — the
+ * register allocator's "narrow value is zero-extended" invariant); w==8 is a
+ * full 64-bit copy. */
+void x86_mov_rr_w(struct code *c, int dst, int src, int w)
+{
+    rex_rb(c, w == 8, src, dst);
+    code_byte(c, 0x89); /* mov r/m, r : reg=src, rm=dst */
+    code_byte(c, 0xc0 | ((src & 7) << 3) | (dst & 7));
+}
+
+/* dst64 = sign-extend(src's low 32 bits) — movsxd. */
+void x86_movsxd_rr(struct code *c, int dst, int src)
+{
+    rex_rb(c, 1, dst, src);
+    code_byte(c, 0x63); /* movsxd reg, r/m32 : reg=dst, rm=src */
+    code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
+/* dst = extend(the low `size` (1 or 2) bytes of src) to width w — movsx/movzx,
+ * the reg-reg twin of x86_load_slot's narrow cases. */
+void x86_movx_rr(struct code *c, int dst, int src, int size, int sign, int w)
+{
+    rex_rb(c, w == 8, dst, src);
+    code_byte(c, 0x0f);
+    if (size == 1)
+        code_byte(c, sign ? 0xbe : 0xb6); /* movsx/movzx r, r/m8 */
+    else
+        code_byte(c, sign ? 0xbf : 0xb7); /* movsx/movzx r, r/m16 */
+    code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
+/* dst op= src (+ - * & | ^), w-bit — the reg-reg twin of x86_alu_eax_mem, same
+ * "r, r/m" opcodes with reg=dst, rm=src. */
+void x86_alu_rr(struct code *c, int op, int dst, int src, int w)
+{
+    rex_rb(c, w == 8, dst, src);
+    switch (op) {
+    case '+': code_byte(c, 0x03); break;
+    case '-': code_byte(c, 0x2b); break;
+    case '*': code_byte(c, 0x0f); code_byte(c, 0xaf); break;
+    case '&': code_byte(c, 0x23); break;
+    case '|': code_byte(c, 0x0b); break;
+    case '^': code_byte(c, 0x33); break;
+    default:
+        fprintf(stderr, "embcc: internal: no reg-reg encoding for '%c'\n", op);
+        exit(1);
+    }
+    code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+}
+
+/* cmp a, b (computes a - b, sets flags) — reg-reg twin of x86_cmp_eax_mem. */
+void x86_cmp_rr(struct code *c, int a, int b, int w)
+{
+    rex_rb(c, w == 8, a, b);
+    code_byte(c, 0x3b); /* cmp r, r/m : reg=a, rm=b */
+    code_byte(c, 0xc0 | ((a & 7) << 3) | (b & 7));
+}
+
+/* [rdx:rax] / src -> quotient rax, remainder rdx (idiv /7, div /6). */
+void x86_div_rr(struct code *c, int src, int sign, int w)
+{
+    rex_rb(c, w == 8, 0, src);
+    code_byte(c, 0xf7);
+    code_byte(c, 0xc0 | ((sign ? 7 : 6) << 3) | (src & 7));
+}
+
 int x86_argreg(int index)
 {
     static const int regs[6] = { REG_RDI, REG_RSI, REG_RDX, REG_RCX,
@@ -482,6 +548,77 @@ void x86_neg_eax(struct code *c, int w)
     rexw(c, w);
     code_byte(c, 0xf7); /* neg: /3 */
     code_byte(c, 0xd8);
+}
+
+/* Byte-swap the low `size` bytes of rax/eax/ax in place. bswap has no
+ * 16-bit form, so a 2-byte swap is `rol $8, %ax`. */
+void x86_bswap(struct code *c, int size)
+{
+    if (size == 2) {
+        code_byte(c, 0x66);   /* operand-size prefix: 16-bit */
+        code_byte(c, 0xc1);   /* rol r/m16, imm8 */
+        code_byte(c, 0xc0);   /* mod=11 /0 reg=ax */
+        code_byte(c, 0x08);
+        return;
+    }
+    if (size == 8)
+        code_byte(c, 0x48);   /* REX.W: bswap %rax */
+    code_byte(c, 0x0f);
+    code_byte(c, 0xc8);       /* bswap eax/rax */
+}
+
+/* mfence — a full memory barrier (__sync_synchronize). */
+void x86_mfence(struct code *c)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0xae);
+    code_byte(c, 0xf0);
+}
+
+/* ud2 — the guaranteed-undefined instruction (__builtin_unreachable). */
+void x86_ud2(struct code *c)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0x0b);
+}
+
+/* xchg rax/eax/ax/al with [rcx] — the memory operand makes it implicitly
+ * LOCKed, i.e. atomic. RAX ends holding the old value at [rcx]. */
+void x86_xchg_rax_mem_rcx(struct code *c, int size)
+{
+    switch (size) {
+    case 1: code_byte(c, 0x86); break;
+    case 2: code_byte(c, 0x66); code_byte(c, 0x87); break;
+    case 4: code_byte(c, 0x87); break;
+    case 8: code_byte(c, 0x48); code_byte(c, 0x87); break;
+    default:
+        fprintf(stderr, "embcc: internal: bad xchg size %d\n", size);
+        exit(1);
+    }
+    code_byte(c, 0x01); /* ModRM: [rcx] <-> eax/rax */
+}
+
+/* lock xadd %rax/eax/ax/al, (%rcx): atomically *rcx += rax, rax = old *rcx. */
+void x86_lock_xadd_rcx(struct code *c, int size)
+{
+    code_byte(c, 0xf0);                       /* LOCK */
+    if (size == 2) code_byte(c, 0x66);
+    if (size == 8) code_byte(c, 0x48);        /* REX.W */
+    code_byte(c, 0x0f);
+    code_byte(c, size == 1 ? 0xc0 : 0xc1);
+    code_byte(c, 0x01);                       /* ModRM: reg=rax, [rcx] */
+}
+
+/* lock cmpxchg %rdx/edx/dx/dl, (%rcx): compare RAX with *rcx; if equal set
+ * *rcx = RDX and ZF, else load *rcx into RAX and clear ZF. Atomic. */
+void x86_lock_cmpxchg_rcx(struct code *c, int size)
+{
+    code_byte(c, 0xf0);                       /* LOCK */
+    if (size == 2) code_byte(c, 0x66);
+    if (size == 8) code_byte(c, 0x48);        /* REX.W */
+    code_byte(c, 0x0f);
+    code_byte(c, size == 1 ? 0xb0 : 0xb1);
+    code_byte(c, 0x11);                       /* ModRM: reg=rdx, [rcx] */
 }
 
 void x86_not_eax(struct code *c, int w)

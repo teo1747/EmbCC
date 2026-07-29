@@ -12,18 +12,18 @@
 
 #include "../sema/type.h"
 
-/* Prototypes in real headers declare more parameters than fit in
- * registers (newlib's _dtoa_r takes seven), so the DECLARATION limit is
- * generous; what is actually refused is a CALL needing more registers
- * than SysV provides — checked in sema, where the classes are known. */
-#define MAX_PARAMS 12
+/* MAX_PARAMS (the declaration/call arity cap) is defined in type.h, which
+ * this header includes, so struct type's ptypes[] and the AST arrays here
+ * stay the same size. */
 
 enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
                  EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT,
-                 EXPR_GENERIC };
+                 EXPR_GENERIC, EXPR_STMTEXPR };
+
+struct stmt;   /* a statement expression `({ ... })` carries a block */
 
 /* B_LAND/B_LOR are short-circuit: irgen lowers them to branches, they
  * never reach codegen as plain binops. Comparisons yield 0/1 ints.
@@ -79,10 +79,15 @@ struct expr {
     struct type **gtypes;
     struct expr **gexprs;
     int ngen;
+    /* EXPR_STMTEXPR: the `({ ... })` block; its value is the last statement
+     * when that is an expression statement, else void. */
+    struct stmt *body;
     const char *desig_field; /* an initlist element's .field designator,
                               * NULL when it is positional */
     int desig_index;         /* an initlist element's [index] designator,
                               * -1 when it is positional */
+    int desig_index_hi;      /* GNU range `[lo ... hi]`: the high index, else
+                              * -1 (a plain `[index]` or positional element) */
     const char *asm_reg;  /* EXPR_VAR: a register-asm binding propagated
                            * from the variable's declaration, else NULL */
 };
@@ -100,15 +105,15 @@ struct initelem {
 };
 
 /* A relocation inside a static object's byte image: a pointer-typed slot
- * whose value is an address the linker fills in. For now the target is a
- * string literal (the only kind EmbCC's own source needs); the seam for
- * &global / &func addends is left open deliberately. */
+ * whose value is an address the linker fills in — a string literal, an
+ * &global, or a function address (a vtable of function pointers). */
 struct greloc {
     int off;              /* byte offset within the object */
-    const char *str;      /* a string-literal target (NULL if a global) */
+    const char *str;      /* a string-literal target (NULL if a global/func) */
     int str_len;          /* including its NUL */
     int str_off;          /* driver: the target's offset inside .rodata */
-    struct global *gtarget; /* an &global target (NULL if a string) */
+    struct global *gtarget; /* an &global target, else NULL */
+    struct func *ftarget; /* a function-address target, else NULL */
     long addend;
 };
 
@@ -123,6 +128,7 @@ enum stmt_kind { STMT_RETURN, STMT_DECL, STMT_EXPR, STMT_IF, STMT_WHILE,
  * fixed-register letters a/b/c/d/S/D and 'r' (bound via a register-asm
  * variable) — enough for EmbLinkOS's int-$0x80 syscall stubs. */
 struct asm_operand {
+    const char *name;    /* a `[name]` symbolic operand, referenced as %[name] */
     const char *constraint;
     struct expr *expr;
     int reg;              /* the fixed register (0-15), resolved by sema */
@@ -139,6 +145,12 @@ struct asm_stmt {
     int nout;
     struct asm_operand *in;
     int nin;
+    /* Clobbered registers (e.g. "rdx"), kept so the operand allocator can
+     * EXCLUDE them — an allocatable "r" operand must never land in a register
+     * the template destroys. "cc"/"memory" are stored too and simply don't
+     * name a GPR. */
+    const char **clob;
+    int nclob;
     int is_volatile;
 };
 
@@ -155,6 +167,7 @@ struct stmt {
     int var_index;        /* STMT_DECL: set by sema */
     const char *asm_reg;  /* STMT_DECL: a register-asm binding, `register T
                            * x __asm__("r10")` — NULL for an ordinary local */
+    int user_align;       /* STMT_DECL: __attribute__((aligned(N))); 0 = none */
     struct asm_stmt *asm_s; /* STMT_ASM */
     struct expr *expr;    /* RETURN/EXPR value; DECL initializer (or NULL) */
     struct expr *cond;    /* IF/WHILE/FOR */
@@ -215,12 +228,15 @@ struct func {
     int seq;              /* source order (see struct global) */
     int is_static;
     int is_weak;          /* __attribute__((weak)) */
+    int is_noreturn;      /* __attribute__((noreturn)) / _Noreturn */
     int is_varargs;       /* declared with a trailing ", ..." */
     struct type *ret_ty;
     int nparams;
     const char *params[MAX_PARAMS]; /* names; NULL in unnamed prototypes */
     struct type *param_tys[MAX_PARAMS];
     struct type **var_tys;          /* sema: type of every var slot */
+    int *var_aligns;                /* sema: __attribute__((aligned(N))) per
+                                     * var slot (0 = natural); parallels var_tys */
     struct stmt *body;
     int defined;          /* parse: THIS node syntactically had a body
                            * (may be NULL even so: "{ }" — sema rejects

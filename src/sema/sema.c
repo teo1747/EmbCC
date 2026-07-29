@@ -19,6 +19,7 @@ struct vardef {
                          * static storage, not the frame */
     int active;         /* 0 once its block has closed */
     const char *asm_reg; /* a register-asm binding, else NULL */
+    int user_align;     /* __attribute__((aligned(N))) on the local; 0 = none */
 };
 
 /* Block scoping without giving up unique frame slots: entries are never
@@ -61,6 +62,7 @@ static int scope_add(struct scope *sc, const char *name, struct type *ty,
     sc->vars[sc->n].g = g;
     sc->vars[sc->n].active = 1;
     sc->vars[sc->n].asm_reg = NULL;
+    sc->vars[sc->n].user_align = 0;
     return sc->n++;
 }
 
@@ -219,6 +221,13 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
             (ty_equal(rhs->ty, to) || to->pointee->kind == TY_VOID ||
              rhs->ty->pointee->kind == TY_VOID))
             return mk_cast(rhs, to);
+        /* Same-size integer pointees differing only in signedness
+         * (`char *` vs `unsigned char *`): gcc warns but allows it, and real
+         * code — string/buffer routines especially — relies on it. */
+        if (rhs->ty->kind == TY_PTR &&
+            ty_is_integer(to->pointee) && ty_is_integer(rhs->ty->pointee) &&
+            ty_size(to->pointee) == ty_size(rhs->ty->pointee))
+            return mk_cast(rhs, to);
         if (is_null_const(rhs))
             return mk_cast(rhs, to);
         diag_fatal(u->file, rhs->line,
@@ -259,6 +268,9 @@ static void lower_static_bytes(struct unit *u, int line, int size,
                                struct initelem *v, int n,
                                const char **out_bytes,
                                struct greloc **out_rel, int *out_nrel);
+static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
+                       struct stmt *s, int in_loop, int in_switch,
+                       int at_sw_level);
 
 /* Nonzero while lowering a static initializer (a file-scope global or a
  * static local). A compound literal met here has static storage: it becomes
@@ -344,7 +356,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                            "(line %d)", e->name, g->line);
             } else if (find_func(u, e->name)) {
                 struct func *fd = find_func(u, e->name);
-                if (!fd->declared)
+                /* seq-based, not the ordered-walk `declared` flag: a function
+                 * used as a value in a static initializer (a vtable) is
+                 * lowered before that walk runs, but is still legal if the
+                 * function was declared earlier in the source. */
+                if (fd->seq > cur_body_seq)
                     diag_fatal(u->file, e->line,
                                "'%s' is used before its declaration",
                                e->name);
@@ -448,10 +464,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (!is_lvalue(e->rhs))
             diag_fatal(u->file, e->line,
                        "'&' needs a variable or *pointer");
-        if (e->rhs->undecayed)
-            diag_fatal(u->file, e->line,
-                       "'&' on an array is not supported yet (its name "
-                       "is already the address of the first element)");
+        if (e->rhs->undecayed) {
+            /* &arr yields a pointer to the whole ARRAY object, T(*)[N]; its
+             * value is the array's address, which gen_addr already gives. */
+            e->ty = ty_ptr(e->rhs->undecayed);
+            break;
+        }
         if (e->rhs->kind == EXPR_MEMBER && e->rhs->memb &&
             e->rhs->memb->is_bitfield)
             diag_fatal(u->file, e->line,
@@ -528,6 +546,18 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         } else {
             e->ty = ty;
         }
+        break;
+    }
+    case EXPR_STMTEXPR: {
+        /* GNU statement expression: check the block, then its value is the
+         * last statement when that is an expression statement, else void.
+         * The block shares the function's flat scope (as any block does). */
+        check_stmt(u, f, sc, e->body, 0, 0, 0);
+        struct stmt *last = NULL;
+        for (struct stmt *s = e->body->body; s; s = s->next)
+            last = s;
+        e->ty = (last && last->kind == STMT_EXPR && last->expr)
+              ? last->expr->ty : ty_base(TY_VOID, 0);
         break;
     }
     case EXPR_GENERIC: {
@@ -890,6 +920,69 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             if (strcmp(bn, "memcpy") == 0 || strcmp(bn, "memmove") == 0 ||
                 strcmp(bn, "memset") == 0)
                 e->lhs->name = bn;   /* fall through to normal call handling */
+            /* byte swaps -> a single instruction; the result is the argument's
+             * width as an unsigned integer. */
+            else if (strcmp(bn, "bswap16") == 0 || strcmp(bn, "bswap32") == 0 ||
+                     strcmp(bn, "bswap64") == 0) {
+                if (e->nargs != 1)
+                    diag_fatal(u->file, e->line, "%s takes one argument",
+                               e->lhs->name);
+                check_expr(u, f, sc, e->args[0]);
+                need_integer(u, e->args[0], "__builtin_bswap");
+                e->name = e->lhs->name;
+                e->ty = ty_base(bn[5] == '1' ? TY_SHORT :
+                                bn[5] == '3' ? TY_INT : TY_LONG, 1);
+                break;
+            }
+            /* the value IS the first argument; the hint is discarded */
+            else if (strcmp(bn, "expect") == 0) {
+                if (e->nargs < 1)
+                    diag_fatal(u->file, e->line,
+                               "__builtin_expect takes two arguments");
+                for (int i = 0; i < e->nargs; i++)
+                    check_expr(u, f, sc, e->args[i]);
+                *e = *e->args[0];
+                break;
+            }
+            /* control never reaches here -> a trap (ud2) */
+            else if (strcmp(bn, "unreachable") == 0) {
+                e->name = e->lhs->name;
+                e->ty = ty_base(TY_VOID, 0);
+                break;
+            }
+        }
+        /* a full memory barrier (not spelled __builtin_) */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            strcmp(e->lhs->name, "__sync_synchronize") == 0) {
+            e->name = e->lhs->name;
+            e->ty = ty_base(TY_VOID, 0);
+            break;
+        }
+        /* __atomic_load_n / store_n / exchange_n. The first argument is a
+         * pointer; x86 makes an aligned scalar load/store atomic on its own,
+         * exchange is a locked xchg, and a store gets a trailing fence for
+         * seq_cst. The memory-order argument is checked and then ignored. */
+        if (e->lhs->kind == EXPR_VAR && e->lhs->name &&
+            (strcmp(e->lhs->name, "__atomic_load_n") == 0 ||
+             strcmp(e->lhs->name, "__atomic_store_n") == 0 ||
+             strcmp(e->lhs->name, "__atomic_exchange_n") == 0 ||
+             strcmp(e->lhs->name, "__atomic_fetch_add") == 0 ||
+             strcmp(e->lhs->name, "__atomic_fetch_sub") == 0 ||
+             strcmp(e->lhs->name, "__atomic_compare_exchange_n") == 0)) {
+            for (int i = 0; i < e->nargs; i++)
+                check_expr(u, f, sc, e->args[i]);
+            if (e->nargs < 1 || e->args[0]->ty->kind != TY_PTR)
+                diag_fatal(u->file, e->line,
+                           "%s needs a pointer first argument", e->lhs->name);
+            e->name = e->lhs->name;
+            if (strcmp(e->lhs->name, "__atomic_store_n") == 0)
+                e->ty = ty_base(TY_VOID, 0);
+            else if (strcmp(e->lhs->name,
+                            "__atomic_compare_exchange_n") == 0)
+                e->ty = ty_base(TY_BOOL, 0);       /* did the swap happen? */
+            else
+                e->ty = e->args[0]->ty->pointee;
+            break;
         }
         /* Direct when the callee is a name that is not a variable in
          * scope and names a function; otherwise a call through a
@@ -901,7 +994,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             !find_global(u, e->lhs->name) &&
             find_func(u, e->lhs->name)) {
             struct func *callee = find_func(u, e->lhs->name);
-            if (!callee->declared)
+            if (callee->seq > cur_body_seq)
                 diag_fatal(u->file, e->line,
                            "call to '%s' before its declaration — "
                            "declare or define functions before their "
@@ -1136,12 +1229,20 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                            el->desig_field);
             if (el->desig_index >= 0)
                 ai = el->desig_index;
-            if (ty->count && ai >= ty->count)
+            /* GNU range `[lo ... hi] = v`: place v at every index in the
+             * span. A zero value needs no leaves — the object is already
+             * zero-filled (static bytes start zero; a local is memzeroed) —
+             * which also keeps a huge `[a ... b] = 0` cheap. */
+            int hi = el->desig_index_hi >= 0 ? el->desig_index_hi : ai;
+            if (ty->count && hi >= ty->count)
                 diag_fatal(u->file, el->line,
                            "initializer index %d is past the end of an "
-                           "array of %d", ai, ty->count);
-            flatten_init(u, f, sc, el, ty->pointee, off + ai * esz, out);
-            ai++;
+                           "array of %d", hi, ty->count);
+            int is_zero = el->kind == EXPR_NUM && el->num == 0;
+            for (; ai <= hi; ai++)
+                if (!(el->desig_index_hi >= 0 && is_zero))
+                    flatten_init(u, f, sc, el, ty->pointee,
+                                 off + ai * esz, out);
         }
         return;
     }
@@ -1194,6 +1295,62 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
     flatten_init(u, f, sc, init->elems[0], ty, off, out);
 }
 
+/* Resolve a constant-address expression (the value of a pointer slot in a
+ * static initializer) to a target global/function plus a byte addend:
+ * `&g`, a decayed array/function, `&arr[i]`, `&g.field`, `p + n`. Returns 1
+ * on success, filling *gt or *ft and adding to *add. */
+static int resolve_addr(struct expr *e, struct global **gt,
+                        struct func **ft, long *add)
+{
+    while (e && e->kind == EXPR_CAST)
+        e = e->rhs;
+    if (!e)
+        return 0;
+    if (e->kind == EXPR_VAR && e->gref) { *gt = e->gref; return 1; }
+    if (e->kind == EXPR_VAR && e->fref) { *ft = e->fref; return 1; }
+    if (e->kind == EXPR_BINOP && (e->op == B_ADD || e->op == B_SUB)) {
+        int esz = e->ty && e->ty->kind == TY_PTR
+                ? ty_size(e->ty->pointee) : 1;
+        long k;
+        if (resolve_addr(e->lhs, gt, ft, add) && const_fold(e->rhs, &k)) {
+            *add += (e->op == B_SUB ? -k : k) * esz;
+            return 1;
+        }
+        if (e->op == B_ADD && const_fold(e->lhs, &k) &&
+            resolve_addr(e->rhs, gt, ft, add)) {
+            *add += k * esz;
+            return 1;
+        }
+        return 0;
+    }
+    if (e->kind == EXPR_ADDR) {
+        struct expr *lv = e->rhs;
+        while (lv && lv->kind == EXPR_CAST)
+            lv = lv->rhs;
+        if (!lv)
+            return 0;
+        if (lv->kind == EXPR_DEREF)            /* &*x == x */
+            return resolve_addr(lv->rhs, gt, ft, add);
+        if (lv->kind == EXPR_VAR && lv->gref) { *gt = lv->gref; return 1; }
+        if (lv->kind == EXPR_MEMBER && lv->memb) {
+            struct expr *base = lv->is_arrow ? lv->lhs : NULL;
+            if (lv->is_arrow) {                /* &p->f : p + off */
+                if (!resolve_addr(base, gt, ft, add))
+                    return 0;
+            } else {                           /* &b.f : &b + off */
+                struct expr addr = { 0 };
+                addr.kind = EXPR_ADDR;
+                addr.rhs = lv->lhs;
+                if (!resolve_addr(&addr, gt, ft, add))
+                    return 0;
+            }
+            *add += lv->memb->off;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Lower flattened initializer leaves into a static object's byte image
  * plus a relocation list. Shared by file-scope globals and static locals
  * — both have static storage, so every leaf must reduce to constant
@@ -1214,28 +1371,24 @@ static void lower_static_bytes(struct unit *u, int line, int size,
         /* The address of a global: `&g`, or an array/function global that
          * decayed to a pointer (`char **environ = embk_empty_env`). */
         struct global *gt = NULL;
-        if (core && core->kind == EXPR_VAR && core->gref)
-            gt = core->gref;
-        else if (core && core->kind == EXPR_ADDR) {
-            struct expr *in = core->rhs;
-            while (in && in->kind == EXPR_CAST)
-                in = in->rhs;
-            if (in && in->kind == EXPR_VAR && in->gref)
-                gt = in->gref;
-        }
+        struct func *ft = NULL;
+        long addend = 0;
+        if (core && core->kind != EXPR_STR)
+            resolve_addr(core, &gt, &ft, &addend);
         if ((core && core->kind == EXPR_STR && v[k].ty->kind == TY_PTR) ||
-            (gt && v[k].ty->kind == TY_PTR)) {
-            /* a pointer slot: zero bytes stay, the linker writes the
-             * address of a string literal or a global. */
+            ((gt || ft) && v[k].ty->kind == TY_PTR)) {
+            /* a pointer slot: zero bytes stay, the linker writes the address
+             * of a string literal, a global (+addend), or a function. */
             if (nrel == caprel) {
                 caprel = caprel ? caprel * 2 : 4;
                 rel = xrealloc(rel, (size_t)caprel * sizeof *rel);
             }
             rel[nrel].off = v[k].off;
-            rel[nrel].str = gt ? NULL : core->name;
-            rel[nrel].str_len = gt ? 0 : (int)core->num;
+            rel[nrel].str = (gt || ft) ? NULL : core->name;
+            rel[nrel].str_len = (gt || ft) ? 0 : (int)core->num;
             rel[nrel].gtarget = gt;
-            rel[nrel].addend = 0;
+            rel[nrel].ftarget = ft;
+            rel[nrel].addend = addend;
             nrel++;
             continue;
         }
@@ -1365,7 +1518,12 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
             return r;
     }
     for (const char *p = c; *p; p++)             /* else allocate a register */
-        if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R')
+        if (*p == 'r' || *p == 'q' || *p == 'g' || *p == 'm' || *p == 'R' ||
+            *p == 'i' || *p == 'n')
+            /* an immediate ('i'/'n'): EmbCC has no way to substitute a literal
+             * (a symbol address needs a relocation), so it computes the value
+             * into a register and the template's mov uses that register — the
+             * result is identical, only the encoding differs from gcc's. */
             return -2;
     for (const char *p = c; *p; p++)             /* an SSE/XMM ('x') operand */
         if (*p == 'x')
@@ -1506,6 +1664,7 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                            s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
             sc->vars[s->var_index].asm_reg = s->asm_reg;
+            sc->vars[s->var_index].user_align = s->user_align;
             /* A static local has static storage, so a compound literal in its
              * initializer is an anonymous global, not a stack slot. */
             if (s->is_static)
@@ -1708,8 +1867,11 @@ static int is_noreturn_call(const struct expr *e)
 {
     if (e->kind != EXPR_CALL || !e->name)
         return 0;
+    if (e->callee && e->callee->is_noreturn)
+        return 1;                       /* __attribute__((noreturn)) callee */
     static const char *const nr[] = {
         "exit", "abort", "_Exit", "diag_fatal",
+        "__builtin_unreachable", "__builtin_trap",
     };
     for (unsigned i = 0; i < sizeof nr / sizeof *nr; i++)
         if (strcmp(e->name, nr[i]) == 0)
@@ -1798,11 +1960,14 @@ static void check_func(struct unit *u, struct func *f)
 
     f->nvars = sc.n;
     f->var_tys = xmalloc((size_t)(sc.n ? sc.n : 1) * sizeof *f->var_tys);
-    for (int i = 0; i < sc.n; i++)
+    f->var_aligns = xmalloc((size_t)(sc.n ? sc.n : 1) * sizeof *f->var_aligns);
+    for (int i = 0; i < sc.n; i++) {
         /* a static local keeps its scope index but needs no frame
          * storage — give it a pointer's worth and never address it */
         f->var_tys[i] = sc.vars[i].g ? ty_base(TY_LONG, 0)
                                      : sc.vars[i].ty;
+        f->var_aligns[i] = sc.vars[i].g ? 0 : sc.vars[i].user_align;
+    }
     free(sc.vars);
 }
 
@@ -1843,6 +2008,7 @@ static void merge_decls(struct unit *u)
                 canon->params[i] = f->params[i]; /* definition names win */
         }
         canon->is_weak |= f->is_weak;  /* weak on any declaration is weak */
+        canon->is_noreturn |= f->is_noreturn;  /* noreturn on any wins */
         f->absorbed = 1;
     }
 }

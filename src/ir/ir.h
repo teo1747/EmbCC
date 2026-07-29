@@ -58,6 +58,14 @@ enum ir_op {
     IR_BRNZ,  /* if (a != 0) goto label  (w) */
     IR_VA_START, /* init the va_list whose ADDRESS is in temp a (SysV:
                   * fill a __va_list_tag on the frame, point *a at it) */
+    IR_BSWAP, /* dst = byteswap(a)   (size: 2/4/8; __builtin_bswapN) */
+    IR_FENCE, /* a full memory barrier (mfence; __sync_synchronize) */
+    IR_UD2,   /* the undefined instruction (ud2; __builtin_unreachable) */
+    IR_XCHG,  /* dst = *(temp a); *(temp a) = b   (atomic; size) */
+    IR_XADD,  /* dst = *(temp a); *(temp a) += b  (lock xadd; size) */
+    IR_CMPXCHG, /* CAS at *(a): compare against *(b), set to c on match;
+                 * dst = matched?1:0, and *(b) updated to the seen value.
+                 * (lock cmpxchg; size) */
     IR_ASM    /* extended asm: load inputs to fixed registers, assemble the
                * template, store outputs. Detail in ir_ins.asm_ir */
 };
@@ -86,6 +94,7 @@ struct ir_ins {
                               * if none — stamped by irgen, read only by the
                               * -g line-table pass in codegen */
     int dst, a, b;
+    int c;                   /* IR_CMPXCHG: the third operand (desired value) */
     int w;                   /* 4 or 8: operation width class */
     int size;                /* 1/2/4/8: memory width for LD/ST/EXT */
     int sign;                /* signed variant of the op */
@@ -148,6 +157,12 @@ struct ir_func {
     struct ir_dbgvar *dbgvars; /* -g: params + locals (irgen) */
     int ndbgvars, dbgvarcap;
     int *var_off;            /* -g: rbp-relative slot offset per vreg (codegen) */
+    /* Per-LOCAL lexical scope, as a half-open instruction range [lo, hi) (irgen).
+     * Two locals whose scopes are disjoint never coexist — a stack pointer used
+     * past its scope is UB — so codegen may give them one stack slot. Params and
+     * function-level locals span the whole function; only nested-block locals get
+     * a narrower range. Length nvars; unused (NULL) when there are no locals. */
+    int *var_scope_lo, *var_scope_hi;
 };
 
 /* One .rodata string; offsets are assigned sequentially at collection

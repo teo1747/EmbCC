@@ -15,6 +15,508 @@ NL="/home/motsou/cross/newlib-c99/x86_64-elf/include"
 
 ---
 
+## Kernel self-host — the next corpus (the hardest yet)
+
+*New goal: EmbCC compiles the EmbLinkOS **kernel** (so the OS can rebuild itself
+entirely, not just its userland). The kernel is freestanding, higher-half,
+hardware C — a materially harder corpus than TinyCC/newlib. Repro from `myos/`:*
+
+```
+for f in $(find kernel -name '*.c'); do /home/motsou/EmbCC/embcc -c "$f" -Ikernel -o /tmp/x.o; done
+```
+
+***89 / 89 kernel TUs compile clean (was 22) — the whole kernel builds under
+EmbCC.*** K1–K9 and every one-off below are closed. No kernel C was changed.
+
+### K1 — inline-asm assembler — DONE
+EmbCC's extended-asm assembler (irgen.c `asm_assemble`) grew from
+`int`/`cpuid`/`rdrand`/`setc` to the kernel's hardware vocabulary, every
+encoding byte-verified against objdump: fixed-form (`cli`/`sti`/`hlt`/`nop`/
+`pause`/`mfence`/`lfence`/`sfence`/`wbinvd`/`rdtsc`/`rdmsr`/`wrmsr`/`fninit`/
+`pushfq`/`popfq`); port I/O (`outb`/`w`/`l`, `inb`/`w`/`l`); reg operands
+(`pop`/`push`/`popq`/`pushq` `%N`, `str`/`ltr` `%N`); control registers
+(`mov %reg,%%crN` / `mov %%crN,%reg`); memory operands (`lgdt`/`lidt %N`,
+`invlpg (%N)`, `movdqa` ↔ `%%xmm0`). Constraint grammar already covered
+`"=r"`/`"r"`/`"=a"`/`"a"`/`"=m"`/`"m"`/`"N"`/`"x"`, `"memory"`/`"cc"` clobbers,
+`%N` refs, and `volatile`. Small parse helpers read the operand forms; unknown
+mnemonics still refuse loudly. Golden test: tests/golden/inline-asm-kernel.sh.
+
+### One-offs — ALL DONE
+The ten distinct remaining gaps, each closed and gcc-verified:
+- GCC **statement expressions** `({ ... })` — EXPR_STMTEXPR (selftests.c).
+- GNU **array-range designators** `[lo ... hi] = v` (font_8x16.c).
+- **`__attribute__((noreturn))`** honored in the return-path check (syscall.c).
+- **`__builtin_va_list`** accepted as `char *` (kprintf.c).
+- **`&global` at a constant offset** in a static initializer — `&arr[i]`,
+  `&g.field`, `p+n` — via a recursive resolve_addr filling greloc's addend
+  (keyboard.c).
+- **`sizeof(EXPR)`** folded in an ICE when the type is resolvable
+  (`sizeof(((T*)0)->f)`, embkfs.c) and **`sizeof(local/global var)`** (fd.c).
+- freestanding **`<string.h>`** (fd.c); **char\*/unsigned char\*** signedness.
+- inline asm the three low-level TUs need: `mov` reg/imm↔GPR and segment
+  registers, `pushq $imm`, `iretq`/`lretq`, a local-label RIP-relative `leaq`
+  (the gdt trampoline), and named `%[operand]`s with the "i" constraint
+  (process.c, gdt.c, usermode.c). **CRITICAL fix along the way:** the
+  per-instruction operand-skip stopped only at `;`, silently dropping every
+  instruction after the first in a `\n`-separated template — now stops at `\n`.
+
+### K2 — GCC builtins — DONE
+`__builtin_bswap16/32/64` (IR_BSWAP), `__sync_synchronize` (mfence),
+`__builtin_unreachable` (ud2 + noreturn in the return-path check),
+`__builtin_expect` (becomes its first arg), `__atomic_load_n`/`store_n`
+(load / store+mfence) and `__atomic_exchange_n` (locked `xchg`, IR_XCHG).
+`__builtin_memcpy/memset` already resolved to the libc names. Verified vs gcc
+at -O0 and -O1.
+
+### K3 — `sizeof` / `offsetof` as an integer-constant-expression — DONE
+`sizeof(type)` already folded; the gap was `offsetof`. Added
+`__builtin_offsetof(type, designator)` folded to a size_t constant at parse
+time (descending `.field`/`[index]`), and pointed `<stddef.h>`'s offsetof at
+it — so `_Static_assert(offsetof(...) == N)` works.
+
+### K4 — raise the parameter / argument cap — DONE
+12 → 32. MAX_PARAMS moved to type.h so `struct type`'s `ptypes[]` grows with
+it (the cap in ast.h alone left ptypes[12] to overflow — a heap smash on a
+>12-param function type, found by ASAN).
+
+### K5 — char/string escape sequences — DONE
+A shared `scan_escape` now handles the full C set: `\a \b \f \v \?`, GNU `\e`,
+hex `\xH...`, and octal `\NNN`, for both char and string literals.
+
+### K6 — `&array` — DONE
+`&arr` yields `T(*)[N]` whose value is the array's address (gen_addr already
+produces it). *(The pointer-to-array `int (*p)[N]` declarator is a separate,
+rarer gap, still open.)*
+
+### K7 — use-before-declaration of a `static` function — DONE
+The call and value paths test `seq <= cur_body_seq` (what the ordered-walk
+`declared` flag encoded) so it also holds during static-initializer lowering —
+a function pointer in a vtable resolves. This closed the "&func in a static
+initializer" seam too: `greloc` grew an `ftarget` the driver relocates.
+
+### K8 — `__attribute__` after a declarator — DONE
+A trailing `__attribute__` on a local declarator is accepted (alignment not
+yet honored on a stack slot).
+
+### K9 — DONE
+An empty translation unit yields a valid empty object.
+*(A freestanding `<string.h>` on the path is an integration matter.)*
+
+### K10 — `-mno-sse` codegen — **DONE** (kernel now compiles + links + boots + runs)
+
+**RESOLVED (branch Teo).** EmbCC gained a `-mno-sse` mode (also spelled
+`-mno-sse2` / `-mgeneral-regs-only`; `-mno-mmx` / `-mno-red-zone` / `-mno-80387`
+/ `-mcmodel=` accepted as no-ops). Under it the varargs prologue skips the
+`xmm0..7` register-save spill entirely, and any float op / `IR_I2F` / `IR_F2I`
+/ `IR_F2F` is **refused loudly** (THE RULE — no silent SSE). Verified:
+the `#UD` site `kprintf` disassembles to **0 SSE**; whole-kernel codegen under
+`-mno-sse` emits **0 SSE** (the only 2 `movdqa` kernel-wide are the kernel's own
+deliberate SSE-context-switch selftest inline asm in `process.c`, which runs
+*after* `fpu_init` sets `CR4.OSFXSR`); integer varargs still run correctly;
+default (no-flag) path is byte-identical (self-host holds, suite 87/87). The
+2 `movdqa` in the original triage were miscounted as a struct-copy lowering —
+they were always the kernel's own inline asm, not codegen.
+
+<details><summary>original triage (kept for context)</summary>
+
+*Empirically confirmed: all 88 kernel TUs compile, LINK with the kernel linker
+script into a valid higher-half `EXEC` (entry `0xffffffff8037bde0`), and it BOOTS
+and runs ring-0 higher-half code — so `-mcmodel=kernel` already works, no
+relocation or code-model problems. It dies with a `#UD` → triple fault at the
+first varargs call:*
+
+```
+v=06 (#UD) at kprintf+0x20:  f2 0f 11 85 ... movsd %xmm0,-0x130(%rbp)
+```
+
+The kernel is `-mno-sse -mno-mmx`, and SSE is not enabled in CR4 until `fpu_init`
+runs — so any SSE instruction before that faults. EmbCC emits SSE where GCC (with
+`-mno-sse`) does not. Whole-kernel disassembly shows this is **tiny and targeted
+— 18 SSE instructions total, zero float math**:
+- **16 `movsd`**: the System V varargs prologue spilling `xmm0..7` into the
+  register-save area (in `kprintf` and one other varargs fn). Under `-mno-sse`
+  this whole XMM save area is skipped (and callers must not set `AL`=xmm-count).
+- **2 `movdqa`**: a 16-byte aligned move (a struct/`memcpy` lowering) — should use
+  general-purpose `mov`s under `-mno-sse`.
+
+**Fix: a `-mno-sse` mode** (a) no XMM spill in the varargs prologue, (b) never
+lower struct copies / anything to SSE. That's the last thing between EmbCC and a
+booting self-compiled kernel. (`-mno-red-zone` not yet exercised — the `#UD`
+comes first; worth confirming once SSE is off, since the kernel takes interrupts.)
+
+*Repro (from `myos/`): compile every `KERNEL_SRC` with `embcc -c … -Ikernel`,
+link `x86_64-elf-ld -T kernel/linker.ld` with the nasm objects, boot.*
+
+</details>
+
+### K11 — honor `__attribute__((aligned(N)))` in LAYOUT — **DONE**
+
+**RESOLVED (branch Teo).** `aligned(N)` is now applied to layout, not just
+parsed: (a) a struct **member**'s offset rounds up to `N` and (b) the struct's
+own align/size rise to a multiple of `N` (per-member `user_align` threads
+through `ty_struct_layout`; it overrides `packed`, which only lowers the
+default); (c) a **stack local** carrying the attribute gets its frame slot
+rounded so its rbp-relative base is `N`-aligned (rbp is 16-aligned on entry, so
+`N<=16` is honored; `N>16` would need dynamic stack realignment and is **refused
+loudly** — THE RULE). Verified against the REAL kernel header: `struct thread`
+(the `fxsave` target) lays out byte-identical to gcc — `fpu_state` at offset 80
+(16-aligned) and `sizeof == 848` (16-multiple); the minimal repro static-asserts
+pass; a local `observed[16] aligned(16)` lands on a 16-aligned slot; suite
+87/87, self-host holds, kernel 89/89. This was the last thing between the
+self-compiled kernel and the desktop.
+
+<details><summary>original triage (kept for context)</summary>
+
+*With `-mno-sse` in, the self-compiled kernel now boots much further — PMM (512 MB),
+VMM direct map, ACPI, EMBKFS mounted, VFS at `/`, ksym loaded — then takes a
+`#GP` at the **first context switch**:*
+
+```
+Vector 0x0D (#GP)  RIP 0xFFFFFFFF8037BC90 = kernel_ctx_switch:  fxsave (%rdx)
+```
+
+`fxsave` **#GPs unless its memory operand is 16-byte aligned**. The buffer is the
+process struct's FPU save area:
+
+```c
+/* kernel/process/process.h:153 — the comment says "aligned(16) is load-bearing" */
+unsigned char fpu_state[512] __attribute__((aligned(16)));
+```
+
+EmbCC **parses** `aligned(N)` (K8) but does not **apply** it to layout, so
+`fpu_state` lands at a non-16 offset and `fxsave` faults. Minimal host repro —
+this `_Static_assert` **fails** under embcc, passes under gcc:
+
+```c
+struct s { char c; char buf[512] __attribute__((aligned(16))); };
+_Static_assert(__builtin_offsetof(struct s, buf) % 16 == 0, "buf 16-aligned");
+```
+
+**Fix: apply `aligned(N)` to layout** — (a) round a struct **field**'s offset up
+to `N`, (b) raise the **struct's** own alignment/size to a multiple of `N`, and
+(c) align **stack slots** for locals carrying the attribute (e.g.
+`uint8_t observed[16] __attribute__((aligned(16)))`). This is the one thing
+between the self-compiled kernel and reaching the desktop.
+
+</details>
+
+### K12 — inline-asm operand allocator must EXCLUDE clobbered registers — **DONE**
+
+**RESOLVED (branch Teo).** The `"r"` operand allocator now removes from its free
+set (a) every register in the **clobber list** (kept in the AST now, no longer
+discarded) and (b) every hard register the **template writes/reads as `%%reg`**
+(any width — `rdi`/`edi`/`di`/`dil`…, mapped by `asm_phys_reg`; conservative,
+a read-only mention is excluded too — always sound). So no allocatable operand
+can land in a register the asm destroys. Verified on the REAL kernel: both
+`iretq` trampolines in process.c now load argc/argv/envp into rdi/rsi/rdx via
+r9/r10/r11 and push operands from rax/rcx/rbx/r8 — none template-written;
+gcc-refereed exec test `tests/exec/asm-clobber.c` (clobber-list AND
+template-written paths) passes. Suite 88/88, self-host holds, kernel 89/89.
+Alongside, K11 got a refinement: a local whose *type* is over-aligned (a struct
+with an aligned member) now also gets its stack slot rounded to the type's
+natural alignment (`ty_align`), not just the declarator attribute.
+
+<details><summary>original triage (kept for context)</summary>
+
+*With aligned(N) honored (K11), the self-compiled kernel boots even further —
+past the first context switch — then `#GP`s on the `iretq` that launches the
+first ring-3 process (`process_trampoline`), i.e. right as it would start
+`init`/`home`.*
+
+Root cause: an inline-asm `"r"` operand is allocated to a register named in the
+**clobber list**, and the asm's own instructions destroy it before it's used.
+`process_trampoline` builds the iret frame with 7 `"r"` operands and clobbers
+`rdi`,`rdx`:
+
+```c
+"movq %6, %%rdx\n"     /* envp -> rdx (rdx is clobbered) */
+"pushq %2\n"           /* cs=0x23 ... but %2 was allocated to rdx! */
+"iretq\n"
+: : ... "r"((uint64_t)(0x20|3)) /*=%2 cs*/ ... "r"(envp) /*=%6*/
+: "rdi", "rdx", "memory"
+```
+
+EmbCC put `%2` (cs) in `rdx`; the `movq %6,%%rdx` overwrites it with `envp`, so
+`push %2` pushes `envp` as **CS** → `iretq` faults. Minimal host repro (7 ops,
+clobber `rdi`/`rdx`) — EmbCC emits `push %rdx` for the operand despite the
+clobber; gcc never does:
+
+```c
+void f(unsigned long o0,unsigned long o1,unsigned long o2,unsigned long o3,
+       unsigned long o4,unsigned long o5,unsigned long o6){
+  __asm__ volatile("movq %4,%%rdi\n movq %5,%%rsi\n movq %6,%%rdx\n"
+                   "pushq %0\n pushq %1\n pushq %2\n pushq %3\n"
+   : : "r"(o0),"r"(o1),"r"(o2),"r"(o3),"r"(o4),"r"(o5),"r"(o6)
+   : "rdi","rdx","memory"); }        /* embcc: 'push %rdx' for %2 — the bug */
+```
+
+**Fix:** remove clobber-list registers (and any register the template writes
+explicitly, e.g. `%%rdi`/`%%rsi`/`%%rdx` here) from the operand allocator's free
+set, so no `"r"` operand is ever placed in one. This is the last thing between
+the self-compiled kernel and userspace / the desktop.
+
+*(K1 follow-ups spotted alongside — **now DONE**: inline-asm memory operands
+`movq disp(%base), %dst` and the store reverse `movq %src, disp(%base)` (incl.
+rbp/rsp/r12/r13 SIB / forced-disp bases), plus the ALU ops add/sub/and/or/xor/
+cmp in `%src,%dst` and `$imm,%dst` (imm8/imm32, 64- and 32-bit) forms. Every
+encoding byte-compared to gas; gcc-refereed exec test `tests/exec/asm-mem-alu.c`
++ extended `tests/golden/inline-asm-kernel.sh`. Remaining known gap, NOT on the
+boot path: a `+r` read-write operand's read side isn't wired — sema accepts `+`
+but treats it as output-only, so the initial value isn't loaded. The kernel
+uses no `+` constraints; deferred.)*
+
+</details>
+
+### K13 — stack usage: `-O0` frames ~18× GCC's — **DONE** (temp slot coalescing)
+
+**RESOLVED (branch Teo).** EmbCC gave every temporary (vreg ≥ nvars) its own
+8-byte slot, never reused — so a deep call chain overflowed the 16 KiB kernel
+stack. Added **temporary stack-slot coalescing** in codegen (`coalesce_temps`):
+temps whose live ranges don't overlap share one slot. A temp is coalescable only
+when its whole live range lies in ONE basic block; such temps are packed by a
+linear scan over their `[first,last]` appearance interval (sound even across
+loop back-edges — each is reborn in its block per iteration). Temps that cross a
+block boundary (`?:`/`&&`/`||` results) keep a unique slot. The interval is the
+span of EVERY operand appearance via a blind field scan — over-counting only
+reduces reuse, never makes it unsound, so there's no per-op operand table to get
+wrong. Deterministic (self-host fixed point holds).
+
+Results: **`ata_read_dma` 1760 B → 144 B** (gcc: 96 B), **frames > 1 KB:
+331 → 46** (the rest are real local buffers — e.g. `sys_chan_recv`'s
+`uint8_t kbuf[CHAN_MSG_MAX_BYTES]` — which gcc sizes identically and coalescing
+correctly leaves alone). Deep overflow path now tiny: `vfs_read` 160 B,
+`ata_read_dma` 144 B. Suite 90/90 (incl. new gcc-refereed `slot-reuse.c` stress
+test at -O0 and -O1), self-host deterministic, kernel 89/89 compile clean.
+
+🎉 **END-TO-END CONFIRMED (myos):** the self-compiled kernel now boots to the
+**home desktop in the STOCK 16 KiB kernel stack** — `home.elf` pid 4, compositor
+window, Clock widget first frame — with **zero kernel changes** (the diagnostic
+KSTACK bump was reverted). *"Self-hosting for C, but the kernel wants GCC"* is
+retired: the OS's own compiler compiles the OS's kernel and it runs.
+
+*Residual tail (NOT on the boot path — desktop is fine): a few mega-functions
+carried EmbCC frames 3–5× GCC's. **Halved by scope-based local-slot coalescing**
+(this session): locals in DISJOINT lexical scopes now share a stack slot — sound
+because a stack pointer used past its scope is UB (gcc's own model). irgen
+records each local's block instruction-range (`ir_func.var_scope_lo/hi`), and
+codegen interval-colours the slots (`coalesce_locals`), sized/aligned to the
+strictest occupant; `-g` disables it (distinct DWARF locations). Result:
+`shell_handle_process_command` **84 KB → 45 KB**. gcc-refereed by
+`tests/exec/scope-slots.c` (disjoint sibling arrays coalesce; nested/overlapping
+ones must not — validated address-taken). The remaining gap to gcc (16.5 KB) is
+gcc ALSO coalescing SAME-scope locals by liveness — safe for non-address-taken,
+but for the address-taken arrays here it relies on the escaping-pointer UB;
+deferred as riskier for a kernel. Not blocking; boot-to-desktop runs stock.*
+
+<details><summary>original triage (kept for context)</summary>
+
+*With K12 in, the self-compiled kernel boots ALL the way through init, the
+dynamic linker runs, and **userspace launches** (`home: launched
+/system/bin/home.elf as pid 4`) — then a **Double Fault** at a plain
+`mov %rax,-0x70(%rbp)` in `ata_read_dma`, with a garbled backtrace: the classic
+**kernel-stack-overflow** signature.*
+
+EmbCC at `-O0` spills every local to the stack (no register allocation, no
+slot reuse), so frames are far larger than GCC's, and a deep kernel call chain
+(`syscall → vfs → embkfs → block → ata_read_dma → …`) overflows the **16 KiB**
+per-thread kernel stack (`KSTACK_SIZE`, myos `process.h:37`):
+
+| function | GCC frame | EmbCC frame |
+|---|---|---|
+| `ata_read_dma` | 96 B (`sub $0x60`) | **1760 B** (`sub $0x6e0`) |
+| kernel-wide | — | **331 functions > 1 KB**, biggest ~4 KB |
+
+The code is *correct* — it's just too stack-hungry. This is the first item where
+"compiles + is correct" isn't enough; it's a **codegen-quality** gap.
+
+**Fix (EmbCC side):** cut stack usage — real **register allocation** (the started
+optimizer, `src/opt/opt.c`) so hot locals live in registers, and/or **reuse
+stack slots** for locals whose live ranges don't overlap (today each gets its own
+slot). Getting close to GCC's frame sizes lets the self-compiled kernel run in
+the same 16 KiB the GCC kernel uses.
+
+*(Confirmed by a diagnostic-only KSTACK_SIZE bump on the myos side — NOT
+committed, per "don't change the kernel for an EmbCC gap": with a larger stack
+the self-compiled kernel runs past this. So this is the last codegen item; once
+EmbCC's stack usage drops, no kernel change is needed.)*
+
+</details>
+
+### K14 — register allocation (`-O2`) — **DONE**
+
+**RESOLVED (branch Teo).** EmbCC gained a real register allocator at a new
+`-O2`, on top of K13's slot coalescing. Eligible vregs (temps, and scalar
+int/long/pointer locals & params of size 4/8) live in the five callee-saved GPRs
+(rbx, r12–r15) instead of memory, so their loads/stores vanish. Design:
+
+- **Callee-saved only** — such a value survives a call untouched, so there is no
+  spill-around-call machinery; the function saves/restores the regs it uses in
+  dedicated frame slots. Params are synced slot→reg once in the prologue.
+- **Real liveness + graph colouring** — a backward dataflow
+  (`compute_live_intervals`) gives per-instruction live-in/live-out sets; the
+  PRECISE interference graph (two vregs interfere only when live at the same
+  program point — entry or exit — so ranges that overlap but are never
+  simultaneously live can share a register) is greedily coloured with the 5
+  registers, spilling the rest. (Two subtleties, each caught by the gcc
+  differential: appearance intervals are unsound across loop back-edges — a
+  loop-carried value's register got clobbered mid-loop; and interference from
+  live-OUT alone misses a value whose only appearance is a last use, e.g. a
+  param consumed once — two such params collided in one register. Both fixed by
+  using real liveness and including live-IN.)
+- **Conservative eligibility** — temps, and scalar int/long/pointer/char/short
+  locals & params, are candidates; scalar-integer CALL ARGUMENTS are allocated
+  too (moved straight into their arg register / stack slot). Any vreg touching
+  an "opaque" raw-slot site (a float op, address-of, atomic/memcpy/store-address/
+  va_start, a struct/float call arg, or inline asm — or live across an asm)
+  stays in memory. Missing an exclusion would read a stale slot, so the
+  allocator errs toward memory.
+- **`-O0`/`-O1` untouched** — everything is gated on the regalloc flag, so their
+  output stays byte-identical (the RAX residency cache is disabled at `-O2`,
+  where register-resident values would make its tracking stale).
+
+Verified: all 60 exec programs match gcc's exit + stdout at `-O2`
+(`tests/golden/regalloc-O2.sh`); a stress corpus (values live across calls,
+recursion, register pressure > 5 forcing spills, 8-param calls, div/mod/shift,
+pointers/structs/narrow types) agrees with gcc at `-O0`/`-O1`/`-O2`; codegen is
+deterministic; EmbCC self-compiles at `-O2` and links (and the `-O2` compiler is
+*smaller* — fewer load/stores); the kernel compiles 89/89 at `-O2`. Memory
+traffic drops materially — a counted loop went 35→15 rbp accesses, an 8-param
+call 68→40, a value-live-across-calls function 30→12. Suite 91/91.
+
+**Follow-up (same session) — move coalescing + a stronger residency cache.**
+Three additions on top: (a) the interference graph is now split PRECISELY into
+live-in and live-out groups (a value dying at an instruction and one born there
+never interfere), which both improves allocation and enables (b) MOVE
+COALESCING — a copy `dst = a` (IR_MOV / IR_STVAR, and a plain non-extending
+IR_LDVAR) records a preference edge, biased colouring gives the pair one
+register, and codegen drops the now-identical self-move; and (c) the RAX
+residency cache runs at `-O2` alongside the allocator (keyed on vreg so it also
+elides reloads of register-resident values), with a zero-extend-aware relaxation
+so a 4-byte store then 8-byte reload (the `IR_MOV` round-trip) is elided.
+Result: whole-kernel `-O2` .text is **23% smaller than `-O0`** (2.42 MB →
+1.84 MB); a copy-heavy function fell 39→24 movs. Still 91/91, deterministic,
+`-O0`/`-O1` byte-identical, kernel 89/89. *(Further still: spill-cost heuristics
+and Briggs-style optimistic colouring; strength reduction; value numbering to
+thin the temp-heavy IR that still emits redundant copies.)*
+
+---
+
+## EmbLD — linking the kernel (the LINK side of self-host)
+
+*With the compile side done (K1–K13), the next step is linking the kernel with
+**EmbLD** instead of `x86_64-elf-ld`, so the whole toolchain is owned. Tried it —
+and it very nearly just works.*
+
+***🎉 Proven: an EmbCC-compiled, EmbLD-linked kernel boots to the home desktop***
+*(EMBKFS mounted, `home.elf` pid 4, compositor window, Clock first frame). No GCC,
+no `ld` in the loop.* EmbLD already produces a correct higher-half kernel: the
+`.text` LOAD at vaddr `0xffffffff80100000`, a page-aligned second LOAD for
+`.data`/`.bss`, the entry point from `-e _start`, and program headers the
+bootloader loads. Invocation:
+
+```
+embld -e _start -Ttext 0xFFFFFFFF80100000 -o kernel.elf <all .o> <nasm .o>
+```
+
+### L1 — linker-defined symbols (`kernel_end`) — the ONE blocker
+The kernel's linker script ends with `kernel_end = .;` and `pmm.c` places the PMM
+bitmap at `kernel_end`. EmbLD has no `-T`/symbol-assignment, so:
+
+```
+embld: undefined symbol 'kernel_end' (referenced by …/pmm.c.o)
+```
+
+It's the **only** thing missing — a diagnostic stub (`kernel_end equ <addr past
+the image>`) let the link succeed and the kernel boot to the desktop. **Fix
+options:** (a) minimal `-T` linker-script support handling `SYM = .` assignments
+(the general answer — also subsumes `-Ttext`/`-e`/`ENTRY()`); or (b) implicitly
+define end-of-image symbols and let the kernel script alias `kernel_end` to one.
+Once EmbLD defines `kernel_end` at the true end of `.bss`, the stub goes and the
+kernel links with **zero** external tools.
+
+### L2 — cosmetic: `AT()` LMA (p_paddr) — not a blocker
+EmbLD sets `p_paddr = p_vaddr` (no `AT()` load-address split), so the LOAD
+segments report a higher-half `PhysAddr`. Both loaders (stage2 and the UEFI
+loader) derive the physical destination from `p_vaddr − KERNEL_VIRTUAL_BASE` and
+ignore `p_paddr`, so it boots fine — but a correct `p_paddr` (real LMA `0x100000`)
+would be nicer for a general kernel ELF. Low priority.
+
+---
+
+## Toolchain frontier — owning the whole build (consolidated)
+
+*Added 2026-07-29 from the OS side (myos `docs/BUILD.md` §12 + `docs/PACKAGING_AND_SDK.md`).
+Compile is done (K1–K14); these are the remaining pieces to a build with **zero
+external tools**, and then to being the **SDK's producer**. OS-side context lives in
+those two myos docs; only the EmbCC/EmbLD/assembler work is tracked here.*
+
+| # | Gap | State | Unlocks |
+|---|-----|-------|---------|
+| **L1** | EmbLD linker-defined symbols (`kernel_end`) | open — see the EmbLD section above | kernel links with **no `ld` and no stub** |
+| **A1** | EmbCC standalone `.asm` assembler (NASM/Intel front-end) | **in progress** (the active frontier) | drops **nasm** — EmbCC = compiler+assembler; `EmbBuild`-builds-the-kernel (KM1) |
+| **L2** | EmbLD `AT()` LMA (`p_paddr`) | open, low priority | cosmetically-correct kernel ELF |
+| **X1** | EMBX emission driven by a build manifest (+ inline namespace, `build_id`) | forward-looking (packaging is design-only) | EmbCC/EmbLD become the **SDK producer** (packaging PK2) |
+
+### A1 — a standalone assembler (grow EmbCC into compiler+assembler)
+
+The last external tool in the kernel build is **nasm**: the 6 kernel `.asm`
+(+ `stage1.asm`/`stage2.asm`) are NASM syntax, and TCC's integrated assembler is
+GAS/AT&T, so nothing on the image assembles them. Recommendation (from BUILD.md
+§12): **not** porting nasm — grow EmbCC a standalone assembler front-end over the
+encoder K1 already built, so EmbCC becomes compiler+assembler (like TCC is
+compiler+assembler+linker in one), fully owned, and the kernel `.asm` stay
+**untouched** (EmbCC learns their syntax).
+
+The corpus is small and bounded — **621 lines, 11 directives, ~23 mnemonics**:
+
+- **Directives (~8 distinct):** `global`/`extern`, `section`, `align`,
+  `db`/`dw`/`dd`/`dq`/`resb`, `%macro`, `incbin`.
+- **Front-end:** an **Intel-syntax** file-level parser (the K1 assembler is AT&T,
+  inline-asm-shaped — this is the new part): instruction parser + operand table,
+  the ~8 directives, one `%macro` expander (the `isr0..255` stub is the only real
+  macro user), `incbin` (`ap_trampoline_blob`), and **ELF-object emission with
+  relocations** so EmbLD links the output.
+- **Encoder:** add the ~10 mnemonics the K1 encoder is missing (most of the ~23
+  are already there).
+
+*Green:* `embcc --asm foo.asm -o foo.o` (or an assemble mode) produces objects
+byte-runnable when EmbLD-linked; the 6 kernel `.asm` assemble and the resulting
+kernel boots. This is the one genuinely new subsystem (a real port/feature, not a
+codegen tweak) and it is **THE blocker** for `EmbBuild`-builds-the-kernel (myos
+BUILD.md §12, KM1). *Porting nasm stays the fallback.*
+
+### X1 — EMBX emission as the SDK producer (forward-looking, not yet needed)
+
+EmbCC/EmbLD already emit EMBX with a declared capability set
+(`embld --embx --cap NAME`). The OS's packaging + SDK design
+(myos `docs/PACKAGING_AND_SDK.md`, phase **PK2**) wants the toolchain to be the
+single producer of an app's declared authority — *when packaging work starts*, not
+now (packaging is design-only). The EmbCC-side asks:
+
+1. **Drive the EMBX capability table from the build manifest** (`build.ebm` package
+   stanza) instead of only command-line `--cap`, so declaring authority is part of
+   building.
+2. **Optional inline namespace section** in EMBX beside the capability table, so an
+   EMBX binary can carry its own namespace declaration (today ELF apps ship a
+   sidecar `<name>.ns`; this is the EMBX-native equivalent noted in the packaging
+   doc §4 / userspace UP4).
+3. **Fill the header fields the packager verifies** — `build_id[32]` = SHA-256 of
+   the image, `header_checksum` (CRC32C), `abi_version` — so `pkg install` can
+   verify a bundle by content. *(Confirm which EmbLD already stamps; fill the rest.)*
+
+*No action until PK1/PK2 begin on the OS side; recorded so the producer end is
+scoped when it does.*
+
+### Codegen — verify the large-frame tail is closed
+
+K14 (register allocation, `-O2`) is done; confirm it closed the residual K13 tail
+(a few userspace **mega-functions** were 3–5× GCC frames — e.g. the shell's
+`shell_handle_process_command` at ~82 KB vs 16.5 KB — which would overflow a
+16 KiB stack; the *boot path* was already fine). Not a new gap if `-O2` covers it —
+just a check to retire the note.
+
+---
+
 ## Tier 1 — blocks ordinary real C; do these first (small, high-leverage)
 
 *Status: both landed. On the TinyCC 0.9.27 corpus (24 files) the block-scope
