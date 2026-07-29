@@ -34,6 +34,7 @@ source ──► lex ──► parse ──► sema ──► IR ──► codeg
 | **IR** | a small typed intermediate form | See §3 |
 | **codegen** | IR → x86-64, System V AMD64 | See §4 |
 | **asm** | encode instructions to bytes | Integrated; no external assembler exists on-OS |
+| **as** | standalone NASM/Intel `.asm` → ELF object | `embas` / `embcc -c foo.asm`; byte-identical to nasm on the kernel corpus (A1) |
 | **link** | objects + archives + (later) shared objects → ELF | See §6 — the most target-specific part |
 
 ## 3. IR: start with something honest and small

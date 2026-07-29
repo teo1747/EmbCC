@@ -12,8 +12,10 @@ set, GNU/GCC extensions the kernel needs (statement expressions, `__attribute__`
 genuine x86_64-elf relocatable objects, cross-checked against gcc on every test.
 It has an optimizer (`-O1`/`-O2`: folding, strength reduction, CSE, register
 allocation, stack-slot coalescing) and DWARF debug info (`-g`). `embread` dumps
-and verifies EMBX images; **EmbLD** links. The active frontier is a standalone
-`.asm` assembler so the last external tool (nasm) drops — see `docs/todo.md`.
+and verifies EMBX images; **EmbLD** links. `embcc -c foo.asm` (and the standalone
+**`embas`**) assemble the kernel's hand-written NASM/Intel `.asm` — all 6 kernel
+ELF objects come out **byte-identical to nasm**, so the last external tool drops
+for the kernel's own objects (see `docs/todo.md`, A1).
 
 EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
 for, and eventually *by*, the OS itself. It is the next ring of ownership after

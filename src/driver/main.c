@@ -15,6 +15,7 @@
 #include "../cpp/cpp.h"
 #include "../debug/dwarf.h"
 #include "../cpp/predef.h"
+#include "../as/as.h"
 #include "../elf/write.h"
 #include "../ir/ir.h"
 #include "../opt/opt.h"
@@ -470,6 +471,22 @@ static int has_c_suffix(const char *s)
     return n > 2 && strcmp(s + n - 2, ".c") == 0;
 }
 
+static int has_asm_suffix(const char *s)
+{
+    size_t n = strlen(s);
+    return n > 4 && strcmp(s + n - 4, ".asm") == 0;
+}
+
+/* Swap `.asm` for `.o`, the default assembler output name. */
+static const char *default_asm_output(const char *in)
+{
+    size_t n = strlen(in);
+    char *out = xstrndup(in, n);        /* room for the full name + NUL */
+    out[n - 3] = 'o';                   /* "....asm" -> "....o" */
+    out[n - 2] = '\0';
+    return out;
+}
+
 int main(int argc, char **argv)
 {
     const char *input = NULL, *output = NULL;
@@ -558,7 +575,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             output = argv[++i];
-        } else if (has_c_suffix(argv[i])) {
+        } else if (has_c_suffix(argv[i]) || has_asm_suffix(argv[i])) {
             if (input) {
                 fprintf(stderr, "embcc: error: more than one input file "
                                 "(M1: one file at a time)\n");
@@ -591,6 +608,17 @@ int main(int argc, char **argv)
         else
             snprintf(selfinc, sizeof selfinc, "./include");
         incdirs[nincdirs++] = selfinc;
+    }
+    /* A `.asm` input goes to the built-in assembler (A1), not the C front-end.
+     * Like gcc dispatching `.s`, embcc owns the kernel's hand-written assembly:
+     * `embcc -c foo.asm -o foo.o` replaces `nasm -f elf64`. */
+    if (has_asm_suffix(input)) {
+        if (pp_only) {
+            fprintf(stderr, "embcc: error: -E does not apply to assembly\n");
+            return 1;
+        }
+        return as_assemble(input, output ? output : default_asm_output(input),
+                           AS_ELF64);
     }
     if (pp_only)
         return compile(input, NULL, 1);

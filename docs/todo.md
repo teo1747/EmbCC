@@ -478,37 +478,48 @@ those two myos docs; only the EmbCC/EmbLD/assembler work is tracked here.*
 | # | Gap | State | Unlocks |
 |---|-----|-------|---------|
 | **L1** | EmbLD linker-defined symbols (`kernel_end`) | **DONE** — `define_end_symbols` auto-provides `kernel_end`/`_end`/`end`/`__bss_end` at the image end (only if referenced; a real def wins; a genuinely-undefined symbol still errors) | kernel links with **no `ld` and no stub** |
-| **A1** | EmbCC standalone `.asm` assembler (NASM/Intel front-end) | **in progress** (the active frontier) | drops **nasm** — EmbCC = compiler+assembler; `EmbBuild`-builds-the-kernel (KM1) |
+| **A1** | EmbCC standalone `.asm` assembler (NASM/Intel front-end) | **DONE** — `embas` + `embcc -c foo.asm`; all 6 kernel ELF `.asm` assemble **byte-identical to nasm** in code, symbols, and relocations | drops **nasm** for the kernel ELF objects — EmbCC = compiler+assembler; `EmbBuild`-builds-the-kernel (KM1) |
 | **L2** | EmbLD `AT()` LMA (`p_paddr`) | **DONE** — `embld --lma-offset OFFSET` sets `p_paddr = p_vaddr - OFFSET` (higher-half kernel LMA); default keeps `p_paddr == p_vaddr` | cosmetically-correct kernel ELF |
 | **X1** | EMBX emission driven by a build manifest (+ inline namespace, `build_id`) | forward-looking (packaging is design-only) | EmbCC/EmbLD become the **SDK producer** (packaging PK2) |
 
-### A1 — a standalone assembler (grow EmbCC into compiler+assembler)
+### A1 — a standalone assembler (grow EmbCC into compiler+assembler) — DONE
 
-The last external tool in the kernel build is **nasm**: the 6 kernel `.asm`
-(+ `stage1.asm`/`stage2.asm`) are NASM syntax, and TCC's integrated assembler is
-GAS/AT&T, so nothing on the image assembles them. Recommendation (from BUILD.md
-§12): **not** porting nasm — grow EmbCC a standalone assembler front-end over the
-encoder K1 already built, so EmbCC becomes compiler+assembler (like TCC is
-compiler+assembler+linker in one), fully owned, and the kernel `.asm` stay
-**untouched** (EmbCC learns their syntax).
+The last external tool in the kernel build was **nasm**: the 6 kernel `.asm`
+are NASM syntax, and the K1 inline-asm assembler is AT&T/operand-resolved, so it
+could not read them. Rather than port nasm, EmbCC grew its own assembler
+front-end — `src/as/as.c`, reachable two ways:
 
-The corpus is small and bounded — **621 lines, 11 directives, ~23 mnemonics**:
+- **`embas -f elf64 foo.asm -o foo.o`** — the standalone tool (`tools/embas/`).
+- **`embcc -c foo.asm -o foo.o`** — the driver dispatches a `.asm` input to the
+  same assembler, exactly as gcc dispatches `.s` (`embcc` = compiler+assembler).
 
-- **Directives (~8 distinct):** `global`/`extern`, `section`, `align`,
-  `db`/`dw`/`dd`/`dq`/`resb`, `%macro`, `incbin`.
-- **Front-end:** an **Intel-syntax** file-level parser (the K1 assembler is AT&T,
-  inline-asm-shaped — this is the new part): instruction parser + operand table,
-  the ~8 directives, one `%macro` expander (the `isr0..255` stub is the only real
-  macro user), `incbin` (`ap_trampoline_blob`), and **ELF-object emission with
-  relocations** so EmbLD links the output.
-- **Encoder:** add the ~10 mnemonics the K1 encoder is missing (most of the ~23
-  are already there).
+**Shipped (all built and tested):** an Intel-syntax two-pass assembler with jump
+relaxation (rel8/rel32 fixpoint, matching nasm's short-jump choices), local-label
+scoping (`.halt` → `parent.halt`), `%macro` expansion (`isr0..255`), the
+directives `global`/`extern`, `section`, `align`, `db`/`dw`/`dd`/`dq`, `resb`,
+`incbin`, and ELF-object emission via the shared writer (`src/elf/write.c`) with
+`R_X86_64_64`/`R_X86_64_PC32` relocations.
 
-*Green:* `embcc --asm foo.asm -o foo.o` (or an assemble mode) produces objects
-byte-runnable when EmbLD-linked; the 6 kernel `.asm` assemble and the resulting
-kernel boots. This is the one genuinely new subsystem (a real port/feature, not a
-codegen tweak) and it is **THE blocker** for `EmbBuild`-builds-the-kernel (myos
-BUILD.md §12, KM1). *Porting nasm stays the fallback.*
+**Correctness bar met — byte-identical to nasm.** All 6 kernel ELF `.asm`
+(`kentry`, `syscall_entry`, `kcontext`, `isr`, `ap_entry`, `ap_trampoline_blob`)
+assemble to objects whose **code (`.text`/`.rodata`/`.data`), symbol table, and
+relocations are byte-identical to `nasm -f elf64`** — including nasm's own
+conventions: section-appearance ordering, a leading `STT_FILE` symbol,
+`STT_SECTION` symbols, a definition-sequence-ordered symtab, and relocations
+against the section symbol + addend for locally-defined targets. The only
+residual differences are the linker-invisible internal layout of the ELF
+container (the `.strtab` string order and the section-header-table placement,
+both in the shared writer used by `embcc` too); a real link of an
+`embas` object produces byte-identical relocated `.text` to the nasm object.
+Covered by `tests/golden/assembler.sh` (skips honestly without nasm). `as.c` is
+in the self-host source set — the fixed point holds at **16 sources**.
+
+**Out of scope (deliberately):** `-f bin` flat-binary mode for the boot stages
+and AP trampoline (`boot/stage1`, `boot/stage2`, `ap_trampoline.asm`) is *not*
+implemented — those are 16/32-bit real-mode code with `org`/`BITS 16`/`DEFAULT
+ABS`, a separate encoder frontier from the 64-bit kernel ELF corpus. `embas -f
+bin` reports "not yet implemented" rather than miscompiling. The kernel's own
+ELF objects — the A1 goal — no longer need nasm.
 
 ### X1 — EMBX emission as the SDK producer (forward-looking, not yet needed)
 
