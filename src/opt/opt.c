@@ -234,10 +234,42 @@ static long fold_ext(long A, int size, int sign, int w)
     return norm(r, w);
 }
 
+static void count_cb(int *p, void *ctx);   /* fwd: use-count accumulator (DCE) */
+
+/* If b is 2^k (k>=1), return k; else -1. */
+static int log2_pow2(long b)
+{
+    if (b <= 1 || (b & (b - 1)))
+        return -1;
+    int k = 0;
+    while ((b >>= 1))
+        k++;
+    return k;
+}
+
+/* Retarget a single-use constant temp to a new value in place (used by strength
+ * reduction: rewrite `x * 8` as `x << 3` by turning the `8` literal into `3`).
+ * Safe only when the constant has exactly one use — CSE may have shared it. */
+static int retarget_const(struct ir_func *fn, struct defs *d, const int *use,
+                          int ctemp, long newval)
+{
+    if (ctemp < 0 || d->cnt[ctemp] != 1 || d->ins[ctemp] < 0 || use[ctemp] != 1)
+        return 0;
+    struct ir_ins *ci = &fn->ins[d->ins[ctemp]];
+    if (ci->op != IR_CONST || ci->flt)
+        return 0;
+    ci->imm = newval;
+    return 1;
+}
+
 static int pass_fold(struct ir_func *fn)
 {
     struct defs d;
     compute_defs(fn, &d);
+    /* use counts, for the single-use check strength reduction needs */
+    int *use = xcalloc((size_t)fn->nvregs, sizeof *use);
+    for (int n = 0; n < fn->nins; n++)
+        each_read(&fn->ins[n], count_cb, use);
     int changed = 0;
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
@@ -269,9 +301,10 @@ static int pass_fold(struct ir_func *fn)
         case IR_ADD: case IR_SUB: case IR_MUL:
         case IR_AND: case IR_OR: case IR_XOR:
         case IR_SHL: case IR_SHR: case IR_CMP:
+        case IR_DIV: case IR_MOD:   /* not const-folded (÷0), but strength-reduced */
             break;
         default:
-            continue;   /* not a foldable binary op (DIV/MOD left alone) */
+            continue;
         }
         if (ka && kb) {
             if (fold_bin(i->op, A, B, i->w, i->sign, i->pred, &r)) {
@@ -297,10 +330,39 @@ static int pass_fold(struct ir_func *fn)
             if (ka && A == 0) { to_mov(i, i->b); changed = 1; }
             else if (kb && B == 0) { to_mov(i, i->a); changed = 1; }
             break;
-        case IR_MUL:
+        case IR_MUL: {
+            int sh;
             if ((ka && A == 0) || (kb && B == 0)) { to_const(i, 0); changed = 1; }
             else if (ka && A == 1) { to_mov(i, i->b); changed = 1; }
             else if (kb && B == 1) { to_mov(i, i->a); changed = 1; }
+            /* x * 2^k -> x << k (retarget the literal to k). Handle either
+             * operand being the constant, since MUL is commutative. */
+            else if (kb && (sh = log2_pow2(B)) >= 0 &&
+                     retarget_const(fn, &d, use, i->b, sh)) {
+                i->op = IR_SHL; changed = 1;   /* x << k, count already in b */
+            } else if (ka && (sh = log2_pow2(A)) >= 0 &&
+                       retarget_const(fn, &d, use, i->a, sh)) {
+                /* A_const * x -> x << k: put x in a, the retargeted count in b */
+                int c = i->a; i->a = i->b; i->b = c;
+                i->op = IR_SHL; changed = 1;
+            }
+            break;
+        }
+        case IR_DIV:
+            /* unsigned x / 2^k -> x >> k (logical) */
+            if (kb && !i->sign) {
+                int sh = log2_pow2(B);
+                if (sh >= 0 && retarget_const(fn, &d, use, i->b, sh)) {
+                    i->op = IR_SHR; changed = 1;
+                } else if (B == 1) { to_mov(i, i->a); changed = 1; }
+            }
+            break;
+        case IR_MOD:
+            /* unsigned x % 2^k -> x & (2^k - 1) */
+            if (kb && !i->sign && log2_pow2(B) >= 0 &&
+                retarget_const(fn, &d, use, i->b, B - 1)) {
+                i->op = IR_AND; changed = 1;
+            }
             break;
         case IR_AND:
             if ((ka && A == 0) || (kb && B == 0)) { to_const(i, 0); changed = 1; }
@@ -313,6 +375,7 @@ static int pass_fold(struct ir_func *fn)
             break;
         }
     }
+    free(use);
     free_defs(&d);
     return changed;
 }
