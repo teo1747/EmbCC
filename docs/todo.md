@@ -536,12 +536,16 @@ now (packaging is design-only). The EmbCC-side asks:
    EMBX binary can carry its own namespace declaration (today ELF apps ship a
    sidecar `<name>.ns`; this is the EMBX-native equivalent noted in the packaging
    doc §4 / userspace UP4).
-3. **Fill the header fields the packager verifies** — `build_id[32]` = SHA-256 of
-   the image, `header_checksum` (CRC32C), `abi_version` — so `pkg install` can
-   verify a bundle by content. *(Confirm which EmbLD already stamps; fill the rest.)*
+3. **Fill the header fields the packager verifies** — **already done.** EmbLD
+   stamps `abi_version`, `build_id[32]` (SHA-256 over the whole image, computed
+   with `build_id`/`header_checksum` zeroed), and `header_checksum` (CRC32C over
+   the header body), plus per-segment CRC32C — see `src/link/link.c` (~L847–889),
+   in the checksum order EMBX §3.4 fixes. So `pkg install` can already verify a
+   bundle by content; nothing outstanding here.
 
-*No action until PK1/PK2 begin on the OS side; recorded so the producer end is
-scoped when it does.*
+So of X1, only (1) manifest-driven capabilities and (2) the inline-namespace EMBX
+section remain, and both are gated on OS-side packaging. **No action until PK1/PK2
+begin on the OS side; recorded so the producer end is scoped when it does.**
 
 ### Codegen — verify the large-frame tail is closed
 
