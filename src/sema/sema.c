@@ -715,6 +715,12 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                        ty_name(base), e->name);
         e->memb = mm;
         e->ty = e->memb->ty;
+        /* C: a member of a `volatile`-qualified struct/union is itself
+         * volatile-qualified — propagate it so the load/store isn't optimized
+         * (the ehci/ohci MMIO register-struct pattern), and so a nested struct
+         * member stays volatile for its own members. */
+        if (base->is_volatile && !e->ty->is_volatile)
+            e->ty = ty_volatile(e->ty);
         if (e->ty->kind == TY_ARRAY) {
             e->undecayed = e->ty;
             e->ty = ty_ptr(e->ty->pointee);

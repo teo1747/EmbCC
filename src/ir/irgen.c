@@ -168,6 +168,7 @@ static int emit_ldvar(struct ir_func *fn, int v, const struct type *t)
     i->size = ty_size(t);
     i->sign = ty_signed_int(t);
     i->w = ty_w(t);
+    i->vol = t->is_volatile;
     i->dst = new_temp(fn);
     return i->dst;
 }
@@ -180,6 +181,7 @@ static void emit_stvar(struct ir_func *fn, int v, int val,
     i->dst = v;
     i->a = val;
     i->size = ty_size(t);
+    i->vol = t->is_volatile;
 }
 
 static int emit_gaddr(struct ir_func *fn, struct global *g)
@@ -200,6 +202,7 @@ static int emit_load(struct ir_func *fn, int addr, const struct type *t)
     i->size = ty_size(t);
     i->sign = ty_signed_int(t);
     i->w = ty_w(t);
+    i->vol = t->is_volatile;
     i->dst = new_temp(fn);
     return i->dst;
 }
@@ -212,6 +215,7 @@ static void emit_store(struct ir_func *fn, int addr, int val,
     i->a = addr;
     i->b = val;
     i->size = ty_size(t);
+    i->vol = t->is_volatile;
 }
 
 static void emit_mov(struct ir_func *fn, int dst, int src)

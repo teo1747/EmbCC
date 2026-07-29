@@ -317,6 +317,125 @@ static int pass_fold(struct ir_func *fn)
     return changed;
 }
 
+/* ---- local value numbering (CSE within a basic block) ---- */
+
+/* An op that may write memory (so a cached load past it is stale). */
+static int writes_memory(enum ir_op op)
+{
+    switch (op) {
+    case IR_STORE: case IR_STVAR: case IR_CALL: case IR_MEMCPY:
+    case IR_MEMZERO: case IR_XCHG: case IR_XADD: case IR_CMPXCHG:
+    case IR_ASM: case IR_VA_START:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* One value-number entry: the discriminating fields of a computation plus the
+ * temp that first produced it. Two instructions with equal keys in the same
+ * block compute the same value. Loads carry `memver` so a store between two
+ * loads gives them different keys (no stale reuse). */
+struct vn {
+    enum ir_op op;
+    int a, b, w, sign, size;
+    enum binop pred;
+    long imm;
+    void *ptr;                 /* GADDR glob / FADDR callee */
+    int label;                 /* STRADDR string index */
+    int memver;                /* LDVAR / LOAD only */
+    int result;                /* the temp holding this value */
+};
+
+static int vn_eq(const struct vn *x, const struct vn *y)
+{
+    return x->op == y->op && x->a == y->a && x->b == y->b && x->w == y->w &&
+           x->sign == y->sign && x->size == y->size && x->pred == y->pred &&
+           x->imm == y->imm && x->ptr == y->ptr && x->label == y->label &&
+           x->memver == y->memver;
+}
+
+/* Build the value key for a CSE-able instruction; returns 0 if it is not one
+ * (float ops, VOLATILE loads/ldvars, calls, stores — anything with an effect or
+ * that we don't number). */
+static int vn_key(struct ir_ins *i, int memver, struct vn *k)
+{
+    memset(k, 0, sizeof *k);
+    k->op = i->op; k->a = -1; k->b = -1;
+    if (i->flt)
+        return 0;
+    switch (i->op) {
+    case IR_CONST:               /* same literal -> one temp, so uses of it CSE */
+        k->imm = i->imm; k->w = i->w; return 1;
+    case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+    case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SHR:
+        k->a = i->a; k->b = i->b; k->w = i->w; k->sign = i->sign; return 1;
+    case IR_CMP:
+        k->a = i->a; k->b = i->b; k->w = i->w; k->sign = i->sign;
+        k->pred = i->pred; return 1;
+    case IR_NEG: case IR_BNOT:
+        k->a = i->a; k->w = i->w; return 1;
+    case IR_EXT:
+        k->a = i->a; k->w = i->w; k->sign = i->sign; k->size = i->size; return 1;
+    case IR_BSWAP:
+        k->a = i->a; k->size = i->size; return 1;
+    case IR_ADDR:                       /* &local: a frame-relative constant */
+        k->a = i->a; return 1;
+    case IR_GADDR: k->ptr = i->glob; return 1;
+    case IR_FADDR: k->ptr = i->callee; return 1;
+    case IR_STRADDR: k->label = i->label; return 1;
+    case IR_LDVAR:                      /* a variable read (memory-versioned) */
+        if (i->vol) return 0;
+        k->a = i->a; k->w = i->w; k->sign = i->sign; k->size = i->size;
+        k->memver = memver; return 1;
+    case IR_LOAD:                       /* a pointer deref (memory-versioned) */
+        if (i->vol) return 0;
+        k->a = i->a; k->w = i->w; k->sign = i->sign; k->size = i->size;
+        k->memver = memver; return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Replace a computation that reproduces an earlier one in the same block with a
+ * copy of that earlier result; fold/copyprop/dce then remove the redundancy.
+ * The block is the run between labels; a memory write bumps `memver` (part of a
+ * load's key), so a load after a store is never reused. Sound: temps are
+ * single-assignment, so equal operand temps => equal value; VOLATILE accesses
+ * are never numbered (vn_key rejects them), preserving every MMIO access. */
+static int pass_lvn(struct ir_func *fn)
+{
+    int changed = 0, memver = 0;
+    struct vn *tab = NULL;
+    int ntab = 0, cap = 0;
+    for (int n = 0; n < fn->nins; n++) {
+        struct ir_ins *i = &fn->ins[n];
+        enum ir_op op0 = i->op;
+        if (op0 == IR_LABEL) { ntab = 0; continue; }   /* block boundary */
+        struct vn k;
+        if (i->dst >= 0 && vn_key(i, memver, &k)) {
+            int hit = -1;
+            for (int t = 0; t < ntab; t++)
+                if (vn_eq(&tab[t], &k)) { hit = tab[t].result; break; }
+            if (hit >= 0 && hit != i->dst) {
+                to_mov(i, hit);
+                changed = 1;
+            } else if (hit < 0) {
+                if (ntab == cap) {
+                    cap = cap ? cap * 2 : 32;
+                    tab = xrealloc(tab, (size_t)cap * sizeof *tab);
+                }
+                k.result = i->dst;
+                tab[ntab++] = k;
+            }
+        }
+        if (writes_memory(op0))
+            memver++;
+    }
+    free(tab);
+    return changed;
+}
+
 /* ---- copy propagation ---- */
 
 struct repl { int from, to, n; };
@@ -394,6 +513,7 @@ static void opt_func(struct ir_func *fn)
     while (changed && guard++ < 1000) {
         changed = 0;
         changed |= pass_fold(fn);
+        changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
         changed |= pass_copyprop(fn);
         changed |= pass_dce(fn);
     }

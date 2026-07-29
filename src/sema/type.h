@@ -38,6 +38,13 @@ struct member {
 struct type {
     enum ty_kind kind;
     int is_unsigned;        /* integers only */
+    int is_volatile;        /* `volatile`-qualified: every access must happen and
+                             * must not be CSE'd/removed (MMIO). Set on the
+                             * ACCESSED type — the pointee of a volatile pointer,
+                             * or a volatile variable. Ignored by ty_equal. */
+    struct type *canon;     /* a volatile COPY points at the unqualified original
+                             * (structs compare by identity, so equality follows
+                             * this); NULL on an original. */
     struct type *pointee;   /* TY_PTR: target; TY_ARRAY: element */
     int count;              /* TY_ARRAY: element count */
     /* TY_STRUCT (unions too — one type kind, is_union flag): */
@@ -57,6 +64,10 @@ struct type {
 /* Base types are interned singletons — pointer equality works for
  * them; ty_equal() works for everything. */
 struct type *ty_base(enum ty_kind kind, int is_unsigned);
+/* A copy of `t` marked `volatile` (or t itself if already). Base types are
+ * interned singletons, so this returns a fresh non-interned node — safe because
+ * nothing compares types by pointer identity (ty_equal compares fields). */
+struct type *ty_volatile(struct type *t);
 struct type *ty_ptr(struct type *pointee);
 struct type *ty_array(struct type *elem, int count);
 

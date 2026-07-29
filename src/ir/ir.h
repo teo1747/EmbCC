@@ -99,6 +99,8 @@ struct ir_ins {
     int size;                /* 1/2/4/8: memory width for LD/ST/EXT */
     int sign;                /* signed variant of the op */
     int flt;                 /* operate in xmm at width w (SSE scalar) */
+    int vol;                 /* LOAD/STORE/LDVAR/STVAR: a `volatile` access —
+                              * the optimizer must never CSE or remove it (MMIO) */
     long imm;                /* IR_CONST */
     enum binop pred;         /* IR_CMP */
     int label;               /* IR_LABEL/IR_JMP/IR_BRZ */

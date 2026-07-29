@@ -25,6 +25,17 @@ struct type *ty_base(enum ty_kind kind, int is_unsigned)
     return &bases[kind][is_unsigned ? 1 : 0];
 }
 
+struct type *ty_volatile(struct type *t)
+{
+    if (!t || t->is_volatile)
+        return t;
+    struct type *v = xcalloc(1, sizeof *v);
+    *v = *t;                 /* a non-interned copy */
+    v->is_volatile = 1;
+    v->canon = t->canon ? t->canon : t;  /* struct equality follows this */
+    return v;
+}
+
 struct type *ty_ptr(struct type *pointee)
 {
     struct type *t = xcalloc(1, sizeof *t);
@@ -179,8 +190,13 @@ int ty_equal(const struct type *a, const struct type *b)
         return ty_equal(a->pointee, b->pointee);
     if (a->kind == TY_ARRAY)
         return a->count == b->count && ty_equal(a->pointee, b->pointee);
-    if (a->kind == TY_STRUCT)
-        return a == b; /* one node per tag: identity is equality */
+    if (a->kind == TY_STRUCT) {
+        /* one node per tag: identity is equality — but a volatile copy points at
+         * its original via `canon`, so compare canonical nodes. */
+        const struct type *ca = a->canon ? a->canon : a;
+        const struct type *cb = b->canon ? b->canon : b;
+        return ca == cb;
+    }
     if (a->kind == TY_FUNC) {
         if (a->nptypes != b->nptypes || a->is_varargs != b->is_varargs ||
             !ty_equal(a->ret, b->ret))

@@ -91,15 +91,20 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL;
 }
 
-/* const/volatile/restrict are accepted and IGNORED: EmbCC does not
- * enforce const-correctness yet. Documented divergence — it accepts
- * programs gcc rejects, the price of parsing real headers pre-M3. */
-static void skip_quals(struct parser *ps)
+/* const/restrict are accepted and IGNORED (no const-correctness enforcement).
+ * VOLATILE is honored for codegen: it must reach the accessed type so the
+ * optimizer never CSEs/removes a volatile access (MMIO). Returns 1 if a
+ * `volatile` was among the qualifiers consumed. */
+static int skip_quals(struct parser *ps)
 {
+    int vol = 0;
     while (cur(ps)->kind == TOK_KW_CONST ||
            cur(ps)->kind == TOK_KW_VOLATILE ||
-           cur(ps)->kind == TOK_KW_RESTRICT)
+           cur(ps)->kind == TOK_KW_RESTRICT) {
+        if (cur(ps)->kind == TOK_KW_VOLATILE) vol = 1;
         advance(ps);
+    }
+    return vol;
 }
 
 /* Does a type begin at the current token — including typedef names,
@@ -319,9 +324,20 @@ static struct type *parse_tagged(struct parser *ps, enum tag_kind kind,
 /* Consumes a type specifier if one starts here, else returns NULL with
  * nothing consumed. "unsigned"/"signed" alone mean int, as in C.
  * allow_body: may a struct/union/enum BODY appear here (file scope). */
+static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
+                                          int *vol);
+
 static struct type *parse_type_spec(struct parser *ps, int allow_body)
 {
-    skip_quals(ps);
+    int vol = 0;
+    struct type *t = parse_type_spec_inner(ps, allow_body, &vol);
+    return (t && vol) ? ty_volatile(t) : t;   /* volatile reaches the type */
+}
+
+static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
+                                          int *vol)
+{
+    *vol = skip_quals(ps);
     /* struct/union/enum first (cannot mix with other specifiers) */
     if (cur(ps)->kind == TOK_KW_STRUCT || cur(ps)->kind == TOK_KW_UNION ||
         cur(ps)->kind == TOK_KW_ENUM) {
@@ -364,7 +380,10 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
         else if (k == TOK_KW_INT) nint++;
         else if (k == TOK_KW_VOID) nvoid++;
         else if (k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
-                 k == TOK_KW_RESTRICT) { advance(ps); continue; }
+                 k == TOK_KW_RESTRICT) {
+            if (k == TOK_KW_VOLATILE) *vol = 1;
+            advance(ps); continue;
+        }
         else break;
         any++;
         advance(ps);
