@@ -43,9 +43,13 @@ lying — likely a linear three-address IR over virtual registers, with explicit
 types (integers by width and signedness, pointers, aggregates by size/align).
 
 Explicitly **not** planned for the early milestones: SSA, a pass manager, an
-optimizer. They are the right shape for a mature compiler and the wrong shape
-for one that has never run a program. Correct-and-slow first; the ROADMAP has no
-performance milestone before M4 for exactly this reason.
+optimizer. Correct-and-slow first — for one that has never run a program that was
+the right call. *(Since then — well past those milestones — the compiler has
+grown a real optimizer: an IR-level pass set (folding, strength reduction, local
+value numbering/CSE, copy propagation, DCE — `src/opt`) plus codegen register
+allocation, stack-slot coalescing, and a residency cache — `src/codegen`. Still
+no SSA; the single-assignment temporaries make the local passes sound without
+it.)*
 
 ## 4. Codegen: x86-64, System V AMD64
 
@@ -123,7 +127,13 @@ compiler read this file yet?"
 
 ## 8. Non-goals for the early milestones
 
-Stated so they are not accidentally attempted: optimization passes, debug info
-(DWARF), C++, TLS/`__thread`, PIE/PIC output, cross-targets other than x86-64,
-and the kernel's freestanding mode (DECISIONS D-007). Several become interesting
-later; none belong before a program runs.
+Stated so they were not accidentally attempted before a program ran: optimization
+passes, debug info (DWARF), C++, TLS/`__thread`, PIE/PIC output, cross-targets
+other than x86-64, and the kernel's freestanding mode (DECISIONS D-007).
+
+*Since the early milestones closed, several have been done deliberately:*
+**optimization passes** (`-O1`/`-O2`, see §3 and `src/opt`/`src/codegen`),
+**debug info** (`-g` emits DWARF-4 line/frame/locals; there is an EmbDBG tool),
+and the **kernel's freestanding mode** (`-mno-sse -mcmodel=kernel` etc. — EmbCC
+compiles the whole EmbLinkOS kernel, which boots to the desktop). C++,
+TLS, and PIE/PIC remain out of scope.

@@ -1,13 +1,19 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
-**Status: M2 complete — EmbLinkOS ran the real sval SDK compiled by EmbCC
-(2026-07-24).** The decision record below still governs. `embcc -c` compiles a
-substantial C subset — the integer types, pointers (incl. function pointers),
-arrays, structs/unions/enums, globals, the full operator set, and a
-preprocessor that digests **real newlib headers**, so `#include <stdio.h>`
-compiles, links and runs — to genuine x86_64-elf relocatable objects,
-cross-checked against gcc on every test. `embread` dumps and verifies EMBX
-images. No linker yet (M3); nothing in EmbLinkOS depends on this.
+**Status: M3 closed and well past it — EmbCC compiles *itself* (self-hosting
+fixed point holds), and the whole EmbLinkOS **kernel** compiles under EmbCC,
+links with **EmbLD**, and boots to the home desktop with no gcc and no `ld` in
+the loop.** The decision record below still governs. `embcc -c` compiles a
+substantial C subset — the integer types, floats, pointers (incl. function
+pointers), arrays, structs/unions/enums, bitfields, globals, the full operator
+set, GNU/GCC extensions the kernel needs (statement expressions, `__attribute__`,
+`__builtin_*`, a real inline-asm assembler), and a preprocessor that digests
+**real newlib headers** (`#include <stdio.h>` compiles, links and runs) — to
+genuine x86_64-elf relocatable objects, cross-checked against gcc on every test.
+It has an optimizer (`-O1`/`-O2`: folding, strength reduction, CSE, register
+allocation, stack-slot coalescing) and DWARF debug info (`-g`). `embread` dumps
+and verifies EMBX images; **EmbLD** links. The active frontier is a standalone
+`.asm` assembler so the last external tool (nasm) drops — see `docs/todo.md`.
 
 EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
 for, and eventually *by*, the OS itself. It is the next ring of ownership after
@@ -68,7 +74,7 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 | Doc | What it is |
 |---|---|
 | [docs/VISION.md](docs/VISION.md) | Why a native compiler; the ownership thesis; the own-the-stack vs host-the-world tension |
-| [docs/VISION_LONGTERM.md](docs/VISION_LONGTERM.md) | The post-M4 horizon: compiler infrastructure, tooling, optimization, analysis — each gated by D-006, none scheduled |
+| [docs/VISION_LONGTERM.md](docs/VISION_LONGTERM.md) | The post-M4 horizon: compiler infrastructure, tooling, deeper analysis — gated by D-006. (Basic optimization has since landed; see `src/opt` + `src/codegen`.) |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions already made, each with its rationale (ADR-style) |
 | [docs/TARGET_ABI.md](docs/TARGET_ABI.md) | **The grounding doc.** The exact EmbLinkOS contract EmbCC must emit — syscalls, crt0, and the precise ELF the in-kernel loader accepts |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
