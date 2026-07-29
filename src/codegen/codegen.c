@@ -501,22 +501,51 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         pref[(size_t)ea * ew + (ed >> 6)] |= 1UL << (ed & 63);
     }
 
-    /* Greedy colouring in first-appearance order (deterministic): give each vreg
-     * a register no interfering neighbour uses, preferring one a move-partner
-     * already has (coalescing); spill (stay in memory) if all NCALLEE are taken. */
+    /* Chaitin-Briggs simplify order. Repeatedly remove a node of degree < NCALLEE
+     * (trivially colourable) onto a stack; when none remains, remove the highest-
+     * degree node as an OPTIMISTIC spill candidate. Colouring then pops the stack
+     * (below) — a spill candidate popped early may still find a free colour, so
+     * fewer values actually spill than a fixed first-appearance order gives.
+     * Deterministic: ties broken by the lowest eligible index. */
     int *order = xmalloc((size_t)(E ? E : 1) * sizeof *order);
-    {   /* bucket by first[] so the order is first-asc, ties by vreg index */
-        int *head = xmalloc((size_t)(nins + 1) * sizeof *head);
-        for (int i = 0; i <= nins; i++) head[i] = -1;
-        int *nxt = xmalloc((size_t)(E ? E : 1) * sizeof *nxt);
-        for (int e = E - 1; e >= 0; e--) {
-            int fi = first[eidx[e]];
-            nxt[e] = head[fi]; head[fi] = e;
+    {
+        int *deg = xmalloc((size_t)(E ? E : 1) * sizeof *deg);
+        for (int e = 0; e < E; e++) {
+            int d = 0;
+            unsigned long *row = adj + (size_t)e * ew;
+            for (int w = 0; w < ew; w++) {
+                unsigned long b = row[w];
+                while (b) { d++; b &= b - 1; }
+            }
+            deg[e] = d;
         }
-        int oc = 0;
-        for (int i = 0; i <= nins; i++)
-            for (int e = head[i]; e >= 0; e = nxt[e]) order[oc++] = e;
-        free(head); free(nxt);
+        char *gone = xcalloc((size_t)(E ? E : 1), 1);
+        int sp = 0;
+        for (int cnt = 0; cnt < E; cnt++) {
+            int pick = -1;
+            for (int e = 0; e < E; e++)          /* a trivially-colourable node */
+                if (!gone[e] && deg[e] < NCALLEE) { pick = e; break; }
+            if (pick < 0)                        /* else the most-constrained one */
+                for (int e = 0; e < E; e++)
+                    if (!gone[e] && (pick < 0 || deg[e] > deg[pick])) pick = e;
+            gone[pick] = 1;
+            order[sp++] = pick;                  /* push */
+            unsigned long *row = adj + (size_t)pick * ew;
+            for (int w = 0; w < ew; w++) {
+                unsigned long b = row[w];
+                while (b) {
+                    int bit = 0; unsigned long t = b;
+                    while (!(t & 1)) { t >>= 1; bit++; }
+                    int ne = w * 64 + bit;
+                    if (!gone[ne]) deg[ne]--;
+                    b &= b - 1;
+                }
+            }
+        }
+        for (int i = 0; i < E / 2; i++) {        /* pop order = reverse of push */
+            int t = order[i]; order[i] = order[E - 1 - i]; order[E - 1 - i] = t;
+        }
+        free(deg); free(gone);
     }
 
     int reg_used[NCALLEE];
