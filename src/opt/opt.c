@@ -564,12 +564,73 @@ static int pass_dce(struct ir_func *fn)
             changed = 1;
             continue;   /* drop it */
         }
+        /* Dead store: a non-volatile STVAR to a local nothing ever reads (no
+         * LDVAR and no address-of, so use[dst] == 0) has no effect — drop it.
+         * This is what clears an inlined parameter once store-forwarding has
+         * rewritten its loads to the argument. */
+        if (i->op == IR_STVAR && !i->vol && i->dst >= 0 &&
+            i->dst < fn->nvregs && use[i->dst] == 0) {
+            changed = 1;
+            continue;
+        }
         if (j != n)
             fn->ins[j] = *i;
         j++;
     }
     fn->nins = j;
     free(use);
+    return changed;
+}
+
+/* ---- local store-forwarding (a lightweight mem2reg) ----
+ *
+ * EmbIR keeps locals in memory (STVAR/LDVAR). Within an extended basic block a
+ * store `STVAR L, v` makes every later `LDVAR L` yield v — until the next store
+ * to L or a control-flow join. Forwarding v turns the reload into a copy that
+ * copyprop/DCE then erase. Sound only for a local that is never address-taken
+ * (so no aliased write can change it) and a full-width plain load (size 4 or 8,
+ * no narrowing/extension between the store and the load). This is what lets an
+ * inlined body's parameter plumbing (STVAR param, arg; LDVAR param) collapse to
+ * the argument, so folding flows through the inline. */
+static int sf_plain(int size, int sign, int w)
+{
+    return size == 8 || (size == 4 && !(sign && w == 8));
+}
+
+static int pass_storefwd(struct ir_func *fn)
+{
+    int nvars = fn->src->nvars;
+    if (nvars == 0)
+        return 0;
+    char *taken = xcalloc((size_t)fn->nvregs, 1);
+    for (int i = 0; i < fn->nins; i++)
+        if (fn->ins[i].op == IR_ADDR && fn->ins[i].a >= 0 &&
+            fn->ins[i].a < fn->nvregs)
+            taken[fn->ins[i].a] = 1;
+    int *cur = xmalloc((size_t)nvars * sizeof *cur);
+    for (int v = 0; v < nvars; v++) cur[v] = -1;
+    int changed = 0;
+    for (int i = 0; i < fn->nins; i++) {
+        struct ir_ins *in = &fn->ins[i];
+        if (in->op == IR_LABEL) {                 /* a join: values may differ */
+            for (int v = 0; v < nvars; v++) cur[v] = -1;
+        } else if (in->op == IR_STVAR) {
+            int L = in->dst;
+            if (L >= 0 && L < nvars)
+                cur[L] = (!taken[L] && sf_plain(in->size, 0, in->size))
+                             ? in->a : -1;
+        } else if (in->op == IR_LDVAR) {
+            int L = in->a;
+            if (L >= 0 && L < nvars && !taken[L] && cur[L] >= 0 &&
+                sf_plain(in->size, in->sign, in->w)) {
+                in->op = IR_MOV;                  /* LDVAR L -> MOV of the stored temp */
+                in->a = cur[L];
+                in->b = -1;
+                changed = 1;
+            }
+        }
+    }
+    free(taken); free(cur);
     return changed;
 }
 
@@ -643,6 +704,192 @@ static int pass_immfold(struct ir_func *fn)
     return changed;
 }
 
+/* ---- function inlining (inter-procedural, -O2) --------------------------- *
+ *
+ * A call to a small, defined function is replaced by the function's body. The
+ * callee's params and locals become caller LOCALS (the memory model EmbIR uses
+ * for addressable, possibly-reassigned variables — treating them as temps would
+ * break codegen's single-assignment / no-alias assumptions), so the caller's
+ * temps renumber UP to open a contiguous local range for them, and its
+ * var_tys/var_aligns/scope metadata extend to match. Params are initialised by
+ * an STVAR of each argument; every RET becomes `MOV result` + a jump to one
+ * shared label after the inlined body. Gated to -O2, so -O0/-O1 are untouched. */
+
+#define INLINE_MAX_CALLEE 24     /* instruction budget for an inline candidate */
+#define INLINE_MAX_CALLER 800    /* stop expanding a caller past this many ins */
+#define INLINE_MAX_PER_FUNC 64   /* and cap inlines per caller, for termination */
+
+/* Vreg remap over one instruction. kind 0 = caller shift (a temp >= p1 moves up
+ * by p2); kind 1 = callee map (a callee local < p3 -> p1+x, a temp -> p2+x). */
+struct rmp { int kind, p1, p2, p3, lbase; };
+
+static int vmap(const struct rmp *r, int x)
+{
+    if (x < 0) return x;
+    if (r->kind == 0) return x < r->p1 ? x : x + r->p2;
+    return x < r->p3 ? r->p1 + x : r->p2 + x;
+}
+static void rmp_cb(int *p, void *ctx) { *p = vmap(ctx, *p); }
+
+static void remap_ins(struct ir_ins *in, struct rmp *r)
+{
+    each_read(in, rmp_cb, r);
+    if (def_target(in) >= 0)
+        in->dst = vmap(r, in->dst);
+    if (in->op == IR_JMP || in->op == IR_BRZ || in->op == IR_BRNZ ||
+        in->op == IR_LABEL)
+        in->label += r->lbase;
+}
+
+/* The ir_func for a callee, or NULL if not defined in this unit. */
+static struct ir_func *func_ir(struct ir_unit *iu, struct func *callee)
+{
+    for (int i = 0; i < iu->nfuncs; i++)
+        if (iu->funcs[i].src == callee)
+            return &iu->funcs[i];
+    return NULL;
+}
+
+/* Conservative eligibility: a real, small body; scalar-integer params and
+ * return only (no varargs / struct / float); no inline asm, va_start, or a
+ * struct-returning call in the body. */
+static int inlinable(struct ir_func *cf)
+{
+    struct func *c = cf->src;
+    if (c->is_varargs || cf->nins == 0 || cf->nins > INLINE_MAX_CALLEE)
+        return 0;
+    if (c->ret_ty->kind == TY_STRUCT || ty_is_float(c->ret_ty))
+        return 0;
+    for (int k = 0; k < c->nvars; k++)
+        if (c->var_tys[k] &&
+            (c->var_tys[k]->kind == TY_STRUCT || ty_is_float(c->var_tys[k])))
+            return 0;
+    for (int i = 0; i < cf->nins; i++) {
+        const struct ir_ins *in = &cf->ins[i];
+        if (in->op == IR_ASM || in->op == IR_VA_START || in->flt)
+            return 0;
+        if (in->op == IR_CALL && in->retsize)
+            return 0;
+    }
+    return 1;
+}
+
+/* Splice the body of cf in place of the call at fn->ins[ci]. */
+static void inline_call(struct ir_func *fn, int ci, struct ir_func *cf)
+{
+    int V = fn->src->nvars, N = fn->nvregs, L = fn->nlabels;
+    int v = cf->src->nvars, n = cf->nvregs, nparams = cf->src->nparams;
+
+    /* 1. Open room: shift the caller's temps up by v (locals stay put). */
+    struct rmp shift = { 0, V, v, 0, 0 };
+    for (int i = 0; i < fn->nins; i++)
+        remap_ins(&fn->ins[i], &shift);
+
+    struct ir_ins call = fn->ins[ci];    /* the (now-shifted) call */
+    int dst = call.dst;
+    int after = L + cf->nlabels;
+
+    /* 2. Build param stores + the remapped body + one exit label. */
+    struct ir_ins *buf = xmalloc((size_t)(nparams + 2 * cf->nins + 1) * sizeof *buf);
+    int m = 0;
+    for (int k = 0; k < nparams; k++) {
+        struct ir_ins *s = &buf[m++];
+        memset(s, 0, sizeof *s);
+        s->op = IR_STVAR;
+        s->dst = V + k;                  /* callee param -> caller local */
+        s->a = call.argv[k].vreg;
+        s->size = ty_size(cf->src->var_tys[k]);
+    }
+    struct rmp cm = { 1, V, N, v, L };
+    for (int i = 0; i < cf->nins; i++) {
+        struct ir_ins in = cf->ins[i];
+        remap_ins(&in, &cm);
+        if (in.op == IR_RET) {
+            if (in.a >= 0 && dst >= 0) {
+                struct ir_ins *mv = &buf[m++];
+                memset(mv, 0, sizeof *mv);
+                mv->op = IR_MOV; mv->dst = dst; mv->a = in.a;
+            }
+            if (i != cf->nins - 1) {     /* the last RET falls into `after` */
+                struct ir_ins *jp = &buf[m++];
+                memset(jp, 0, sizeof *jp);
+                jp->op = IR_JMP; jp->label = after;
+            }
+        } else {
+            buf[m++] = in;
+        }
+    }
+    struct ir_ins *lb = &buf[m++];
+    memset(lb, 0, sizeof *lb);
+    lb->op = IR_LABEL; lb->label = after;
+
+    /* 3. Splice buf over the call. */
+    int newn = fn->nins - 1 + m;
+    struct ir_ins *ni = xmalloc((size_t)newn * sizeof *ni);
+    memcpy(ni, fn->ins, (size_t)ci * sizeof *ni);
+    memcpy(ni + ci, buf, (size_t)m * sizeof *ni);
+    memcpy(ni + ci + m, fn->ins + ci + 1,
+           (size_t)(fn->nins - ci - 1) * sizeof *ni);
+    free(fn->ins); free(buf);
+    fn->ins = ni; fn->nins = newn; fn->cap = newn;
+
+    /* 4. Grow vreg/label space and the caller's var metadata. */
+    fn->nvregs = N + n;
+    fn->nlabels = L + cf->nlabels + 1;
+    int nv = V + v;
+    struct type **vt = xmalloc((size_t)(nv ? nv : 1) * sizeof *vt);
+    int *va = xmalloc((size_t)(nv ? nv : 1) * sizeof *va);
+    for (int k = 0; k < V; k++) { vt[k] = fn->src->var_tys[k]; va[k] = fn->src->var_aligns[k]; }
+    for (int k = 0; k < v; k++) { vt[V + k] = cf->src->var_tys[k]; va[V + k] = cf->src->var_aligns[k]; }
+    fn->src->var_tys = vt;
+    fn->src->var_aligns = va;
+
+    /* Scope ranges are instruction indices; the splice inserted (m-1) net at ci.
+     * Shift every existing endpoint past ci, and scope the new callee locals to
+     * the inlined region. Kept precise so local-slot coalescing still works. */
+    if (fn->var_scope_lo) {
+        int *lo = xmalloc((size_t)nv * sizeof *lo);
+        int *hi = xmalloc((size_t)nv * sizeof *hi);
+        int d = m - 1;
+        for (int k = 0; k < V; k++) {
+            int a = fn->var_scope_lo[k], b = fn->var_scope_hi[k];
+            lo[k] = a <= ci ? a : a + d;
+            hi[k] = b <= ci ? b : b + d;
+        }
+        for (int k = 0; k < v; k++) { lo[V + k] = ci; hi[V + k] = ci + m; }
+        free(fn->var_scope_lo); free(fn->var_scope_hi);
+        fn->var_scope_lo = lo; fn->var_scope_hi = hi;
+    }
+    fn->src->nvars = nv;
+}
+
+/* Inline eligible calls across the unit (a bounded fixpoint per caller). */
+static void inline_unit(struct ir_unit *iu)
+{
+    for (int f = 0; f < iu->nfuncs; f++) {
+        struct ir_func *fn = &iu->funcs[f];
+        int done = 0;
+        for (;;) {
+            if (done >= INLINE_MAX_PER_FUNC || fn->nins > INLINE_MAX_CALLER)
+                break;
+            int ci = -1;
+            struct ir_func *cf = NULL;
+            for (int i = 0; i < fn->nins; i++) {
+                struct ir_ins *in = &fn->ins[i];
+                if (in->op != IR_CALL || in->indirect || !in->callee ||
+                    in->retsize)
+                    continue;
+                struct ir_func *c = func_ir(iu, in->callee);
+                if (c && c != fn && inlinable(c)) { ci = i; cf = c; break; }
+            }
+            if (ci < 0)
+                break;
+            inline_call(fn, ci, cf);
+            done++;
+        }
+    }
+}
+
 /* ---- driver ---- */
 
 static void opt_func(struct ir_func *fn)
@@ -650,6 +897,7 @@ static void opt_func(struct ir_func *fn)
     int changed = 1, guard = 0;
     while (changed && guard++ < 1000) {
         changed = 0;
+        changed |= pass_storefwd(fn); /* forward local stores to loads (mem2reg-lite) */
         changed |= pass_fold(fn);
         changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
         changed |= pass_copyprop(fn);
@@ -666,6 +914,8 @@ void opt_run(struct ir_unit *iu, int level)
 {
     if (level < 1)
         return;
+    if (level >= 2)               /* inline before the per-function passes clean up */
+        inline_unit(iu);
     for (int f = 0; f < iu->nfuncs; f++)
         opt_func(&iu->funcs[f]);
 }
