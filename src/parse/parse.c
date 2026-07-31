@@ -32,6 +32,9 @@ struct parser {
     struct typedefent *typedefs;
     struct econst **econst_tail;
     int seq;              /* current top-level item, for econst seq */
+    int alignas_out;      /* alignment from a `_Alignas(...)` on the current
+                           * declaration specifiers; read + reset where the
+                           * declaration applies its alignment (like `aligned`) */
 };
 
 static struct token *cur(struct parser *ps) { return &ps->lx.tok; }
@@ -88,7 +91,8 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_SIGNED || k == TOK_KW_VOID ||
            k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM ||
            k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
-           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL;
+           k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL ||
+           k == TOK_KW_ALIGNAS;
 }
 
 /* const/restrict are accepted and IGNORED (no const-correctness enforcement).
@@ -334,10 +338,39 @@ static struct type *parse_type_spec(struct parser *ps, int allow_body)
     return (t && vol) ? ty_volatile(t) : t;   /* volatile reaches the type */
 }
 
+/* `_Alignas(N)` / `_Alignas(type-name)` — a C11 alignment specifier among the
+ * declaration specifiers. Its value is accumulated into ps->alignas_out (the
+ * strictest wins), which the declaration then applies exactly like an
+ * `__attribute__((aligned(N)))`. A run is consumed so it may appear more than
+ * once or interleave with the type specifiers. */
+static void consume_alignas(struct parser *ps)
+{
+    while (cur(ps)->kind == TOK_KW_ALIGNAS) {
+        int line = cur(ps)->line;
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after _Alignas");
+        int a;
+        if (at_type_start(ps)) {
+            struct type *t = parse_type_name(ps, parse_type_spec(ps, 0));
+            a = ty_align(t);
+        } else {
+            struct expr *e = parse_cond(ps);
+            long v;
+            if (!size_fold(e, &v) || v <= 0)
+                diag_fatal(ps->lx.file, line,
+                           "_Alignas requires a positive constant alignment");
+            a = (int)v;
+        }
+        expect(ps, TOK_RPAREN, "')' after _Alignas");
+        if (a > ps->alignas_out) ps->alignas_out = a;
+    }
+}
+
 static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
                                           int *vol)
 {
     *vol = skip_quals(ps);
+    consume_alignas(ps);
     /* struct/union/enum first (cannot mix with other specifiers) */
     if (cur(ps)->kind == TOK_KW_STRUCT || cur(ps)->kind == TOK_KW_UNION ||
         cur(ps)->kind == TOK_KW_ENUM) {
@@ -346,7 +379,13 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
                           TAG_ENUM;
         int line = cur(ps)->line;
         advance(ps);
-        return parse_tagged(ps, k, allow_body, line);
+        /* Parsing the tag body recurses through declarations that use and reset
+         * alignas_out; preserve this declaration's own across it. */
+        int saved = ps->alignas_out;
+        ps->alignas_out = 0;
+        struct type *tt = parse_tagged(ps, k, allow_body, line);
+        ps->alignas_out = saved;
+        return tt;
     }
     /* a typedef name, when no specifier has appeared */
     if (cur(ps)->kind == TOK_IDENT) {
@@ -384,6 +423,7 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
             if (k == TOK_KW_VOLATILE) *vol = 1;
             advance(ps); continue;
         }
+        else if (k == TOK_KW_ALIGNAS) { consume_alignas(ps); continue; }
         else break;
         any++;
         advance(ps);
@@ -524,6 +564,13 @@ static int size_fold(const struct expr *e, long *out)
         if (!t || ty_size(t) == 0)
             return 0;   /* sizeof(expr) whose type this pass cannot resolve */
         *out = ty_size(t);
+        return 1;
+    }
+    case EXPR_ALIGNOF: {
+        struct type *t = e->cast_ty ? e->cast_ty : ce_type(e->rhs);
+        if (!t || ty_size(t) == 0)
+            return 0;
+        *out = ty_align(t);
         return 1;
     }
     case EXPR_CAST:
@@ -743,7 +790,9 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
             ms[n].is_bitfield = is_bf;
             ms[n].bit_off = 0;
             ms[n].bit_width = bit_width;
-            ms[n].user_align = mat.aligned;
+            ms[n].user_align = mat.aligned > ps->alignas_out
+                               ? mat.aligned : ps->alignas_out;
+            ps->alignas_out = 0;
             n++;
             if (cur(ps)->kind == TOK_COMMA) {
                 advance(ps);
@@ -1123,6 +1172,25 @@ static struct expr *parse_unary(struct parser *ps)
                 return e;
             }
             ps->lx = save; /* sizeof (expr) */
+        }
+        e->rhs = parse_unary(ps);
+        return e;
+    }
+    case TOK_KW_ALIGNOF: {
+        /* _Alignof(type) — a type-name in parens (C11). The GNU __alignof__
+         * also accepts an expression, so fall back to that like sizeof. */
+        int line = t->line;
+        advance(ps);
+        e = new_expr(EXPR_ALIGNOF, line, 0);
+        if (cur(ps)->kind == TOK_LPAREN) {
+            struct lexer save = ps->lx;
+            advance(ps);
+            if (at_type_start(ps)) {
+                e->cast_ty = parse_type_name(ps, parse_type_spec(ps, 0));
+                expect(ps, TOK_RPAREN, "')'");
+                return e;
+            }
+            ps->lx = save;
         }
         e->rhs = parse_unary(ps);
         return e;
@@ -1647,7 +1715,9 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             {
                 struct attrs lat = { 0, 0, 0, 0 };
                 parse_attributes(ps, &lat);
-                s->user_align = lat.aligned;
+                s->user_align = lat.aligned > ps->alignas_out
+                                ? lat.aligned : ps->alignas_out;
+                ps->alignas_out = 0;
             }
             int was_array = s->dty->kind == TY_ARRAY;
             (void)was_array;
@@ -2028,6 +2098,8 @@ static void parse_top(struct parser *ps, struct unit *u,
     if (!base)
         diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                    "expected a type before %s", tok_describe(cur(ps)));
+    ps->alignas_out = 0;   /* a top-level object carries no over-alignment slot;
+                            * drop any _Alignas so it can't leak into the next decl */
     if (cur(ps)->kind == TOK_SEMI) {
         /* bare declaration: 'struct X { ... };', 'enum { ... };' */
         advance(ps);
@@ -2222,6 +2294,7 @@ struct unit *parse_unit(const char *file, const char *src)
     ps.typedefs = NULL;
     ps.econst_tail = &u->econsts;
     ps.seq = 0;
+    ps.alignas_out = 0;
     lex_init(&ps.lx, file, src);
     struct func **ftail = &u->funcs;
     struct global **gtail = &u->globals;

@@ -66,6 +66,10 @@ static const struct {
     { "_Bool", TOK_KW_BOOL },
     { "_Static_assert", TOK_KW_STATIC_ASSERT },
     { "_Generic", TOK_KW_GENERIC },
+    { "_Alignof", TOK_KW_ALIGNOF },
+    { "__alignof__", TOK_KW_ALIGNOF },
+    { "__alignof", TOK_KW_ALIGNOF },
+    { "_Alignas", TOK_KW_ALIGNAS },
     { "unsigned", TOK_KW_UNSIGNED },
     { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
@@ -486,6 +490,8 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_BOOL: return "'_Bool'";
     case TOK_KW_STATIC_ASSERT: return "'_Static_assert'";
     case TOK_KW_GENERIC: return "'_Generic'";
+    case TOK_KW_ALIGNOF: return "'_Alignof'";
+    case TOK_KW_ALIGNAS: return "'_Alignas'";
     case TOK_KW_UNSIGNED: return "'unsigned'";
     case TOK_KW_SIGNED: return "'signed'";
     case TOK_KW_SIZEOF: return "'sizeof'";

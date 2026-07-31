@@ -804,6 +804,21 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         e->ty = ty_base(TY_LONG, 1);
         break;
     }
+    case EXPR_ALIGNOF: {
+        struct type *t = e->cast_ty;
+        if (!t) {
+            check_expr(u, f, sc, e->rhs);
+            t = e->rhs->undecayed ? e->rhs->undecayed : e->rhs->ty;
+        }
+        if (t->kind == TY_VOID || ty_size(t) == 0)
+            diag_at(u->file, e->line, e->col, "_Alignof of incomplete %s",
+                    ty_name(t));
+        e->kind = EXPR_NUM;                 /* folds to a size_t constant */
+        e->num = ty_align(t);
+        e->rhs = NULL;
+        e->ty = ty_base(TY_LONG, 1);
+        break;
+    }
     case EXPR_VA_ARG:
         check_expr(u, f, sc, e->lhs);   /* the va_list */
         if (e->cast_ty->kind == TY_VOID)

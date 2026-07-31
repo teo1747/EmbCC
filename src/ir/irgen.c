@@ -858,6 +858,7 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return gen_convert(fn, v, e->rhs->ty, e->ty);
     }
     case EXPR_SIZEOF:
+    case EXPR_ALIGNOF:
         break; /* folded to EXPR_NUM by sema; unreachable */
     case EXPR_STMTEXPR:
         return gen_stmtexpr(fn, e);

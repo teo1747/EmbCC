@@ -25,6 +25,8 @@ enum tok_kind {
     TOK_KW_BOOL,
     TOK_KW_STATIC_ASSERT,
     TOK_KW_GENERIC,
+    TOK_KW_ALIGNOF,
+    TOK_KW_ALIGNAS,
     TOK_KW_UNSIGNED,
     TOK_KW_SIGNED,
     TOK_KW_VOID,
