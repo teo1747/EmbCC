@@ -56,7 +56,7 @@ static struct type *find_typedef(struct parser *ps, const char *name)
 static void expect(struct parser *ps, enum tok_kind kind, const char *what)
 {
     if (cur(ps)->kind != kind)
-        diag_fatal(ps->lx.file, cur(ps)->line, "expected %s before %s",
+        diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col, "expected %s before %s",
                    what, tok_describe(cur(ps)));
     advance(ps);
 }
@@ -156,7 +156,7 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
             while (cur(ps)->kind == TOK_LBRACKET) {
                 advance(ps);
                 if (nad >= 4)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "more than 4 array dimensions");
                 if (cur(ps)->kind == TOK_RBRACKET) {
                     /* an omitted size: `(*arr[])(void)` — an incomplete
@@ -223,7 +223,7 @@ static struct type *parse_fn_params(struct parser *ps, struct type *ret)
             }
             struct type *spec = parse_type_spec(ps, 0);
             if (!spec)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a parameter type before %s",
                            tok_describe(cur(ps)));
             const char *dummy;
@@ -233,10 +233,10 @@ static struct type *parse_fn_params(struct parser *ps, struct type *ret)
             if (t->kind == TY_FUNC)
                 t = ty_ptr(t);
             if (t->kind == TY_VOID)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "a parameter cannot have type void");
             if (n >= MAX_PARAMS)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "too many parameters in a function type");
             pt[n++] = t;
             if (cur(ps)->kind != TOK_COMMA)
@@ -263,7 +263,7 @@ static struct type *parse_tagged(struct parser *ps, enum tag_kind kind,
 
     if (cur(ps)->kind == TOK_LBRACE) {
         if (!allow_body)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "define %s at file scope (block-scope type "
                        "definitions are not supported)",
                        kind == TAG_ENUM ? "enums" : "structs/unions");
@@ -392,14 +392,14 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
         return NULL;
     if (nbool) {
         if (any > 1)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "_Bool cannot combine with other specifiers");
         return ty_base(TY_BOOL, 0);
     }
     if (nfloat || ndouble) {
         if (uns != -1 || nchar || nshort || nint || nvoid ||
             (nfloat && ndouble))
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "invalid type specifier combination");
         /* 'long double' is accepted AS double — there is no 80-bit
          * type here, and saying so beats pretending. */
@@ -407,13 +407,13 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
     }
     if (nvoid) {
         if (any > 1)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "void cannot combine with other specifiers");
         return ty_base(TY_VOID, 0);
     }
     if (nlong > 2 || (nshort && nlong) || (nchar && (nshort || nlong)) ||
         (nchar && nint))
-        diag_fatal(ps->lx.file, cur(ps)->line,
+        diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                    "invalid type specifier combination");
     enum ty_kind kind = nchar ? TY_CHAR :
                         nshort ? TY_SHORT :
@@ -592,7 +592,7 @@ static struct type *parse_array_dims(struct parser *ps, struct type *t)
             dim = (int)dv; /* 0 is the extern/flexible form */
         }
         if (ndims >= 4)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "more than 4 array dimensions");
         dims[ndims++] = dim;
         expect(ps, TOK_RBRACKET, "']'");
@@ -674,7 +674,7 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
         /* allow_body: nested struct/union definitions are legal C */
         struct type *spec = parse_type_spec(ps, 1);
         if (!spec)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected a member type before %s",
                        tok_describe(cur(ps)));
         for (;;) { /* declarators share the base: int a, *b, c[4]; */
@@ -719,7 +719,7 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
              * belonged to the enclosing type. A nameless non-aggregate is
              * still an error. */
             if (!mname && !is_bf && mty->kind != TY_STRUCT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
             if (!is_bf && ty_size(mty) == 0)
@@ -757,7 +757,7 @@ static struct type *parse_struct_body(struct parser *ps, struct type *t)
     struct attrs at = { 0, 0, 0, 0 };
     parse_attributes(ps, &at);   /* struct {...} __attribute__((packed)) */
     if (n == 0)
-        diag_fatal(ps->lx.file, cur(ps)->line,
+        diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                    "a struct/union needs at least one member");
     ty_struct_layout(t, ms, n, at.packed, at.aligned);
     return t;
@@ -770,7 +770,7 @@ static void parse_enum_body(struct parser *ps)
 
     while (cur(ps)->kind != TOK_RBRACE) {
         if (cur(ps)->kind != TOK_IDENT)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected an enumerator name before %s",
                        tok_describe(cur(ps)));
         const char *name = cur(ps)->text;
@@ -784,7 +784,7 @@ static void parse_enum_body(struct parser *ps)
                 advance(ps);
             }
             if (cur(ps)->kind != TOK_NUM)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "an enumerator value must be an integer "
                            "literal for now");
             val = neg ? -cur(ps)->num : cur(ps)->num;
@@ -940,11 +940,11 @@ static struct expr *parse_primary(struct parser *ps)
                     diag_fatal(ps->lx.file, line,
                                "offsetof needs a complete struct/union type");
                 if (cur(ps)->kind != TOK_IDENT)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "expected a member name in offsetof");
                 struct member *m2 = ty_find_member(ty, cur(ps)->text);
                 if (!m2)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "%s has no member '%s'", ty_name(ty),
                                cur(ps)->text);
                 off += m2->off;
@@ -979,7 +979,7 @@ static struct expr *parse_primary(struct parser *ps)
         return e;
     }
     default:
-        diag_fatal(ps->lx.file, t->line, "expected an expression, got %s",
+        diag_at(ps->lx.file, t->line, t->col, "expected an expression, got %s",
                    tok_describe(t));
         return NULL;
     }
@@ -1013,7 +1013,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
             if (cur(ps)->kind != TOK_RPAREN) {
                 for (;;) {
                     if (call->nargs >= MAX_PARAMS)
-                        diag_fatal(ps->lx.file, cur(ps)->line,
+                        diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                    "more than %d call arguments",
                                    MAX_PARAMS);
                     call->args[call->nargs++] = parse_expr(ps);
@@ -1040,7 +1040,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
             int line = cur(ps)->line;
             advance(ps);
             if (cur(ps)->kind != TOK_IDENT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
             struct expr *m = new_expr(EXPR_MEMBER, line);
@@ -1334,7 +1334,7 @@ static struct expr *parse_initializer(struct parser *ps)
     advance(ps);
     while (cur(ps)->kind != TOK_RBRACE) {
         if (cur(ps)->kind == TOK_EOF)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "unterminated initializer");
         /* A designator: struct field `.name =` or array element `[i] =`.
          * One level only (no `[i].f =` chains — no EmbCC source needs it). */
@@ -1361,7 +1361,7 @@ static struct expr *parse_initializer(struct parser *ps)
         } else if (cur(ps)->kind == TOK_DOT) {
             advance(ps);
             if (cur(ps)->kind != TOK_IDENT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a field name after '.'");
             field = cur(ps)->text;
             advance(ps);
@@ -1399,7 +1399,7 @@ static struct stmt *parse_block(struct parser *ps)
     struct stmt **tail = &s->body;
     while (cur(ps)->kind != TOK_RBRACE) {
         if (cur(ps)->kind == TOK_EOF)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "unexpected end of file inside a block");
         *tail = parse_stmt(ps, 1);
         while (*tail) /* a declaration may be a chain: int a, b; */
@@ -1414,7 +1414,7 @@ static struct stmt *parse_block(struct parser *ps)
 static char *parse_str_literal(struct parser *ps, const char *what)
 {
     if (cur(ps)->kind != TOK_STR)
-        diag_fatal(ps->lx.file, cur(ps)->line, "expected %s", what);
+        diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col, "expected %s", what);
     struct token *t = cur(ps);
     size_t len = (size_t)t->num;            /* includes the NUL */
     char *bytes = xmalloc(len);
@@ -1448,7 +1448,7 @@ static void parse_asm_operands(struct parser *ps, struct asm_operand **out,
         if (cur(ps)->kind == TOK_LBRACKET) {  /* a `[name]` symbolic operand */
             advance(ps);
             if (cur(ps)->kind != TOK_IDENT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a name in an asm `[name]` operand");
             op->name = cur(ps)->text;
             advance(ps);
@@ -1534,14 +1534,14 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
      * scoping -- fine, and the same trade-off tags/typedefs already make. */
     if (t->kind == TOK_KW_TYPEDEF || t->kind == TOK_KW_EXTERN) {
         if (!allow_decl)
-            diag_fatal(ps->lx.file, t->line,
+            diag_at(ps->lx.file, t->line, t->col,
                        "a declaration cannot be the body of if/while/for; "
                        "wrap it in braces");
         int is_td = t->kind == TOK_KW_TYPEDEF;
         advance(ps);
         struct type *base = parse_type_spec(ps, 1);
         if (!base)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected a type after '%s'", is_td ? "typedef" : "extern");
         /* extern declarators become STMT_DECL nodes with is_extern set; sema
          * registers the unit global/function (appending to those lists at
@@ -1553,11 +1553,11 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                 const char *tname;
                 struct type *tt = parse_declarator(ps, base, &tname);
                 if (!tname)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "typedef needs a name, got %s", tok_describe(cur(ps)));
                 struct type *prev = find_typedef(ps, tname);
                 if (prev && !ty_equal(prev, tt))
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "redefinition of typedef '%s'", tname);
                 struct typedefent *te = xcalloc(1, sizeof *te);
                 te->name = tname; te->ty = tt;
@@ -1565,7 +1565,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             } else {
                 struct type *dty = parse_stars(ps, base);
                 if (cur(ps)->kind != TOK_IDENT)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "expected a name before %s", tok_describe(cur(ps)));
                 const char *dname = cur(ps)->text;
                 int dline = cur(ps)->line;
@@ -1604,10 +1604,10 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         while (cur(ps)->kind == TOK_KW_INLINE) /* accepted, ignored */
             advance(ps);
         if ((t->kind == TOK_KW_STATIC || is_register) && !at_type_start(ps))
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected a type after the storage specifier");
         if (!allow_decl)
-            diag_fatal(ps->lx.file, t->line,
+            diag_at(ps->lx.file, t->line, t->col,
                        "a declaration cannot be the body of if/while/for "
                        "(C99 forbids it too); wrap it in braces");
         /* allow_body=1: a block-scope struct/union/enum DEFINITION is legal C
@@ -1622,11 +1622,11 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
             const char *dname;
             s->dty = parse_declarator(ps, base, &dname);
             if (s->dty->kind == TY_VOID || s->dty->kind == TY_FUNC)
-                diag_fatal(ps->lx.file, t->line,
+                diag_at(ps->lx.file, t->line, t->col,
                            "a variable cannot have type %s",
                            ty_name(s->dty));
             if (!dname)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a variable name before %s",
                            tok_describe(cur(ps)));
             s->name = dname;
@@ -1715,7 +1715,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         s = new_stmt(STMT_GOTO, t->line);
         advance(ps);
         if (cur(ps)->kind != TOK_IDENT)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected a label name after 'goto'");
         s->name = cur(ps)->text;
         advance(ps);
@@ -1778,7 +1778,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         advance(ps);
         s->body = parse_controlled(ps);
         if (cur(ps)->kind != TOK_KW_WHILE)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected 'while' after a do-body, got %s",
                        tok_describe(cur(ps)));
         advance(ps);
@@ -1837,7 +1837,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         expect(ps, TOK_SEMI, "';'");
         return s;
     default:
-        diag_fatal(ps->lx.file, t->line,
+        diag_at(ps->lx.file, t->line, t->col,
                    "expected a statement, got %s", tok_describe(t));
         return NULL;
     }
@@ -1873,7 +1873,7 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
     if (has_init) {
         advance(ps);
         if (is_extern)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "'extern' with an initializer");
         if (g->ty->kind == TY_ARRAY || g->ty->kind == TY_STRUCT) {
             /* Aggregates (and any string/relocation content) are lowered
@@ -1889,7 +1889,7 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
                     g->ty = ty_array(g->ty->pointee,
                                      initlist_array_count(ie));
                 else
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "'%s' needs a brace or string initializer "
                                "to supply its size", name);
             }
@@ -1987,23 +1987,23 @@ static void parse_top(struct parser *ps, struct unit *u,
     }
     if (cur(ps)->kind == TOK_KW_TYPEDEF) {
         if (is_static || is_extern)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "typedef cannot be static or extern");
         advance(ps);
         struct type *tbase = parse_type_spec(ps, 1);
         if (!tbase)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected a type after 'typedef'");
         for (;;) {
             const char *tname;
             struct type *tt = parse_declarator(ps, tbase, &tname);
             if (!tname)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "typedef needs a name, got %s",
                            tok_describe(cur(ps)));
             struct type *prev = find_typedef(ps, tname);
             if (prev && !ty_equal(prev, tt))
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "redefinition of typedef '%s'", tname);
             /* identical redefinition: headers do it; harmless */
             struct typedefent *te = xcalloc(1, sizeof *te);
@@ -2024,7 +2024,7 @@ static void parse_top(struct parser *ps, struct unit *u,
         reject_reserved(ps, cur(ps)->text, cur(ps)->line);
     struct type *base = parse_type_spec(ps, 1);
     if (!base)
-        diag_fatal(ps->lx.file, cur(ps)->line,
+        diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                    "expected a type before %s", tok_describe(cur(ps)));
     if (cur(ps)->kind == TOK_SEMI) {
         /* bare declaration: 'struct X { ... };', 'enum { ... };' */
@@ -2047,7 +2047,7 @@ static void parse_top(struct parser *ps, struct unit *u,
             int gline = cur(ps)->line;
             struct type *gt = parse_declarator(ps, base, &gname);
             if (!gname)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a name before %s",
                            tok_describe(cur(ps)));
             if (gt->kind == TY_FUNC)
@@ -2098,7 +2098,7 @@ static void parse_top(struct parser *ps, struct unit *u,
         for (;;) {
             if (cur(ps)->kind == TOK_ELLIPSIS) {
                 if (f->nparams == 0)
-                    diag_fatal(ps->lx.file, cur(ps)->line,
+                    diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                                "'...' needs at least one named "
                                "parameter before it");
                 f->is_varargs = 1;
@@ -2109,7 +2109,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                 reject_reserved(ps, cur(ps)->text, cur(ps)->line);
             struct type *spec = parse_type_spec(ps, 0);
             if (!spec)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a parameter type before %s",
                            tok_describe(cur(ps)));
             const char *pname;
@@ -2119,10 +2119,10 @@ static void parse_top(struct parser *ps, struct unit *u,
             if (pt->kind == TY_FUNC)
                 pt = ty_ptr(pt);
             if (pt->kind == TY_VOID)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "a parameter cannot have type void");
             if (f->nparams >= MAX_PARAMS)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "more than %d parameters", MAX_PARAMS);
             f->param_tys[f->nparams] = pt;
             f->params[f->nparams] = pname; /* NULL fine in prototypes */
@@ -2150,7 +2150,7 @@ static void parse_top(struct parser *ps, struct unit *u,
             advance(ps);
             struct type *dty = parse_stars(ps, base);
             if (cur(ps)->kind != TOK_IDENT)
-                diag_fatal(ps->lx.file, cur(ps)->line,
+                diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a name before %s", tok_describe(cur(ps)));
             const char *dname = cur(ps)->text;
             int dline = cur(ps)->line;
@@ -2192,7 +2192,7 @@ static void parse_top(struct parser *ps, struct unit *u,
         return;
     } else {
         if (cur(ps)->kind != TOK_LBRACE)
-            diag_fatal(ps->lx.file, cur(ps)->line,
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected '{' or ';' before %s",
                        tok_describe(cur(ps)));
         for (int i = 0; i < f->nparams; i++)

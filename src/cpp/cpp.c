@@ -805,8 +805,11 @@ static void do_include(struct src *s, const char *arg, struct tbuf *out,
                         : "cannot find include file \"%s\"", fname);
 
     s->cpp->depth++;
-    process_file(s->cpp, xstrndup(path, strlen(path)), text, out,
-                 found_idx);
+    {
+        char *ipath = xstrndup(path, strlen(path));
+        diag_register_source(ipath, text);   /* header errors show their lines */
+        process_file(s->cpp, ipath, text, out, found_idx);
+    }
     s->cpp->depth--;
 }
 

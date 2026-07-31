@@ -13,6 +13,7 @@ void lex_init(struct lexer *lx, const char *file, const char *src)
     lx->file = file;
     lx->src = src;
     lx->p = src;
+    lx->line_start = src;
     lx->line = 1;
     lex_next(lx);
 }
@@ -22,8 +23,10 @@ static void skip_space_and_comments(struct lexer *lx)
     for (;;) {
         while (*lx->p == ' ' || *lx->p == '\t' || *lx->p == '\r' ||
                *lx->p == '\n') {
-            if (*lx->p == '\n')
+            if (*lx->p == '\n') {
                 lx->line++;
+                lx->line_start = lx->p + 1;
+            }
             lx->p++;
         }
         if (lx->p[0] == '/' && lx->p[1] == '/') {
@@ -37,8 +40,10 @@ static void skip_space_and_comments(struct lexer *lx)
             while (!(lx->p[0] == '*' && lx->p[1] == '/')) {
                 if (!*lx->p)
                     diag_fatal(lx->file, start, "unterminated comment");
-                if (*lx->p == '\n')
+                if (*lx->p == '\n') {
                     lx->line++;
+                    lx->line_start = lx->p + 1;
+                }
                 lx->p++;
             }
             lx->p += 2;
@@ -157,6 +162,7 @@ void lex_next(struct lexer *lx)
 
     skip_space_and_comments(lx);
     t->line = lx->line;
+    t->col = (int)(lx->p - lx->line_start) + 1;
     t->text = NULL;
     t->num = 0;
 
@@ -384,6 +390,7 @@ void lex_next(struct lexer *lx)
         if (*p == '\n')
             p++;
         lx->p = p;
+        lx->line_start = p;
         lx->line = (int)ln;
         lex_next(lx); /* the marker produced no token; go again */
         return;
