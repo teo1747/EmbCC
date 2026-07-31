@@ -70,6 +70,9 @@ static const struct {
     { "__alignof__", TOK_KW_ALIGNOF },
     { "__alignof", TOK_KW_ALIGNOF },
     { "_Alignas", TOK_KW_ALIGNAS },
+    { "typeof", TOK_KW_TYPEOF },
+    { "__typeof__", TOK_KW_TYPEOF },
+    { "__typeof", TOK_KW_TYPEOF },
     { "unsigned", TOK_KW_UNSIGNED },
     { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
@@ -492,6 +495,7 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_GENERIC: return "'_Generic'";
     case TOK_KW_ALIGNOF: return "'_Alignof'";
     case TOK_KW_ALIGNAS: return "'_Alignas'";
+    case TOK_KW_TYPEOF: return "'typeof'";
     case TOK_KW_UNSIGNED: return "'unsigned'";
     case TOK_KW_SIGNED: return "'signed'";
     case TOK_KW_SIZEOF: return "'sizeof'";

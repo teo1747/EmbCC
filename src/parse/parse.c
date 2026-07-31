@@ -92,7 +92,7 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM ||
            k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
            k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL ||
-           k == TOK_KW_ALIGNAS;
+           k == TOK_KW_ALIGNAS || k == TOK_KW_TYPEOF;
 }
 
 /* const/restrict are accepted and IGNORED (no const-correctness enforcement).
@@ -125,6 +125,7 @@ static struct type *parse_fn_params(struct parser *ps, struct type *ret);
 static struct type *parse_stars(struct parser *ps, struct type *t);
 static struct expr *parse_cond(struct parser *ps);
 static int size_fold(const struct expr *e, long *out);
+static struct type *ce_type(const struct expr *e);
 static struct type *parse_array_dims(struct parser *ps, struct type *t);
 static struct type *parse_type_spec(struct parser *ps, int allow_body);
 static void parse_static_assert(struct parser *ps);
@@ -381,6 +382,27 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
 {
     *vol = skip_quals(ps);
     consume_alignas(ps);
+    /* GNU `typeof(x)` / `typeof(type)` — the type of an expression (never
+     * evaluated, like sizeof) or a type-name. The expression's type is resolved
+     * with ce_type: a variable, a deref, a `.`/`->` member, a cast — the shapes
+     * kernel macros (min/max, container_of helpers) use. */
+    if (cur(ps)->kind == TOK_KW_TYPEOF) {
+        int line = cur(ps)->line;
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after typeof");
+        struct type *t;
+        if (at_type_start(ps)) {
+            t = parse_type_name(ps, parse_type_spec(ps, 0));
+        } else {
+            struct expr *e = parse_cond(ps);
+            t = ce_type(e);
+            if (!t)
+                diag_fatal(ps->lx.file, line,
+                           "typeof of an unsupported expression");
+        }
+        expect(ps, TOK_RPAREN, "')' after typeof");
+        return t;
+    }
     /* struct/union/enum first (cannot mix with other specifiers) */
     if (cur(ps)->kind == TOK_KW_STRUCT || cur(ps)->kind == TOK_KW_UNION ||
         cur(ps)->kind == TOK_KW_ENUM) {

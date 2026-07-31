@@ -85,8 +85,13 @@ hex `\xH...`, and octal `\NNN`, for both char and string literals.
 
 ### K6 — `&array` — DONE
 `&arr` yields `T(*)[N]` whose value is the array's address (gen_addr already
-produces it). *(The pointer-to-array `int (*p)[N]` declarator is a separate,
-rarer gap, still open.)*
+produces it). The pointer-to-array `int (*p)[N]` declarator (and its abstract
+`int (*)[N]`) now parse too — DONE (commit 719d93a).
+
+### C11 alignment — DONE
+`_Alignof(type)`/`__alignof__(expr)` fold to `ty_align` like sizeof; `_Alignas(N)`
+/`_Alignas(type)` reuse the aligned-attribute layout on struct members and locals
+(over-16 local alignment still refused loudly). Commit 27f57c0.
 
 ### K7 — use-before-declaration of a `static` function — DONE
 The call and value paths test `seq <= cur_body_seq` (what the ordered-walk
