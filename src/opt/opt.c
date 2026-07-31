@@ -608,8 +608,17 @@ static int pass_immfold(struct ir_func *fn)
             continue;
         long A, B;
         int commutative;
+        /* Shifts fold only their count (b), and only a valid small one — the
+         * value being shifted (a) is not an immediate operand. */
+        if (i->op == IR_SHL || i->op == IR_SHR) {
+            if (get_const(fn, &d, i->b, &B) && B >= 0 && B <= 63) {
+                i->imm = B; i->imm_b = 1; i->b = -1;
+                changed = 1;
+            }
+            continue;
+        }
         switch (i->op) {
-        case IR_ADD: case IR_AND: case IR_OR: case IR_XOR:
+        case IR_ADD: case IR_MUL: case IR_AND: case IR_OR: case IR_XOR:
             commutative = 1; break;
         case IR_SUB: case IR_CMP:
             commutative = 0; break;

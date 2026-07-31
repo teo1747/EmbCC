@@ -255,6 +255,23 @@ void x86_alu_reg_imm(struct code *c, int op, int reg, long imm, int w)
     }
 }
 
+/* imul dst, src, imm — the three-operand form: dst = src * imm, so dst need not
+ * equal src and nothing routes through rax. imm8 (6b) when it fits, else imm32
+ * (69). */
+void x86_imul_reg_imm(struct code *c, int dst, int src, long imm, int w)
+{
+    rex_rb(c, w == 8, dst, src);   /* dst -> REX.R, src -> REX.B */
+    if (imm >= -128 && imm <= 127) {
+        code_byte(c, 0x6b);
+        code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+        code_byte(c, (int)(imm & 0xff));
+    } else {
+        code_byte(c, 0x69);
+        code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+        code_u32(c, (unsigned long)imm);
+    }
+}
+
 /* test reg, reg — ZF/SF from the value itself, the compact `cmp reg, 0`. */
 void x86_test_reg(struct code *c, int reg, int w)
 {
@@ -578,6 +595,22 @@ void x86_shift_eax_cl(struct code *c, int kind, int w)
     default:
         fprintf(stderr, "embcc: internal: bad shift kind\n");
         exit(1);
+    }
+}
+
+/* shift `reg` by a constant: the 1-count short form (D1 /ext) or the imm8 form
+ * (C1 /ext ib). kind: '<' shl, '>' sar, 'u' shr — the twin of x86_shift_eax_cl. */
+void x86_shift_reg_imm(struct code *c, int reg, int kind, int count, int w)
+{
+    int ext = kind == '<' ? 4 : kind == 'u' ? 5 : 7;   /* shl:/4 shr:/5 sar:/7 */
+    rex_rb(c, w == 8, 0, reg);
+    if (count == 1) {
+        code_byte(c, 0xd1);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+    } else {
+        code_byte(c, 0xc1);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+        code_byte(c, count & 0xff);
     }
 }
 

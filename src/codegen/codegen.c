@@ -1262,6 +1262,19 @@ static void gen_func(struct ir_func *fn, struct code *text,
                  * the dest register directly when both dst and a are resident
                  * (RAX untouched), else through RAX. MUL is never imm-folded. */
                 if (i->imm_b) {
+                    /* MUL by a constant is the three-operand imul: dst = a*imm
+                     * directly, no copy and no rax detour even when dst != a. */
+                    if (i->op == IR_MUL) {
+                        if (in_reg(i->dst) && in_reg(i->a)) {
+                            x86_imul_reg_imm(text, g_loc[i->dst], g_loc[i->a],
+                                             i->imm, i->w);
+                            break;
+                        }
+                        cg_load(text, sd, i->a, i->w, 0, i->w);
+                        x86_imul_reg_imm(text, REG_RAX, REG_RAX, i->imm, i->w);
+                        cg_store(text, sd, i->dst, i->w);
+                        break;
+                    }
                     if (in_reg(i->dst) && in_reg(i->a)) {
                         int D = g_loc[i->dst], A = g_loc[i->a];
                         if (D != A)
@@ -1329,15 +1342,30 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_SHL:
-        case IR_SHR:
+        case IR_SHR: {
+            int skind = i->op == IR_SHL ? '<' : i->sign ? '>' : 'u';
+            /* Constant shift count folded to an immediate: `shift $k, dst` with
+             * no count loaded into rcx — in the dest register when resident. */
+            if (i->imm_b) {
+                if (in_reg(i->dst) && in_reg(i->a)) {
+                    int D = g_loc[i->dst], A = g_loc[i->a];
+                    if (D != A)
+                        x86_mov_rr_w(text, D, A, i->w);
+                    x86_shift_reg_imm(text, D, skind, (int)i->imm, i->w);
+                    break;
+                }
+                cg_load(text, sd, i->a, i->w, 0, i->w);
+                x86_shift_reg_imm(text, REG_RAX, skind, (int)i->imm, i->w);
+                cg_store(text, sd, i->dst, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->w, 0, i->w);
             cg_load_rcx(text, sd, i->b, 4);  /* byte-identical to the old
                                               * x86_mov_ecx_mem when regalloc off */
-            x86_shift_eax_cl(text,
-                             i->op == IR_SHL ? '<' :
-                             i->sign ? '>' : 'u', i->w);
+            x86_shift_eax_cl(text, skind, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
+        }
         case IR_NEG:
         case IR_BNOT:
             cg_load(text, sd, i->a, i->w, 0, i->w);
