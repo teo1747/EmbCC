@@ -19,6 +19,10 @@ char *xstrndup(const char *s, size_t n);
  * `text` must outlive every diagnostic (the whole compile). */
 void diag_register_source(const char *file, const char *text);
 
+/* Record that `macro` expanded at file:line, so an error there notes it.
+ * `file`/`macro` must outlive the compile. */
+void diag_register_expansion(const char *file, int line, const char *macro);
+
 /* "embcc: FILE:LINE: error: ..." then the source line and a caret, then
  * exit(1). line 0 omits the line; a registered source adds the line + caret. */
 void diag_fatal(const char *file, int line, const char *fmt, ...);

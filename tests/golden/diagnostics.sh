@@ -21,7 +21,7 @@ EOF
 err=$("$EMBCC" -c "$out/miss.c" -o "$out/x.o" 2>&1 || true)
 echo "$err" | grep -q "$out/miss.c:4:5: error:" || { echo "no located error at 4:5:"; echo "$err"; exit 1; }
 echo "$err" | grep -q 'return x;'                || { echo "source line not shown:"; echo "$err"; exit 1; }
-echo "$err" | grep -qE '^ +\^$'                  || { echo "no caret line:"; echo "$err"; exit 1; }
+echo "$err" | grep -qE '^ +\^~*$'                  || { echo "no caret line:"; echo "$err"; exit 1; }
 echo "located error: file:line:col + source line + caret at the column"
 
 # 2. An error inside a header is located to the HEADER, showing the header's own
@@ -44,7 +44,7 @@ echo "no colour codes when stderr is not a terminal"
 printf 'int main(void){int x=3; return x.y;}\n' > "$out/sema.c"
 err=$("$EMBCC" -c "$out/sema.c" -o "$out/x.o" 2>&1 || true)
 echo "$err" | grep -qE "$out/sema.c:1:[0-9]+: error:" || { echo "sema error not located to a column:"; echo "$err"; exit 1; }
-echo "$err" | grep -qE '^ +\^$'                       || { echo "no caret on the semantic error:"; echo "$err"; exit 1; }
+echo "$err" | grep -qE '^ +\^~*$'                       || { echo "no caret on the semantic error:"; echo "$err"; exit 1; }
 echo "semantic errors carry a caret at the expression"
 
 # 5. A redefinition prints the error AND a note at the previous definition, each
@@ -66,4 +66,20 @@ err=$("$EMBCC" -c "$out/nohint.c" -o "$out/x.o" 2>&1 || true)
 echo "$err" | grep -q 'did you mean' && { echo "bogus suggestion for an unrelated name:"; echo "$err"; exit 1; }
 echo "did-you-mean: nearest symbol suggested, no false positives"
 
-echo "diagnostics: caret + source line + column + notes + suggestions, TTY-gated colour"
+# 7. The caret underlines the whole offending identifier (^~~~).
+printf 'int counter=0;\nint main(void){ return counterX; }\n' > "$out/span.c"
+err=$("$EMBCC" -c "$out/span.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -qE '^ +\^~+$' || { echo "identifier not underlined:"; echo "$err"; exit 1; }
+echo "the caret underlines the whole token (^~~~)"
+
+# 8. An error inside a macro expansion is attributed to the macro; an unrelated
+#    error merely sharing a line with a macro is NOT (column-precise).
+printf '#define BAD undefined_thing\nint main(void){ return BAD; }\n' > "$out/mac.c"
+err=$("$EMBCC" -c "$out/mac.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -q "note: expanded from macro 'BAD'" || { echo "no expanded-from-macro note:"; echo "$err"; exit 1; }
+printf '#define OK 1\nint main(void){ int a = OK; return zzz; }\n' > "$out/mac2.c"
+err=$("$EMBCC" -c "$out/mac2.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -q 'expanded from macro' && { echo "misattributed an unrelated error to a macro:"; echo "$err"; exit 1; }
+echo "expanded-from-macro note: attributed precisely, no misattribution"
+
+echo "diagnostics: caret+underline + notes + suggestions + macro attribution, TTY-gated colour"

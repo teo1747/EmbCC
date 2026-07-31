@@ -371,8 +371,10 @@ static void expand_text(struct src *s, const char *text, struct tbuf *out)
                 continue;
             }
             p = q;
+            diag_register_expansion(s->file, s->line, m->name);
             expand_funclike(s, m, &p, out);
         } else {
+            diag_register_expansion(s->file, s->line, m->name);
             struct tbuf tmp = { 0, 0, 0 };
             m->expanding = 1;
             expand_text(s, m->body, &tmp);
