@@ -1178,6 +1178,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
     int *usecnt = fn->nvregs
         ? xmalloc((size_t)fn->nvregs * sizeof *usecnt) : (int *)0;
     if (usecnt) count_vreg_uses(fn, usecnt);
+    /* -O2: with two or more returns each inlining the full callee-restore
+     * sequence, route them through ONE shared epilogue instead — each return
+     * loads its value then `jmp`s to it. Worth the jmp only when there is more
+     * than one return and something to restore; a single return stays inline. */
+    int nret = 0;
+    for (int t = 0; t < fn->nins; t++) if (fn->ins[t].op == IR_RET) nret++;
+    int shared_epi = g_regalloc && nsave >= 1 && nret >= 2;
+    int *epi_patch = NULL, nepi = 0, capepi = 0;
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
         /* -g: a row where the source line changes. text->len is the .text
@@ -1807,10 +1815,19 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 else
                     x86_load_slot(text, sd[i->a], 8, 0, 8);
             }
-            for (int k = 0; k < nsave; k++)             /* -O2: restore callee regs */
-                x86_load_reg_mem(text, used_callee[k], REG_RBP,
-                                 save_base + k * 8, 8);
-            x86_epilogue(text);
+            if (shared_epi) {                           /* jump to the one epilogue */
+                int p = x86_jmp_rel32(text);
+                if (nepi == capepi) {
+                    capepi = capepi ? capepi * 2 : 8;
+                    epi_patch = xrealloc(epi_patch, (size_t)capepi * sizeof(int));
+                }
+                epi_patch[nepi++] = p;
+            } else {
+                for (int k = 0; k < nsave; k++)         /* -O2: restore callee regs */
+                    x86_load_reg_mem(text, used_callee[k], REG_RBP,
+                                     save_base + k * 8, 8);
+                x86_epilogue(text);
+            }
             break;
         }
     }
@@ -1830,11 +1847,20 @@ static void gen_func(struct ir_func *fn, struct code *text,
         (fn->ins[fn->nins - 1].op == IR_RET ||
          fn->ins[fn->nins - 1].op == IR_JMP ||
          fn->ins[fn->nins - 1].op == IR_UD2);
-    if (!(g_regalloc && last_terminates)) {
+    /* Emit the trailing epilogue when the returns share it (it is their jump
+     * target) OR when control can fall off the end (a void function). */
+    int epi_off = text->len;
+    if (shared_epi || !(g_regalloc && last_terminates)) {
         for (int k = 0; k < nsave; k++)                 /* -O2: restore callee regs */
             x86_load_reg_mem(text, used_callee[k], REG_RBP, save_base + k * 8, 8);
         x86_epilogue(text);
     }
+    for (int e = 0; e < nepi; e++) {                    /* patch shared-return jumps */
+        int from = epi_patch[e] + 4;
+        code_patch32(text, epi_patch[e],
+                     (unsigned long)(unsigned int)(epi_off - from));
+    }
+    free(epi_patch);
 
     for (int n = 0; n < nbrs; n++) {
         int target = label_off[brs[n].label];
