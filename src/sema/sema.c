@@ -298,6 +298,53 @@ static int find_member_deep(struct type *base, const char *name,
     return 0;
 }
 
+/* Levenshtein distance, bounded — for "did you mean?" suggestions. Long names
+ * are not worth diffing (capped at 999 = "no match"). */
+static int edit_distance(const char *a, const char *b)
+{
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la > 63 || lb > 63)
+        return 999;
+    int prev[65], cur[65];
+    for (int j = 0; j <= lb; j++) prev[j] = j;
+    for (int i = 1; i <= la; i++) {
+        cur[0] = i;
+        for (int j = 1; j <= lb; j++) {
+            int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            int del = prev[j] + 1, ins = cur[j - 1] + 1, sub = prev[j - 1] + cost;
+            int m = del < ins ? del : ins;
+            cur[j] = m < sub ? m : sub;
+        }
+        for (int j = 0; j <= lb; j++) prev[j] = cur[j];
+    }
+    return prev[lb];
+}
+
+/* The in-scope local, function, or global whose name is closest to `name`, if
+ * one is close enough to be worth suggesting (a few edits, scaled to length),
+ * else NULL. Powers the "did you mean 'x'?" note on an undeclared name. */
+static const char *suggest_name(struct unit *u, struct scope *sc,
+                                const char *name)
+{
+    const char *best = NULL;
+    int bestd = 1000, nlen = (int)strlen(name);
+    for (int i = 0; i < sc->n; i++)
+        if (sc->vars[i].active) {
+            int d = edit_distance(name, sc->vars[i].name);
+            if (d > 0 && d < bestd) { bestd = d; best = sc->vars[i].name; }
+        }
+    for (struct func *fd = u->funcs; fd; fd = fd->next) {
+        int d = edit_distance(name, fd->name);
+        if (d > 0 && d < bestd) { bestd = d; best = fd->name; }
+    }
+    for (struct global *g = u->globals; g; g = g->next) {
+        int d = edit_distance(name, g->name);
+        if (d > 0 && d < bestd) { bestd = d; best = g->name; }
+    }
+    int thresh = nlen / 3 < 2 ? 2 : nlen / 3;
+    return (best && bestd <= thresh) ? best : NULL;
+}
+
 /* ---- expression checking ---- */
 
 static void check_expr(struct unit *u, struct func *f, struct scope *sc,
@@ -369,10 +416,15 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 e->ty = ty_ptr(ty_func(fd->ret_ty, fd->param_tys,
                                        fd->nparams, fd->is_varargs));
             } else {
-                diag_at(u->file, e->line, e->col,
-                           "'%s' is not declared in '%s' — for a call, "
-                           "add a prototype or define it first",
-                           e->name, f->name);
+                const char *sug = suggest_name(u, sc, e->name);
+                diag_error_at(u->file, e->line, e->col,
+                              "'%s' is not declared in '%s' — for a call, "
+                              "add a prototype or define it first",
+                              e->name, f->name);
+                if (sug)
+                    diag_note_at(u->file, e->line, e->col,
+                                 "did you mean '%s'?", sug);
+                exit(1);
             }
         }
         if (e->ty->kind == TY_ARRAY) {

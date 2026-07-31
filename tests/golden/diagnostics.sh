@@ -56,4 +56,14 @@ echo "$err" | grep -q "redef.c:1: note: previous definition of 'g'"   || { echo 
 echo "$err" | grep -q 'int g = 1;'                                    || { echo "note's source line not shown:"; echo "$err"; exit 1; }
 echo "redefinition: error + note, each with its source line"
 
-echo "diagnostics: caret + source line + column + notes, across includes, TTY-gated colour"
+# 6. A typo'd name suggests the nearest in-scope symbol; an unrelated name does
+#    not (the edit-distance threshold scales with length).
+printf 'int counter = 0;\nint main(void){ return countr; }\n' > "$out/typo.c"
+err=$("$EMBCC" -c "$out/typo.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -q "note: did you mean 'counter'?" || { echo "no did-you-mean suggestion:"; echo "$err"; exit 1; }
+printf 'int main(void){ return zzzzzz; }\n' > "$out/nohint.c"
+err=$("$EMBCC" -c "$out/nohint.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -q 'did you mean' && { echo "bogus suggestion for an unrelated name:"; echo "$err"; exit 1; }
+echo "did-you-mean: nearest symbol suggested, no false positives"
+
+echo "diagnostics: caret + source line + column + notes + suggestions, TTY-gated colour"
