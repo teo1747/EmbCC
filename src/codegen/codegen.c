@@ -185,10 +185,20 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
  * toward memory and the gcc-differential tests police the rest. */
 
 /* The callee-saved GPRs the allocator may hand out (rbp/rsp excluded; none is
- * used as codegen scratch, so all five are free). NCALLEE is a literal so it can
- * size arrays under EmbCC's own subset (which won't fold sizeof/sizeof there). */
+ * used as codegen scratch). NCALLEE is a literal so it can size arrays under
+ * EmbCC's own subset (which won't fold sizeof/sizeof there). It bounds the
+ * prologue-save set — a function saves at most these five. */
 #define NCALLEE 5
-static const int CALLEE_POOL[NCALLEE] = { 3 /*rbx*/, 12, 13, 14, 15 };
+
+/* A non-leaf function's pool. Beyond the callee-saved five it also gets the two
+ * caller-saved GPRs that are NEVER an argument register — r10, r11 — but only
+ * for a value whose live range does not cross a call (a call clobbers them;
+ * see `crosses` below). They come first so a short-lived value prefers them and
+ * skips the prologue save. r8/r9 are deliberately excluded: they ARE argument
+ * registers, and the sequential argument-setup move (case IR_CALL) would clobber
+ * a source still held in one before it is read. */
+#define NNONLEAF 7
+static const int NONLEAF_POOL[NNONLEAF] = { 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
 
 /* A LEAF, non-variadic function may also use the caller-saved r8..r11 with NO
  * save/restore: codegen touches those only at call sites (a leaf has none) and
@@ -382,8 +392,8 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     for (int i = 0; i < nins; i++)
         if (fn->ins[i].op == IR_CALL) { is_leaf = 0; break; }
     int use_leaf = is_leaf && !fn->src->is_varargs;
-    const int *POOL = use_leaf ? LEAF_POOL : CALLEE_POOL;
-    int NP = use_leaf ? NLEAF : NCALLEE;
+    const int *POOL = use_leaf ? LEAF_POOL : NONLEAF_POOL;
+    int NP = use_leaf ? NLEAF : NNONLEAF;
 
     int *first = xmalloc((size_t)nvr * sizeof *first);
     int *last  = xmalloc((size_t)nvr * sizeof *last);
@@ -395,6 +405,29 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     unsigned long *livein = NULL;
     unsigned long *liveout = compute_live_intervals(fn, first, last,
                                                     &livein, &defv, &lwords);
+
+    /* A value LIVE-OUT of a call survives it, so it cannot sit in a caller-saved
+     * register (the call clobbers those) — it must take a callee-saved reg or
+     * memory. The call's own result (defv[i]) is born at the call, so it does
+     * not "cross" this one. Only meaningful for the non-leaf pool, whose first
+     * entries are caller-saved; a leaf has no calls, so `crosses` stays all-0. */
+    char *crosses = xcalloc((size_t)(nvr ? nvr : 1), 1);
+    if (!use_leaf)
+        for (int i = 0; i < nins; i++) {
+            if (fn->ins[i].op != IR_CALL)
+                continue;
+            unsigned long *lo = liveout + (size_t)i * lwords;
+            for (int w = 0; w < lwords; w++) {
+                unsigned long bits = lo[w];
+                while (bits) {
+                    int b = 0; unsigned long t = bits;
+                    while (!(t & 1)) { t >>= 1; b++; }
+                    int v = w * 64 + b;
+                    if (v < nvr && v != defv[i]) crosses[v] = 1;
+                    bits &= bits - 1;
+                }
+            }
+        }
     for (int v = 0; v < nvr; v++) {
         if (v >= nvars) {
             elig[v] = 1;                          /* a temp */
@@ -603,6 +636,11 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 bits &= bits - 1;
             }
         }
+        /* A value that crosses a call may not take a caller-saved register: a
+         * call clobbers those, so forbid them here (leaving callee-saved/spill). */
+        if (crosses[eidx[e]])
+            for (int k = 0; k < NP; k++)
+                if (!is_callee_saved(POOL[k])) taken |= 1 << k;
         /* preferred colours: registers a colored, non-interfering move-partner
          * already holds (and that are still free) */
         int want = 0;
@@ -654,7 +692,7 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (reg_used[k] && is_callee_saved(POOL[k])) used_out[nu++] = POOL[k];
     *nused_out = nu;
 
-    free(first); free(last); free(elig);
+    free(first); free(last); free(elig); free(crosses);
     free(eof); free(eidx); free(adj); free(pref);
     free(members); free(order);
     free(liveout); free(livein); free(defv);
