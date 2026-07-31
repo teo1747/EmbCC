@@ -1815,16 +1815,26 @@ static void gen_func(struct ir_func *fn, struct code *text,
         }
     }
 
-    for (int k = 0; k < nsave; k++)                     /* -O2: restore callee regs */
-        x86_load_reg_mem(text, used_callee[k], REG_RBP, save_base + k * 8, 8);
-
     /* Every function ends with an epilogue, whether or not its last
      * statement was a return. A void function may legally fall off the
      * end (sema only demands a return from value-returning ones), and
      * without this it fell straight into the NEXT function's code —
-     * silently, since nothing crashes until a stray ret runs. A dead
-     * `leave; ret` after an explicit return costs two bytes. */
-    x86_epilogue(text);
+     * silently, since nothing crashes until a stray ret runs.
+     *
+     * But when the last instruction is an unconditional terminator (an
+     * explicit return, a tail jump, or a trap) the fall-through is
+     * unreachable, and at -O2 this dead tail also re-emits nsave callee
+     * restores. Drop it there. -O0/-O1 keep the (2-byte) dead `leave; ret`
+     * so their output — the self-host fixed point — stays byte-identical. */
+    int last_terminates = fn->nins > 0 &&
+        (fn->ins[fn->nins - 1].op == IR_RET ||
+         fn->ins[fn->nins - 1].op == IR_JMP ||
+         fn->ins[fn->nins - 1].op == IR_UD2);
+    if (!(g_regalloc && last_terminates)) {
+        for (int k = 0; k < nsave; k++)                 /* -O2: restore callee regs */
+            x86_load_reg_mem(text, used_callee[k], REG_RBP, save_base + k * 8, 8);
+        x86_epilogue(text);
+    }
 
     for (int n = 0; n < nbrs; n++) {
         int target = label_off[brs[n].label];
