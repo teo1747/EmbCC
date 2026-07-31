@@ -179,6 +179,22 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
 #define NCALLEE 5
 static const int CALLEE_POOL[NCALLEE] = { 3 /*rbx*/, 12, 13, 14, 15 };
 
+/* A LEAF, non-variadic function may also use the caller-saved r8..r11 with NO
+ * save/restore: codegen touches those only at call sites (a leaf has none) and
+ * the variadic register-save (excluded). They come first in the pool so they
+ * are preferred and the prologue save is skipped entirely; the callee-saved
+ * five follow as overflow (and are still saved if used). NLEAF sizes the
+ * allocator's per-colour arrays for either pool. */
+#define NLEAF 9
+static const int LEAF_POOL[NLEAF] = { 8, 9, 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
+
+/* Does a register need callee-save preservation (rbx, r12..r15)? r8..r11 are
+ * caller-saved — free to clobber, so no prologue slot. */
+static int is_callee_saved(int reg)
+{
+    return reg == 3 || (reg >= 12 && reg <= 15);
+}
+
 /* The vreg WRITTEN by an instruction (its def), or -1. Kept in lockstep with
  * what codegen actually stores (cg_store / the STVAR store). Each temp is a
  * single-def SSA value; a local may be redefined, which liveness handles. */
@@ -348,6 +364,15 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     for (int v = 0; v < nvr; v++) loc[v] = -1;
     *nused_out = 0;
     if (nvr == 0) return loc;
+
+    /* A leaf, non-variadic function gets the wider pool (caller-saved r8..r11
+     * first, no save/restore); everything else uses the callee-saved five. */
+    int is_leaf = 1;
+    for (int i = 0; i < nins; i++)
+        if (fn->ins[i].op == IR_CALL) { is_leaf = 0; break; }
+    int use_leaf = is_leaf && !fn->src->is_varargs;
+    const int *POOL = use_leaf ? LEAF_POOL : CALLEE_POOL;
+    int NP = use_leaf ? NLEAF : NCALLEE;
 
     int *first = xmalloc((size_t)nvr * sizeof *first);
     int *last  = xmalloc((size_t)nvr * sizeof *last);
@@ -524,7 +549,7 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         for (int cnt = 0; cnt < E; cnt++) {
             int pick = -1;
             for (int e = 0; e < E; e++)          /* a trivially-colourable node */
-                if (!gone[e] && deg[e] < NCALLEE) { pick = e; break; }
+                if (!gone[e] && deg[e] < NP) { pick = e; break; }
             if (pick < 0)                        /* else the most-constrained one */
                 for (int e = 0; e < E; e++)
                     if (!gone[e] && (pick < 0 || deg[e] > deg[pick])) pick = e;
@@ -548,8 +573,8 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         free(deg); free(gone);
     }
 
-    int reg_used[NCALLEE];
-    for (int k = 0; k < NCALLEE; k++) reg_used[k] = 0;
+    int reg_used[NLEAF];
+    for (int k = 0; k < NP; k++) reg_used[k] = 0;
     for (int oi = 0; oi < E; oi++) {
         int e = order[oi];
         int taken = 0;                        /* bitmask of neighbour registers */
@@ -562,8 +587,8 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 int ne = w * 64 + b;
                 int nl = loc[eidx[ne]];
                 if (nl >= 0)
-                    for (int k = 0; k < NCALLEE; k++)
-                        if (CALLEE_POOL[k] == nl) taken |= 1 << k;
+                    for (int k = 0; k < NP; k++)
+                        if (POOL[k] == nl) taken |= 1 << k;
                 bits &= bits - 1;
             }
         }
@@ -579,24 +604,25 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 int pe = w * 64 + b;
                 int pl = loc[eidx[pe]];
                 if (pl >= 0)
-                    for (int k = 0; k < NCALLEE; k++)
-                        if (CALLEE_POOL[k] == pl && !(taken & (1 << k)))
+                    for (int k = 0; k < NP; k++)
+                        if (POOL[k] == pl && !(taken & (1 << k)))
                             want |= 1 << k;
                 bits &= bits - 1;
             }
         }
         int pick = -1;
-        for (int k = 0; k < NCALLEE; k++)             /* a free preferred reg */
+        for (int k = 0; k < NP; k++)                  /* a free preferred reg */
             if ((want & (1 << k)) && !(taken & (1 << k))) { pick = k; break; }
         if (pick < 0)
-            for (int k = 0; k < NCALLEE; k++)          /* else lowest free */
+            for (int k = 0; k < NP; k++)               /* else lowest free */
                 if (!(taken & (1 << k))) { pick = k; break; }
-        if (pick >= 0) { loc[eidx[e]] = CALLEE_POOL[pick]; reg_used[pick] = 1; }
+        if (pick >= 0) { loc[eidx[e]] = POOL[pick]; reg_used[pick] = 1; }
     }
 
+    /* Only the callee-saved registers actually used need a prologue save. */
     int nu = 0;
-    for (int k = 0; k < NCALLEE; k++)
-        if (reg_used[k]) used_out[nu++] = CALLEE_POOL[k];
+    for (int k = 0; k < NP; k++)
+        if (reg_used[k] && is_callee_saved(POOL[k])) used_out[nu++] = POOL[k];
     *nused_out = nu;
 
     free(first); free(last); free(elig);
