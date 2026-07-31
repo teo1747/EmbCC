@@ -54,6 +54,17 @@ it drives `embcc` + `embld` from that manifest to a resolved ET_EXEC `embcc.elf`
 `/data/src/embcc/`, run the OS's `embbuild` on it, and confirm the on-OS-built
 EmbCC compiles the M1 program → exit 42.
 
+**And the kernel too (myos BUILD.md §12, KM1 host half).** The bigger EmbBuild
+prize — the OS rebuilding its own **kernel** — was blocked on G1 (an on-OS
+assembler) and G2 (`kernel_end`), which are EmbAS and EmbLD's L1, both done. So
+it is now pure orchestration: `tools/gen-kernel-manifest.sh` generates a 96-target
+manifest (89 embcc C compiles + 6 embcc `.asm` assembles + one embld link, no
+gcc/nasm/ld), and `tests/golden/embbuild-kernel.sh` (opt-in, `EMBCC_KM1=1`) walks
+it to a higher-half `kernel.elf` that **boots** in qemu — 193 lines of serial,
+zero faults, userspace reached. KM2/KM3 (the bootable image, and the derived
+`KERNEL_LOAD_SECTORS` — BUILD.md §12.3 G3, EmbBuild's first computed-value step)
+stay OS-side.
+
 ---
 
 **M3 — how it closed (2026-07-24; twelve sources at the time, fifteen now):**
