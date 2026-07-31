@@ -1996,18 +1996,25 @@ static void merge_decls(struct unit *u)
         for (int i = 0; match && i < f->nparams; i++)
             if (!ty_equal(canon->param_tys[i], f->param_tys[i]))
                 match = 0;
-        if (!match)
-            diag_fatal(u->file, f->line,
-                       "conflicting declaration of '%s' (earlier one at "
-                       "line %d)", f->name, canon->line);
+        if (!match) {
+            diag_error_at(f->file, f->line, 0,
+                          "conflicting declaration of '%s'", f->name);
+            diag_note_at(canon->file, canon->line, 0,
+                         "previous declaration of '%s' here", f->name);
+            exit(1);
+        }
         if (f->is_static && !canon->is_static)
             diag_fatal(u->file, f->line,
                        "static declaration of '%s' follows non-static "
                        "declaration (line %d)", f->name, canon->line);
         if (f->defined) {
-            if (canon->has_defn)
-                diag_fatal(u->file, f->line, "redefinition of '%s'",
-                           f->name);
+            if (canon->has_defn) {
+                diag_error_at(f->file, f->line, 0, "redefinition of '%s'",
+                              f->name);
+                diag_note_at(canon->file, canon->line, 0,
+                             "previous definition of '%s' here", f->name);
+                exit(1);
+            }
             canon->has_defn = 1;
             canon->body = f->body;
             for (int i = 0; i < f->nparams; i++)
@@ -2051,19 +2058,26 @@ static void merge_globals(struct unit *u)
             if (canon->ty->count == 0)
                 canon->ty = g->ty;
         }
-        if (!compat)
-            diag_fatal(u->file, g->line,
-                       "conflicting types for '%s': %s here, %s at "
-                       "line %d", g->name, ty_name(g->ty),
-                       ty_name(canon->ty), canon->line);
+        if (!compat) {
+            diag_error_at(g->file, g->line, 0,
+                          "conflicting types for '%s': %s here, %s before",
+                          g->name, ty_name(g->ty), ty_name(canon->ty));
+            diag_note_at(canon->file, canon->line, 0,
+                         "previous declaration of '%s' here", g->name);
+            exit(1);
+        }
         if (g->is_static && !canon->is_static)
             diag_fatal(u->file, g->line,
                        "static declaration of '%s' follows non-static "
                        "declaration (line %d)", g->name, canon->line);
         if (g->has_init) {
-            if (canon->has_init)
-                diag_fatal(u->file, g->line, "redefinition of '%s'",
-                           g->name);
+            if (canon->has_init) {
+                diag_error_at(g->file, g->line, 0, "redefinition of '%s'",
+                              g->name);
+                diag_note_at(canon->file, canon->line, 0,
+                             "previous definition of '%s' here", g->name);
+                exit(1);
+            }
             canon->has_init = 1;
             canon->init = g->init;
             canon->init_expr = g->init_expr;

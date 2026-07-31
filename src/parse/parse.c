@@ -1007,7 +1007,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
             /* a call — through a name or any pointer-valued expression */
             int line = cur(ps)->line;
             advance(ps);
-            struct expr *call = new_expr(EXPR_CALL, line, 0);
+            struct expr *call = new_expr(EXPR_CALL, line, e->col);
             call->lhs = e;
             if (e->kind == EXPR_VAR)
                 call->name = e->name;
@@ -1032,7 +1032,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
             advance(ps);
             struct expr *idx = parse_expr(ps);
             expect(ps, TOK_RBRACKET, "']'");
-            struct expr *d = new_expr(EXPR_DEREF, line, 0);
+            struct expr *d = new_expr(EXPR_DEREF, line, e->col);
             d->rhs = binop(B_ADD, e, idx);
             e = d;
         } else if (cur(ps)->kind == TOK_DOT ||
@@ -1044,7 +1044,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
                 diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
-            struct expr *m = new_expr(EXPR_MEMBER, line, 0);
+            struct expr *m = new_expr(EXPR_MEMBER, line, e->col);
             m->lhs = e;
             m->name = cur(ps)->text;
             m->is_arrow = is_arrow;
@@ -1278,7 +1278,7 @@ static struct expr *parse_expr(struct parser *ps)
     advance(ps);
 
     if (comp < 0) {
-        struct expr *a = new_expr(EXPR_ASSIGN, line, 0);
+        struct expr *a = new_expr(EXPR_ASSIGN, line, e->col);
         a->lhs = e;
         a->rhs = parse_expr(ps);
         return a;
@@ -1286,7 +1286,7 @@ static struct expr *parse_expr(struct parser *ps)
     /* `x op= y` keeps its own node rather than desugaring to
      * `x = x op y`: through a pointer or a member the address must be
      * evaluated ONCE, and the desugared form evaluates it twice. */
-    struct expr *a = new_expr(EXPR_COMPOUND, line, 0);
+    struct expr *a = new_expr(EXPR_COMPOUND, line, e->col);
     a->op = compound_assign[comp].op;
     a->lhs = e;
     a->rhs = parse_expr(ps);

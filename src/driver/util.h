@@ -26,6 +26,10 @@ void diag_fatal(const char *file, int line, const char *fmt, ...);
 /* As diag_fatal, but with a column for the caret. */
 void diag_at(const char *file, int line, int col, const char *fmt, ...);
 
+/* An "error:" that does NOT exit — the primary of an error+note pair. Follow it
+ * with diag_note_at(s) and then exit(1) yourself. */
+void diag_error_at(const char *file, int line, int col, const char *fmt, ...);
+
 /* A non-fatal "note:" tied to a location — a previous declaration, a macro
  * expansion site. Does not exit. */
 void diag_note_at(const char *file, int line, int col, const char *fmt, ...);

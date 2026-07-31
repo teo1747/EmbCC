@@ -39,4 +39,21 @@ if printf '%s' "$err" | grep -q "$(printf '\033')"; then
 fi
 echo "no colour codes when stderr is not a terminal"
 
-echo "diagnostics: caret + source line + column, across includes, TTY-gated colour"
+# 4. A semantic error points at the expression (a column on AST nodes): a member
+#    access on a non-struct carries a caret under the base.
+printf 'int main(void){int x=3; return x.y;}\n' > "$out/sema.c"
+err=$("$EMBCC" -c "$out/sema.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -qE "$out/sema.c:1:[0-9]+: error:" || { echo "sema error not located to a column:"; echo "$err"; exit 1; }
+echo "$err" | grep -qE '^ +\^$'                       || { echo "no caret on the semantic error:"; echo "$err"; exit 1; }
+echo "semantic errors carry a caret at the expression"
+
+# 5. A redefinition prints the error AND a note at the previous definition, each
+#    with its own source line.
+printf 'int g = 1;\nint g = 2;\nint main(void){return g;}\n' > "$out/redef.c"
+err=$("$EMBCC" -c "$out/redef.c" -o "$out/x.o" 2>&1 || true)
+echo "$err" | grep -q "redef.c:2: error: redefinition of 'g'"         || { echo "no redefinition error:"; echo "$err"; exit 1; }
+echo "$err" | grep -q "redef.c:1: note: previous definition of 'g'"   || { echo "no previous-definition note:"; echo "$err"; exit 1; }
+echo "$err" | grep -q 'int g = 1;'                                    || { echo "note's source line not shown:"; echo "$err"; exit 1; }
+echo "redefinition: error + note, each with its source line"
+
+echo "diagnostics: caret + source line + column + notes, across includes, TTY-gated colour"

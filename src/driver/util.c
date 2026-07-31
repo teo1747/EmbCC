@@ -138,6 +138,18 @@ void diag_at(const char *file, int line, int col, const char *fmt, ...)
     exit(1);
 }
 
+/* An error that does NOT exit — for the primary of an error+note pair, so the
+ * note (a previous declaration, an expansion site) prints under it before the
+ * caller exits. */
+void diag_error_at(const char *file, int line, int col, const char *fmt, ...)
+{
+    va_list ap;
+    fprintf(stderr, "embcc: ");
+    va_start(ap, fmt);
+    diag_render(file, line, col, "\033[1;31m", "error", fmt, ap);
+    va_end(ap);
+}
+
 /* A non-fatal note, tied to an earlier location (a previous declaration, a
  * macro-expansion site). Does not exit — the caller's error already will. */
 void diag_note_at(const char *file, int line, int col, const char *fmt, ...)
