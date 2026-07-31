@@ -1257,6 +1257,23 @@ static void gen_func(struct ir_func *fn, struct code *text,
                           i->op == IR_MUL ? '*' :
                           i->op == IR_AND ? '&' :
                           i->op == IR_OR ? '|' : '^';
+                /* Operand b folded to an immediate (the optimizer's imm-fold):
+                 * `OP $imm, dst` with no constant materialised in a register. In
+                 * the dest register directly when both dst and a are resident
+                 * (RAX untouched), else through RAX. MUL is never imm-folded. */
+                if (i->imm_b) {
+                    if (in_reg(i->dst) && in_reg(i->a)) {
+                        int D = g_loc[i->dst], A = g_loc[i->a];
+                        if (D != A)
+                            x86_mov_rr_w(text, D, A, i->w);
+                        x86_alu_reg_imm(text, aop, D, i->imm, i->w);
+                        break;
+                    }
+                    cg_load(text, sd, i->a, i->w, 0, i->w);
+                    x86_alu_reg_imm(text, aop, REG_RAX, i->imm, i->w);
+                    cg_store(text, sd, i->dst, i->w);
+                    break;
+                }
                 /* All three operands register-resident: compute in the dest
                  * register, no RAX detour. dst = a OP b becomes an in-place
                  * `OP b,dst` when dst already holds a (the common case after
@@ -1360,10 +1377,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 fn->ins[n + 1].a == i->dst && usecnt[i->dst] == 1) {
                 struct ir_ins *br = &fn->ins[n + 1];
                 cg_load(text, sd, i->a, i->w, 0, i->w);
-                if (in_reg(i->b))
+                if (i->imm_b) {
+                    if (i->imm == 0) x86_test_reg(text, REG_RAX, i->w);
+                    else x86_alu_reg_imm(text, 'c', REG_RAX, i->imm, i->w);
+                } else if (in_reg(i->b)) {
                     x86_cmp_rr(text, REG_RAX, g_loc[i->b], i->w);
-                else
+                } else {
                     x86_cmp_eax_mem(text, sd[i->b], i->w);
+                }
                 /* BRNZ jumps when the comparison is true; BRZ when it is false. */
                 enum binop jp = br->op == IR_BRNZ ? i->pred
                                                   : negate_pred(i->pred);
@@ -1380,10 +1401,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 break;
             }
             cg_load(text, sd, i->a, i->w, 0, i->w);
-            if (in_reg(i->b))
+            if (i->imm_b) {
+                if (i->imm == 0) x86_test_reg(text, REG_RAX, i->w);
+                else x86_alu_reg_imm(text, 'c', REG_RAX, i->imm, i->w);
+            } else if (in_reg(i->b)) {
                 x86_cmp_rr(text, REG_RAX, g_loc[i->b], i->w);
-            else
+            } else {
                 x86_cmp_eax_mem(text, sd[i->b], i->w);
+            }
             x86_setcc_eax(text, cc_for(i->pred, i->sign));
             cg_store(text, sd, i->dst, 4);        /* the 0/1 result is an int */
             break;

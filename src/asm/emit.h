@@ -127,6 +127,8 @@ int x86_jz_rel32(struct code *c);
 int x86_jnz_rel32(struct code *c);
 int x86_jmp_rel32(struct code *c);
 int x86_jcc_rel32(struct code *c, int setcc); /* setcc cond byte (0x9x) -> Jcc rel32 */
+void x86_alu_reg_imm(struct code *c, int op, int reg, long imm, int w); /* reg OP= imm ('c'=cmp) */
+void x86_test_reg(struct code *c, int reg, int w); /* test reg,reg (cmp reg,0) */
 
 /* call rel32 with a zero placeholder; returns the rel32 field offset. */
 int x86_call_rel32(struct code *c);

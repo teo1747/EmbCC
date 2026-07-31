@@ -225,6 +225,44 @@ void x86_alu_rr(struct code *c, int op, int dst, int src, int w)
     code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
 }
 
+/* group-1 ALU `reg OP= imm` (add/sub/and/or/xor, and cmp via op 'c'): the imm8
+ * form (83 /ext ib, sign-extended) when the value fits, else imm32 (81 /ext id).
+ * Works for any register including rax — shorter than materialising the constant
+ * in a scratch register first. */
+void x86_alu_reg_imm(struct code *c, int op, int reg, long imm, int w)
+{
+    int ext;
+    switch (op) {
+    case '+': ext = 0; break;
+    case '|': ext = 1; break;
+    case '&': ext = 4; break;
+    case '-': ext = 5; break;
+    case '^': ext = 6; break;
+    case 'c': ext = 7; break;   /* cmp */
+    default:
+        fprintf(stderr, "embcc: internal: no reg-imm encoding for '%c'\n", op);
+        exit(1);
+    }
+    rex_rb(c, w == 8, 0, reg);   /* reg is the r/m operand -> REX.B */
+    if (imm >= -128 && imm <= 127) {
+        code_byte(c, 0x83);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+        code_byte(c, (int)(imm & 0xff));
+    } else {
+        code_byte(c, 0x81);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+        code_u32(c, (unsigned long)imm);
+    }
+}
+
+/* test reg, reg — ZF/SF from the value itself, the compact `cmp reg, 0`. */
+void x86_test_reg(struct code *c, int reg, int w)
+{
+    rex_rb(c, w == 8, reg, reg);
+    code_byte(c, 0x85);
+    code_byte(c, 0xc0 | ((reg & 7) << 3) | (reg & 7));
+}
+
 /* cmp a, b (computes a - b, sets flags) — reg-reg twin of x86_cmp_eax_mem. */
 void x86_cmp_rr(struct code *c, int a, int b, int w)
 {

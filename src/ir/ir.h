@@ -101,7 +101,10 @@ struct ir_ins {
     int flt;                 /* operate in xmm at width w (SSE scalar) */
     int vol;                 /* LOAD/STORE/LDVAR/STVAR: a `volatile` access —
                               * the optimizer must never CSE or remove it (MMIO) */
-    long imm;                /* IR_CONST */
+    long imm;                /* IR_CONST; also the folded value when imm_b */
+    int imm_b;               /* ADD/SUB/AND/OR/XOR/CMP: operand b is the constant
+                              * in `imm` (an immediate), not vreg b — set by the
+                              * optimizer's immediate-fold pass, read by codegen */
     enum binop pred;         /* IR_CMP */
     int label;               /* IR_LABEL/IR_JMP/IR_BRZ */
     struct func *callee;     /* IR_CALL (direct), IR_FADDR */

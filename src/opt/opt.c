@@ -75,7 +75,12 @@ static void each_read(struct ir_ins *i, void (*cb)(int *, void *), void *ctx)
         break;
     case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
     case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SHR:
-    case IR_CMP: case IR_STORE: case IR_MEMCPY: case IR_XCHG:
+    case IR_CMP:
+        cb(&i->a, ctx);
+        if (!i->imm_b)           /* b folded to an immediate: not a vreg read */
+            cb(&i->b, ctx);
+        break;
+    case IR_STORE: case IR_MEMCPY: case IR_XCHG:
     case IR_XADD:
         cb(&i->a, ctx);
         cb(&i->b, ctx);
@@ -568,6 +573,67 @@ static int pass_dce(struct ir_func *fn)
     return changed;
 }
 
+/* ---- immediate-operand folding ---- */
+
+/* x86 ALU/compare immediates are imm32 (sign-extended to 64). A value outside
+ * that range must stay in a register. */
+static int fits_imm32(long v)
+{
+    return v >= -2147483647L - 1 && v <= 2147483647L;
+}
+
+/* The predicate when a comparison's operands are swapped: `a < b` becomes
+ * `b > a`, so folding a constant `a` into `cmp b, imm` flips the direction. */
+static enum binop swap_pred(enum binop p)
+{
+    switch (p) {
+    case B_LT: return B_GT; case B_GT: return B_LT;
+    case B_LE: return B_GE; case B_GE: return B_LE;
+    default:   return p;   /* EQ/NE are symmetric */
+    }
+}
+
+/* Fold a constant operand of an integer ALU/compare op into an immediate, so
+ * the value need not be materialised in a register. Run once AFTER the main
+ * fixpoint (fold/lvn/copyprop never see the imm_b form) and followed by DCE,
+ * which drops the CONSTs that folding left unreferenced. */
+static int pass_immfold(struct ir_func *fn)
+{
+    struct defs d;
+    compute_defs(fn, &d);
+    int changed = 0;
+    for (int n = 0; n < fn->nins; n++) {
+        struct ir_ins *i = &fn->ins[n];
+        if (i->flt || i->imm_b)
+            continue;
+        long A, B;
+        int commutative;
+        switch (i->op) {
+        case IR_ADD: case IR_AND: case IR_OR: case IR_XOR:
+            commutative = 1; break;
+        case IR_SUB: case IR_CMP:
+            commutative = 0; break;
+        default:
+            continue;
+        }
+        if (get_const(fn, &d, i->b, &B) && fits_imm32(B)) {
+            i->imm = B; i->imm_b = 1; i->b = -1;    /* op a, imm */
+            changed = 1;
+        } else if ((commutative || i->op == IR_CMP) &&
+                   get_const(fn, &d, i->a, &A) && fits_imm32(A)) {
+            /* Constant in the first operand: move it to the immediate, keeping
+             * a valid instruction — commutative ops just swap, a compare swaps
+             * and flips its predicate. */
+            i->a = i->b; i->b = -1; i->imm = A; i->imm_b = 1;
+            if (i->op == IR_CMP)
+                i->pred = swap_pred(i->pred);
+            changed = 1;
+        }
+    }
+    free_defs(&d);
+    return changed;
+}
+
 /* ---- driver ---- */
 
 static void opt_func(struct ir_func *fn)
@@ -580,6 +646,11 @@ static void opt_func(struct ir_func *fn)
         changed |= pass_copyprop(fn);
         changed |= pass_dce(fn);
     }
+    /* After the fixpoint: fold constant operands into immediates, then DCE the
+     * CONSTs that leaves unreferenced. Kept out of the fixpoint so the earlier
+     * passes never reason about the imm_b form. */
+    if (pass_immfold(fn))
+        pass_dce(fn);
 }
 
 void opt_run(struct ir_unit *iu, int level)
