@@ -180,7 +180,17 @@ static struct type *parse_declarator(struct parser *ps, struct type *base,
                 expect(ps, TOK_RBRACKET, "']'");
             }
             expect(ps, TOK_RPAREN, "')'");
-            struct type *t = ty_ptr(parse_fn_params(ps, base));
+            /* What the parenthesized `(*name...)` refers to is decided by what
+             * follows: `(params)` a function pointer, `[dims]` a pointer to an
+             * array (`int (*p)[N]`), otherwise a plain parenthesized pointer. */
+            struct type *inner;
+            if (cur(ps)->kind == TOK_LPAREN)
+                inner = parse_fn_params(ps, base);
+            else if (cur(ps)->kind == TOK_LBRACKET)
+                inner = parse_array_dims(ps, base);
+            else
+                inner = base;
+            struct type *t = ty_ptr(inner);
             for (int i = 0; i < extra; i++)
                 t = ty_ptr(t);
             for (int i = nad - 1; i >= 0; i--)
