@@ -1126,6 +1126,107 @@ static int pass_gcse(struct ir_func *fn)
     return changed;
 }
 
+/* ---- conditional constant propagation (the reachability half of SCCP) ----
+ *
+ * A conditional branch whose condition is a known constant has one live edge.
+ * Resolve it (BRZ/BRNZ -> unconditional jump, or fall-through), then drop every
+ * block no longer reachable over the live edges. The constant conditions come
+ * from inlining a call with a constant argument, mem2reg + folding collapsing a
+ * flag, config constants — code the earlier passes leave as `test; jz` over a
+ * value they have already proven constant, plus the now-dead arm behind it.
+ *
+ * One rebuild handles both: emit each reachable block, replacing a resolved
+ * branch with a jump to its live successor (or nothing when that successor is
+ * the fall-through), and skip unreachable blocks entirely. */
+static int pass_sccp(struct ir_func *fn)
+{
+    if (fn->nins == 0)
+        return 0;
+    struct defs d;
+    compute_defs(fn, &d);
+    int nbb, *l2b;
+    struct bb *bb = build_cfg(fn, &nbb, &l2b);
+
+    /* live_only[b] = index into bb[b].succ of the sole live edge, or -1 = all.
+     * succ[0] is the branch-taken target, succ[1] the fall-through. */
+    int *live_only = xmalloc((size_t)nbb * sizeof *live_only);
+    for (int b = 0; b < nbb; b++) {
+        live_only[b] = -1;
+        if (bb[b].end <= bb[b].start)
+            continue;
+        struct ir_ins *t = &fn->ins[bb[b].end - 1];
+        if ((t->op != IR_BRZ && t->op != IR_BRNZ) || t->a < 0 ||
+            d.cnt[t->a] != 1 || d.ins[t->a] < 0 ||
+            fn->ins[d.ins[t->a]].op != IR_CONST)
+            continue;
+        long v = fn->ins[d.ins[t->a]].imm;
+        int taken = (t->op == IR_BRZ) ? (v == 0) : (v != 0);
+        int want = taken ? 0 : 1;
+        if (want < bb[b].nsucc)      /* only if that edge actually exists */
+            live_only[b] = want;
+    }
+
+    /* Reachability over the live edges only. */
+    char *reach = xcalloc((size_t)nbb, 1);
+    int *wl = xmalloc((size_t)nbb * sizeof *wl), nwl = 0;
+    reach[0] = 1; wl[nwl++] = 0;
+    while (nwl) {
+        int b = wl[--nwl];
+        for (int s = 0; s < bb[b].nsucc; s++) {
+            if (live_only[b] >= 0 && s != live_only[b])
+                continue;
+            int sb = bb[b].succ[s];
+            if (!reach[sb]) { reach[sb] = 1; wl[nwl++] = sb; }
+        }
+    }
+
+    int work = 0;
+    for (int b = 0; b < nbb; b++)
+        if (!reach[b] || live_only[b] >= 0) { work = 1; break; }
+    if (!work) {
+        free(live_only); free(reach); free(wl); free(l2b);
+        for (int i = 0; i < nbb; i++) free(bb[i].pred);
+        free(bb); free_defs(&d);
+        return 0;
+    }
+
+    struct ibuf nb = { 0, 0, 0 };
+    for (int b = 0; b < nbb; b++) {
+        if (!reach[b])
+            continue;                       /* unreachable: drop the whole block */
+        if (live_only[b] >= 0) {
+            for (int n = bb[b].start; n < bb[b].end - 1; n++)  /* body, not branch */
+                *ib_push(&nb) = fn->ins[n];
+            int ls = bb[b].succ[live_only[b]];
+            /* Jump to the live successor by label; if it has none it is the
+             * fall-through (b+1, reachable, emitted next) — just fall in. */
+            if (bb[ls].end > bb[ls].start && fn->ins[bb[ls].start].op == IR_LABEL) {
+                struct ir_ins *j = ib_push(&nb);
+                j->op = IR_JMP; j->dst = -1; j->a = -1; j->b = -1;
+                j->label = fn->ins[bb[ls].start].label;
+            }
+        } else {
+            for (int n = bb[b].start; n < bb[b].end; n++)
+                *ib_push(&nb) = fn->ins[n];
+        }
+    }
+    free(fn->ins);
+    fn->ins = nb.p; fn->nins = nb.n; fn->cap = nb.cap;
+
+    /* The rebuild renumbered every instruction, so the local scope ranges (used
+     * by codegen to coalesce disjoint-lifetime locals) are stale — drop them,
+     * as mem2reg does; each surviving local then takes its own slot. */
+    if (fn->var_scope_lo) {
+        free(fn->var_scope_lo); free(fn->var_scope_hi);
+        fn->var_scope_lo = fn->var_scope_hi = NULL;
+    }
+
+    free(live_only); free(reach); free(wl); free(l2b);
+    for (int i = 0; i < nbb; i++) free(bb[i].pred);
+    free(bb); free_defs(&d);
+    return 1;
+}
+
 /* ---- local store-forwarding (a lightweight mem2reg) ----
  *
  * EmbIR keeps locals in memory (STVAR/LDVAR). Within an extended basic block a
@@ -1438,6 +1539,7 @@ static void inline_unit(struct ir_unit *iu)
 
 static int g_mem2reg;   /* -O2: promote locals to SSA before the fixpoint */
 static int g_gcse;      /* -O2: dominator-scoped global CSE inside the fixpoint */
+static int g_sccp;      /* -O2: const-branch resolution + unreachable-block drop */
 
 static void opt_func(struct ir_func *fn)
 {
@@ -1451,6 +1553,8 @@ static void opt_func(struct ir_func *fn)
         changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
         if (g_gcse)
             changed |= pass_gcse(fn); /* CSE across the dominator tree */
+        if (g_sccp)
+            changed |= pass_sccp(fn); /* resolve const branches, drop dead blocks */
         changed |= pass_copyprop(fn);
         changed |= pass_dce(fn);
     }
@@ -1467,6 +1571,7 @@ void opt_run(struct ir_unit *iu, int level)
         return;
     g_mem2reg = level >= 2;       /* SSA mem2reg: promote scalar locals to temps */
     g_gcse = level >= 2;          /* global CSE across the dominator tree */
+    g_sccp = level >= 2;          /* conditional constant propagation */
     if (level >= 2)               /* inline before the per-function passes clean up */
         inline_unit(iu);
     for (int f = 0; f < iu->nfuncs; f++)
