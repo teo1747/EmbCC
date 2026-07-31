@@ -40,6 +40,7 @@ static int g_want_debug;
  * the self-host fixed point requires. */
 static int g_regalloc;          /* defined below; -O2 register allocation is on */
 static const int *g_loc;        /* per-vreg physical register at -O2, or -1 */
+static int g_opt_frames;        /* -O1+: dead temps take no stack slot (frame shrink) */
 
 static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
 {
@@ -137,8 +138,17 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
                 slot[k] = -1;
                 continue;
             }
-            if (first[k] < 0) {          /* never referenced: throwaway slot */
-                slot[k] = pool++;
+            if (first[k] < 0) {          /* never referenced: no slot needed */
+                /* A temp that appears in no instruction is dead — nothing ever
+                 * loads or stores it, so it needs no frame slot. This is common
+                 * once the optimizer's immediate-fold detaches a CONST and DCE
+                 * drops its defining instruction, leaving the temp unreferenced;
+                 * giving each one an 8-byte throwaway slot inflates the frame for
+                 * nothing, and a recursive kernel function (path walk, tree
+                 * sweep) then overflows the kernel stack. Gated to optimizing
+                 * builds so -O0 stays byte-identical (its throwaway layout is
+                 * unchanged, which the self-host fixed point relies on). */
+                slot[k] = g_opt_frames ? -1 : pool++;
                 continue;
             }
             int coalescable = (blk[first[k]] == blk[last[k]]);
@@ -2148,6 +2158,7 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
      * so their output stays byte-identical. */
     g_regalloc = regalloc;
     g_regcache = optimize;
+    g_opt_frames = optimize;
     g_no_sse = no_sse;
 
     for (int n = 0; n < iu->nfuncs; n++)

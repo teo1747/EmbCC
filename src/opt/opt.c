@@ -556,8 +556,19 @@ static int pass_dce(struct ir_func *fn)
     int *use = xcalloc((size_t)fn->nvregs, sizeof *use);
     for (int n = 0; n < fn->nins; n++)
         each_read(&fn->ins[n], count_cb, use);
+    /* Removing instructions renumbers the ones that follow. fn->var_scope_lo/hi
+     * (irgen-stamped instruction indices, read by codegen's coalesce_locals to
+     * decide which address-taken locals may share a stack slot) must move with
+     * them — otherwise a stale scope index is compared against a FRESH liveness
+     * index and two locals whose lifetimes actually overlap get the same slot,
+     * so one's store clobbers the other. newpos[n] is the new index instruction
+     * n lands at (a dropped instruction collapses onto the next survivor); it
+     * maps the half-open [lo, hi) scope bounds, index nins included. */
+    int *newpos = fn->var_scope_lo
+        ? xmalloc((size_t)(fn->nins + 1) * sizeof *newpos) : NULL;
     int changed = 0, j = 0;
     for (int n = 0; n < fn->nins; n++) {
+        if (newpos) newpos[n] = j;
         struct ir_ins *i = &fn->ins[n];
         int t = def_target(i);
         if (is_pure(i->op) && t >= 0 && use[t] == 0) {
@@ -576,6 +587,15 @@ static int pass_dce(struct ir_func *fn)
         if (j != n)
             fn->ins[j] = *i;
         j++;
+    }
+    if (newpos) {
+        newpos[fn->nins] = j;
+        for (int v = 0; v < fn->src->nvars; v++) {
+            int lo = fn->var_scope_lo[v], hi = fn->var_scope_hi[v];
+            if (lo >= 0 && lo <= fn->nins) fn->var_scope_lo[v] = newpos[lo];
+            if (hi >= 0 && hi <= fn->nins) fn->var_scope_hi[v] = newpos[hi];
+        }
+        free(newpos);
     }
     fn->nins = j;
     free(use);
