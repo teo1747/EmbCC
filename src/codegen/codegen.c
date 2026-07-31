@@ -38,6 +38,9 @@ static int g_want_debug;
  * range only shrinks reuse, never makes it unsound, so a blind field scan (no
  * per-op operand table to get wrong) is deliberately used. Deterministic, which
  * the self-host fixed point requires. */
+static int g_regalloc;          /* defined below; -O2 register allocation is on */
+static const int *g_loc;        /* per-vreg physical register at -O2, or -1 */
+
 static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
 {
     int nins = fn->nins, nvr = fn->nvregs;
@@ -126,6 +129,14 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
     int nfree = 0, nact = 0, pool = 0;
     for (int i = 0; i <= nins; i++) {
         for (int k = head[i]; k >= 0; k = nxt[k]) {
+            /* A register-resident temp (-O2 regalloc) never touches memory, so
+             * it needs no stack slot — skip it, keeping the frame to the temps
+             * that actually spill. (This also caps mem2reg's SSA-temp inflation:
+             * the extra versions live in registers, not the frame.) */
+            if (g_regalloc && g_loc && g_loc[k + nvars] >= 0) {
+                slot[k] = -1;
+                continue;
+            }
             if (first[k] < 0) {          /* never referenced: throwaway slot */
                 slot[k] = pool++;
                 continue;

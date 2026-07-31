@@ -582,6 +582,463 @@ static int pass_dce(struct ir_func *fn)
     return changed;
 }
 
+/* ==== SSA-based mem2reg (-O2) =============================================== *
+ *
+ * Promotes every non-address-taken scalar local out of memory into SSA temps.
+ * Builds the CFG, the dominator tree (Cooper-Harvey-Kennedy) and dominance
+ * frontiers, inserts phi-functions at the iterated frontier of each variable's
+ * defs, renames defs/uses to versioned temps down the dominator tree, then
+ * destructs SSA by realising each phi as copies on its incoming edges — the
+ * branch-taken edge via a trampoline block, a branch's fall-through with inline
+ * copies (they run only when the branch is not taken), single-successor edges by
+ * appending. Every copy set is sequenced read-all-then-write-all through fresh
+ * temps, so a swap or a self-referential loop phi is safe. This turns
+ * STVAR/LDVAR chains that cross basic blocks — loop counters, a value live down
+ * one arm of an `if` — into temps that fold/lvn/copyprop then optimise, which is
+ * what the block-local store-forwarding could not reach. */
+
+struct bb {
+    int start, end;                 /* instruction range [start, end) */
+    int succ[2], nsucc;
+    int *pred, npred;
+    int idom, rpo;                  /* immediate dominator; reverse-postorder # */
+    int *phi_local, *phi_res, nphi; /* phi(local) -> result temp, per block */
+    int **phi_inc;                  /* phi_inc[p][k] = value on edge from pred p */
+};
+
+/* Growable instruction buffer, for rebuilding fn->ins out of SSA. */
+struct ibuf { struct ir_ins *p; int n, cap; };
+static struct ir_ins *ib_push(struct ibuf *b)
+{
+    if (b->n == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 64;
+        b->p = xrealloc(b->p, (size_t)b->cap * sizeof *b->p);
+    }
+    struct ir_ins *i = &b->p[b->n++];
+    memset(i, 0, sizeof *i);
+    return i;
+}
+
+static void bb_add_pred(struct bb *b, int p)
+{
+    for (int i = 0; i < b->npred; i++)
+        if (b->pred[i] == p) return;
+    b->pred = xrealloc(b->pred, (size_t)(b->npred + 1) * sizeof *b->pred);
+    b->pred[b->npred++] = p;
+}
+
+/* Build basic blocks + succ/pred + a label->block map. */
+static struct bb *build_cfg(struct ir_func *fn, int *nbb_out, int **l2b_out)
+{
+    int N = fn->nins;
+    char *lead = xcalloc((size_t)(N ? N : 1), 1);
+    if (N) lead[0] = 1;
+    for (int i = 0; i < N; i++) {
+        enum ir_op op = fn->ins[i].op;
+        if (op == IR_LABEL) lead[i] = 1;
+        if ((op == IR_JMP || op == IR_BRZ || op == IR_BRNZ ||
+             op == IR_RET || op == IR_UD2) && i + 1 < N)
+            lead[i + 1] = 1;
+    }
+    int nbb = 0;
+    for (int i = 0; i < N; i++) if (lead[i]) nbb++;
+    if (nbb == 0) nbb = 1;
+    struct bb *bb = xcalloc((size_t)nbb, sizeof *bb);
+    int b = 0, prev = 0;
+    for (int i = 1; i <= N; i++)
+        if (i == N || lead[i]) { bb[b].start = prev; bb[b].end = i; prev = i; b++; }
+    for (int i = 0; i < nbb; i++) { bb[i].idom = -1; bb[i].rpo = -1; }
+
+    int *l2b = xmalloc((size_t)(fn->nlabels ? fn->nlabels : 1) * sizeof *l2b);
+    for (int l = 0; l < fn->nlabels; l++) l2b[l] = -1;
+    for (int i = 0; i < nbb; i++)
+        if (bb[i].end > bb[i].start && fn->ins[bb[i].start].op == IR_LABEL)
+            l2b[fn->ins[bb[i].start].label] = i;
+
+    for (int i = 0; i < nbb; i++) {
+        enum ir_op op = bb[i].end > bb[i].start ? fn->ins[bb[i].end - 1].op : IR_UD2;
+        int L = bb[i].end > bb[i].start ? fn->ins[bb[i].end - 1].label : -1;
+        if (op == IR_RET || op == IR_UD2) {
+            /* no successors */
+        } else if (op == IR_JMP) {
+            if (l2b[L] >= 0) bb[i].succ[bb[i].nsucc++] = l2b[L];
+        } else if (op == IR_BRZ || op == IR_BRNZ) {
+            if (l2b[L] >= 0) bb[i].succ[bb[i].nsucc++] = l2b[L];
+            if (i + 1 < nbb) bb[i].succ[bb[i].nsucc++] = i + 1;
+        } else if (i + 1 < nbb) {
+            bb[i].succ[bb[i].nsucc++] = i + 1;
+        }
+    }
+    for (int i = 0; i < nbb; i++)
+        for (int k = 0; k < bb[i].nsucc; k++)
+            bb_add_pred(&bb[bb[i].succ[k]], i);
+    free(lead);
+    *nbb_out = nbb;
+    *l2b_out = l2b;
+    return bb;
+}
+
+/* Reverse-postorder numbering from the entry (block 0). */
+static void compute_rpo(struct bb *bb, int nbb, int *order, int *norder)
+{
+    char *seen = xcalloc((size_t)nbb, 1);
+    int *stk = xmalloc((size_t)nbb * sizeof *stk), *it = xmalloc((size_t)nbb * sizeof *it);
+    int sp = 0, po = 0, *post = xmalloc((size_t)nbb * sizeof *post);
+    stk[sp] = 0; it[sp] = 0; seen[0] = 1;
+    while (sp >= 0) {
+        int u = stk[sp];
+        if (it[sp] < bb[u].nsucc) {
+            int w = bb[u].succ[it[sp]++];
+            if (!seen[w]) { seen[w] = 1; sp++; stk[sp] = w; it[sp] = 0; }
+        } else { post[po++] = u; sp--; }
+    }
+    *norder = po;
+    for (int i = 0; i < po; i++) order[i] = post[po - 1 - i];   /* reverse */
+    for (int i = 0; i < po; i++) bb[order[i]].rpo = i;
+    free(seen); free(stk); free(it); free(post);
+}
+
+static int idom_intersect(struct bb *bb, int a, int b)
+{
+    while (a != b) {
+        while (bb[a].rpo > bb[b].rpo) a = bb[a].idom;
+        while (bb[b].rpo > bb[a].rpo) b = bb[b].idom;
+    }
+    return a;
+}
+
+/* Immediate dominators (Cooper-Harvey-Kennedy) over the reachable blocks. */
+static void compute_idom(struct bb *bb, int *order, int norder)
+{
+    bb[0].idom = 0;
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 1; i < norder; i++) {       /* skip entry, RPO order */
+            int b = order[i], nd = -1;
+            for (int k = 0; k < bb[b].npred; k++) {
+                int p = bb[b].pred[k];
+                if (bb[p].idom < 0) continue;    /* not yet processed */
+                nd = nd < 0 ? p : idom_intersect(bb, nd, p);
+            }
+            if (nd >= 0 && bb[b].idom != nd) { bb[b].idom = nd; changed = 1; }
+        }
+    }
+}
+
+/* Dominance frontiers. df[b] holds the blocks on b's frontier. */
+static void compute_df(struct bb *bb, int nbb, int **df, int *ndf)
+{
+    for (int b = 0; b < nbb; b++) {
+        if (bb[b].npred < 2) continue;
+        for (int k = 0; k < bb[b].npred; k++) {
+            int r = bb[b].pred[k];
+            while (r >= 0 && r != bb[b].idom) {
+                int dup = 0;
+                for (int j = 0; j < ndf[r]; j++) if (df[r][j] == b) dup = 1;
+                if (!dup) { df[r] = xrealloc(df[r], (size_t)(ndf[r]+1)*sizeof(int));
+                            df[r][ndf[r]++] = b; }
+                r = bb[r].idom;
+            }
+        }
+    }
+}
+
+/* A full-width plain access (no truncation/extension mismatch between a store
+ * and a load) — the same soundness gate mem2reg and store-forwarding share. */
+static int m2r_plain(int size, int sign, int w)
+{
+    return size == 8 || (size == 4 && !(sign && w == 8));
+}
+
+/* Emit the phi copies for edge (pred p -> block s): read every incoming value
+ * into a fresh temp, then write each phi result — read-all-then-write-all, so a
+ * self-referential loop phi or a swap is realised correctly. */
+static void emit_edge_copies(struct ibuf *nb, struct bb *bb, int s, int p,
+                             struct ir_func *fn)
+{
+    struct bb *S = &bb[s];
+    if (S->nphi == 0) return;
+    int pi = -1;
+    for (int k = 0; k < S->npred; k++) if (S->pred[k] == p) { pi = k; break; }
+    if (pi < 0) return;
+    /* A conflict — an incoming value that is another phi result of this block
+     * (a swap, a self-referential loop phi) — needs read-all-then-write-all
+     * through temps. The common case has none: emit direct copies, no temps. */
+    int conflict = 0;
+    for (int k = 0; k < S->nphi && !conflict; k++)
+        for (int j = 0; j < S->nphi; j++)
+            if (S->phi_inc[pi][k] == S->phi_res[j]) { conflict = 1; break; }
+    if (!conflict) {
+        for (int k = 0; k < S->nphi; k++) {
+            struct ir_ins *mv = ib_push(nb);
+            mv->op = IR_MOV; mv->dst = S->phi_res[k]; mv->a = S->phi_inc[pi][k];
+        }
+        return;
+    }
+    int *tmp = xmalloc((size_t)S->nphi * sizeof *tmp);
+    for (int k = 0; k < S->nphi; k++) {
+        tmp[k] = fn->nvregs++;
+        struct ir_ins *mv = ib_push(nb);
+        mv->op = IR_MOV; mv->dst = tmp[k]; mv->a = S->phi_inc[pi][k];
+    }
+    for (int k = 0; k < S->nphi; k++) {
+        struct ir_ins *mv = ib_push(nb);
+        mv->op = IR_MOV; mv->dst = S->phi_res[k]; mv->a = tmp[k];
+    }
+    free(tmp);
+}
+
+static void mem2reg_free(struct bb *bb, int nbb, int **df, int *ndf, int *l2b,
+                         int *order)
+{
+    for (int i = 0; i < nbb; i++) {
+        free(bb[i].pred);
+        free(bb[i].phi_local); free(bb[i].phi_res);
+        if (bb[i].phi_inc) {
+            for (int k = 0; k < bb[i].npred; k++) free(bb[i].phi_inc[k]);
+            free(bb[i].phi_inc);
+        }
+        free(df[i]);
+    }
+    free(bb); free(df); free(ndf); free(l2b); free(order);
+}
+
+static int pass_mem2reg(struct ir_func *fn)
+{
+    int nvars = fn->src->nvars;
+    if (nvars == 0 || fn->nins == 0)
+        return 0;
+
+    /* 1. Promotable locals: a scalar int/ptr of 4 or 8 bytes, never
+     * address-taken, every load full-width plain. */
+    int nparams = fn->src->nparams;
+    char *ok = xmalloc((size_t)nvars);
+    for (int L = 0; L < nvars; L++) {
+        struct type *t = fn->src->var_tys[L];
+        /* Params are excluded: their value is live on entry (no defining IR
+         * instruction), so SSA has no version to seed a read with. Only true
+         * locals, always assigned before use, are promoted. */
+        ok[L] = L >= nparams && t &&
+                (ty_is_integer(t) || t->kind == TY_PTR) &&
+                (ty_size(t) == 4 || ty_size(t) == 8);
+    }
+    for (int L = 0; L < nvars; L++)
+        if (fn->src->var_tys[L] && fn->src->var_tys[L]->is_volatile)
+            ok[L] = 0;                          /* volatile: every access must stay */
+    for (int i = 0; i < fn->nins; i++) {
+        struct ir_ins *in = &fn->ins[i];
+        if (in->op == IR_ADDR && in->a >= 0 && in->a < nvars) ok[in->a] = 0;
+        if (in->op == IR_LDVAR && in->a >= 0 && in->a < nvars &&
+            (in->vol || !m2r_plain(in->size, in->sign, in->w))) ok[in->a] = 0;
+        if (in->op == IR_STVAR && in->dst >= 0 && in->dst < nvars && in->vol)
+            ok[in->dst] = 0;
+    }
+    int nprom = 0;
+    int *prom = xmalloc((size_t)nvars * sizeof *prom);     /* local -> prom idx */
+    int *ploc = xmalloc((size_t)nvars * sizeof *ploc);     /* prom idx -> local */
+    for (int L = 0; L < nvars; L++)
+        prom[L] = ok[L] ? (ploc[nprom] = L, nprom++) : -1;
+    free(ok);
+    if (nprom == 0) { free(prom); free(ploc); return 0; }
+
+    /* 2. CFG + dominance. */
+    int nbb, *l2b;
+    struct bb *bb = build_cfg(fn, &nbb, &l2b);
+    int *order = xmalloc((size_t)nbb * sizeof *order), norder;
+    compute_rpo(bb, nbb, order, &norder);
+    if (norder != nbb) {   /* unreachable blocks: bail rather than mis-dominate */
+        free(order); free(l2b);
+        for (int i = 0; i < nbb; i++) free(bb[i].pred);
+        free(bb); free(prom); free(ploc); return 0;
+    }
+    compute_idom(bb, order, norder);
+    int **df = xcalloc((size_t)nbb, sizeof *df);
+    int *ndf = xcalloc((size_t)nbb, sizeof *ndf);
+    compute_df(bb, nbb, df, ndf);
+
+    /* 3. Phi insertion at the iterated dominance frontier of each var's defs. */
+    char *hasphi = xcalloc((size_t)nbb * (size_t)nprom, 1);
+    int *work = xmalloc((size_t)nbb * sizeof *work);
+    for (int pidx = 0; pidx < nprom; pidx++) {
+        int L = ploc[pidx], nw = 0;
+        char *ondef = xcalloc((size_t)nbb, 1);
+        for (int bI = 0; bI < nbb; bI++)
+            for (int i = bb[bI].start; i < bb[bI].end; i++)
+                if (fn->ins[i].op == IR_STVAR && fn->ins[i].dst == L) {
+                    if (!ondef[bI]) { ondef[bI] = 1; work[nw++] = bI; }
+                    break;
+                }
+        while (nw) {
+            int x = work[--nw];
+            for (int j = 0; j < ndf[x]; j++) {
+                int d = df[x][j];
+                if (hasphi[d * nprom + pidx]) continue;
+                hasphi[d * nprom + pidx] = 1;
+                bb[d].phi_local = xrealloc(bb[d].phi_local, (size_t)(bb[d].nphi+1)*sizeof(int));
+                bb[d].phi_res   = xrealloc(bb[d].phi_res,   (size_t)(bb[d].nphi+1)*sizeof(int));
+                bb[d].phi_local[bb[d].nphi] = L;
+                bb[d].phi_res[bb[d].nphi] = fn->nvregs++;
+                bb[d].nphi++;
+                if (!ondef[d]) { ondef[d] = 1; work[nw++] = d; }
+            }
+        }
+        free(ondef);
+    }
+    for (int b = 0; b < nbb; b++) if (bb[b].nphi) {
+        bb[b].phi_inc = xcalloc((size_t)bb[b].npred, sizeof *bb[b].phi_inc);
+        for (int k = 0; k < bb[b].npred; k++)
+            bb[b].phi_inc[k] = xmalloc((size_t)bb[b].nphi * sizeof(int));
+    }
+
+    /* 4. Rename down the dominator tree. Each prom has a version stack; an entry
+     * "undef" temp (0) gives an uninitialised read a defined value. */
+    int *undef = xmalloc((size_t)nprom * sizeof *undef);
+    int **stk = xmalloc((size_t)nprom * sizeof *stk);
+    int *sp = xcalloc((size_t)nprom, sizeof *sp);
+    int *scap = xcalloc((size_t)nprom, sizeof *scap);
+    for (int p = 0; p < nprom; p++) {
+        undef[p] = fn->nvregs++;
+        stk[p] = xmalloc(sizeof(int) * 8); scap[p] = 8;
+        stk[p][sp[p]++] = undef[p];
+    }
+    /* explicit dominator-tree DFS (children = blocks whose idom is this block) */
+    int *dstk = xmalloc((size_t)nbb * sizeof *dstk);
+    int *dpushed = xcalloc((size_t)nbb * nprom, sizeof *dpushed); /* per (block,prom) */
+    char *entered = xcalloc((size_t)nbb, 1);
+    int dsp = 0; dstk[dsp++] = 0;
+    while (dsp) {
+        int b = dstk[dsp - 1];
+        if (!entered[b]) {
+            entered[b] = 1;
+            /* phi defs become the current version */
+            for (int k = 0; k < bb[b].nphi; k++) {
+                int pidx = prom[bb[b].phi_local[k]];
+                if (sp[pidx] == scap[pidx]) { scap[pidx]*=2; stk[pidx]=xrealloc(stk[pidx],(size_t)scap[pidx]*sizeof(int)); }
+                stk[pidx][sp[pidx]++] = bb[b].phi_res[k];
+                dpushed[b * nprom + pidx]++;
+            }
+            for (int i = bb[b].start; i < bb[b].end; i++) {
+                struct ir_ins *in = &fn->ins[i];
+                if (in->op == IR_LDVAR && in->a >= 0 && in->a < nvars && prom[in->a] >= 0) {
+                    int pidx = prom[in->a];
+                    in->op = IR_MOV; in->a = stk[pidx][sp[pidx]-1]; in->b = -1;
+                } else if (in->op == IR_STVAR && in->dst >= 0 && in->dst < nvars && prom[in->dst] >= 0) {
+                    int pidx = prom[in->dst];
+                    if (sp[pidx] == scap[pidx]) { scap[pidx]*=2; stk[pidx]=xrealloc(stk[pidx],(size_t)scap[pidx]*sizeof(int)); }
+                    stk[pidx][sp[pidx]++] = in->a;   /* the stored temp is the new version */
+                    dpushed[b * nprom + pidx]++;
+                    in->op = IR_MOV; in->dst = -1; in->a = -1;  /* mark: drop in rebuild */
+                }
+            }
+            /* fill successors' phi incoming from this block */
+            for (int s = 0; s < bb[b].nsucc; s++) {
+                int sb = bb[b].succ[s];
+                if (!bb[sb].nphi) continue;
+                int pk = -1;
+                for (int k = 0; k < bb[sb].npred; k++) if (bb[sb].pred[k]==b){pk=k;break;}
+                for (int k = 0; k < bb[sb].nphi; k++) {
+                    int pidx = prom[bb[sb].phi_local[k]];
+                    bb[sb].phi_inc[pk][k] = stk[pidx][sp[pidx]-1];
+                }
+            }
+            /* push dom-tree children */
+            for (int c = 0; c < nbb; c++)
+                if (c != 0 && bb[c].idom == b && !entered[c]) dstk[dsp++] = c;
+        } else {
+            /* leaving b: pop its versions */
+            for (int p = 0; p < nprom; p++) sp[p] -= dpushed[b * nprom + p];
+            dsp--;
+        }
+    }
+
+    /* 5. Rebuild the linear IR out of SSA. */
+    struct ibuf nb = { 0, 0, 0 };
+    for (int p = 0; p < nprom; p++) {   /* entry undef defs */
+        struct ir_ins *c = ib_push(&nb);
+        c->op = IR_CONST; c->dst = undef[p]; c->imm = 0;
+        c->w = ty_size(fn->src->var_tys[ploc[p]]) == 8 ? 8 : 4;
+    }
+    struct { int lbl, from, edge_pred; } *tramp = NULL; int ntramp = 0, ctramp = 0;
+    for (int b = 0; b < nbb; b++) {
+        int hasterm = bb[b].end > bb[b].start;
+        enum ir_op top = hasterm ? fn->ins[bb[b].end - 1].op : IR_UD2;
+        int isterm = top == IR_JMP || top == IR_BRZ || top == IR_BRNZ ||
+                     top == IR_RET || top == IR_UD2;
+        int body_end = (hasterm && isterm) ? bb[b].end - 1 : bb[b].end;
+        for (int i = bb[b].start; i < body_end; i++)
+            if (!(fn->ins[i].op == IR_MOV && fn->ins[i].dst < 0))   /* dropped store */
+                *ib_push(&nb) = fn->ins[i];
+        if (top == IR_RET || top == IR_UD2) {
+            if (isterm) *ib_push(&nb) = fn->ins[bb[b].end - 1];
+        } else if (top == IR_JMP && isterm) {
+            emit_edge_copies(&nb, bb, bb[b].succ[0], b, fn);
+            *ib_push(&nb) = fn->ins[bb[b].end - 1];
+        } else if ((top == IR_BRZ || top == IR_BRNZ) && isterm) {
+            struct ir_ins br = fn->ins[bb[b].end - 1];   /* branch-taken = succ[0] */
+            int taken = bb[b].succ[0];
+            if (bb[taken].nphi) {                        /* trampoline the taken edge */
+                int Lt = fn->nlabels++;
+                if (ntramp == ctramp) { ctramp = ctramp?ctramp*2:8;
+                    tramp = xrealloc(tramp, (size_t)ctramp*sizeof *tramp); }
+                tramp[ntramp].lbl = Lt; tramp[ntramp].from = b;
+                tramp[ntramp].edge_pred = taken; ntramp++;
+                br.label = Lt;
+            }
+            *ib_push(&nb) = br;
+            if (bb[b].nsucc > 1)                         /* fall-through copies (inline) */
+                emit_edge_copies(&nb, bb, bb[b].succ[1], b, fn);
+        } else {   /* falls through to the next block */
+            if (bb[b].nsucc > 0)
+                emit_edge_copies(&nb, bb, bb[b].succ[0], b, fn);
+        }
+    }
+    /* The last real block may fall off the end — an implicit return that the
+     * original linear IR carries no explicit RET for (codegen returns at the
+     * function's physical end). Trampoline blocks are appended next, so a
+     * fall-through last block would run straight into one. Cap it with a void
+     * RET. Only a block that does NOT end in an unconditional jump/ret can
+     * reach the next physical instruction, so only those need the cap. */
+    if (ntramp > 0 && nbb > 0) {
+        enum ir_op lt = bb[nbb - 1].end > bb[nbb - 1].start
+                        ? fn->ins[bb[nbb - 1].end - 1].op : IR_UD2;
+        if (lt != IR_JMP && lt != IR_RET && lt != IR_UD2) {
+            struct ir_ins *r = ib_push(&nb);
+            r->op = IR_RET; r->a = -1;
+        }
+    }
+    for (int t = 0; t < ntramp; t++) {   /* trampoline blocks: label; copies; jmp */
+        struct ir_ins *lb = ib_push(&nb);
+        lb->op = IR_LABEL; lb->label = tramp[t].lbl;
+        emit_edge_copies(&nb, bb, tramp[t].edge_pred, tramp[t].from, fn);
+        struct ir_ins *jp = ib_push(&nb);
+        int origlbl = -1;
+        for (int i = bb[tramp[t].edge_pred].start; i < bb[tramp[t].edge_pred].end; i++)
+            if (fn->ins[i].op == IR_LABEL) { origlbl = fn->ins[i].label; break; }
+        jp->op = IR_JMP; jp->label = origlbl;
+    }
+    free(tramp);
+
+    free(fn->ins);
+    fn->ins = nb.p; fn->nins = nb.n; fn->cap = nb.cap;
+
+    /* The rebuild renumbered every instruction, so the local scope ranges (which
+     * are instruction indices, used by codegen to coalesce disjoint-lifetime
+     * locals) are now stale. Drop them: codegen then gives each surviving local
+     * its own slot — correct, if a touch larger. Promoted locals are dead. */
+    if (fn->var_scope_lo) {
+        free(fn->var_scope_lo); free(fn->var_scope_hi);
+        fn->var_scope_lo = fn->var_scope_hi = NULL;
+    }
+
+    for (int p = 0; p < nprom; p++) free(stk[p]);
+    free(undef); free(stk); free(sp); free(scap);
+    free(dstk); free(dpushed); free(entered);
+    free(hasphi); free(work); free(prom); free(ploc);
+    mem2reg_free(bb, nbb, df, ndf, l2b, order);
+    return 1;
+}
+
 /* ---- local store-forwarding (a lightweight mem2reg) ----
  *
  * EmbIR keeps locals in memory (STVAR/LDVAR). Within an extended basic block a
@@ -892,8 +1349,12 @@ static void inline_unit(struct ir_unit *iu)
 
 /* ---- driver ---- */
 
+static int g_mem2reg;   /* -O2: promote locals to SSA before the fixpoint */
+
 static void opt_func(struct ir_func *fn)
 {
+    if (g_mem2reg)
+        pass_mem2reg(fn);         /* global mem2reg (subsumes store-forwarding) */
     int changed = 1, guard = 0;
     while (changed && guard++ < 1000) {
         changed = 0;
@@ -914,6 +1375,7 @@ void opt_run(struct ir_unit *iu, int level)
 {
     if (level < 1)
         return;
+    g_mem2reg = level >= 2;       /* SSA mem2reg: promote scalar locals to temps */
     if (level >= 2)               /* inline before the per-function passes clean up */
         inline_unit(iu);
     for (int f = 0; f < iu->nfuncs; f++)
