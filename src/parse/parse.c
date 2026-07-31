@@ -92,7 +92,7 @@ static int tok_is_type_start(enum tok_kind k)
            k == TOK_KW_STRUCT || k == TOK_KW_UNION || k == TOK_KW_ENUM ||
            k == TOK_KW_CONST || k == TOK_KW_VOLATILE ||
            k == TOK_KW_FLOAT || k == TOK_KW_DOUBLE || k == TOK_KW_BOOL ||
-           k == TOK_KW_ALIGNAS || k == TOK_KW_TYPEOF;
+           k == TOK_KW_ALIGNAS || k == TOK_KW_TYPEOF || k == TOK_KW_ATOMIC;
 }
 
 /* const/restrict are accepted and IGNORED (no const-correctness enforcement).
@@ -102,11 +102,21 @@ static int tok_is_type_start(enum tok_kind k)
 static int skip_quals(struct parser *ps)
 {
     int vol = 0;
-    while (cur(ps)->kind == TOK_KW_CONST ||
-           cur(ps)->kind == TOK_KW_VOLATILE ||
-           cur(ps)->kind == TOK_KW_RESTRICT) {
-        if (cur(ps)->kind == TOK_KW_VOLATILE) vol = 1;
-        advance(ps);
+    for (;;) {
+        enum tok_kind k = cur(ps)->kind;
+        if (k == TOK_KW_CONST || k == TOK_KW_RESTRICT) { advance(ps); continue; }
+        if (k == TOK_KW_VOLATILE) { vol = 1; advance(ps); continue; }
+        if (k == TOK_KW_ATOMIC) {
+            /* `_Atomic(type)` is a specifier, not a qualifier — leave it for the
+             * type-spec handler. Bare `_Atomic` is a qualifier: EmbCC maps atomic
+             * to volatile, so an aligned scalar load/store still happens and is
+             * not reordered/removed. (Lock-prefixed RMW still needs __atomic_*.) */
+            struct lexer save = ps->lx;
+            advance(ps);
+            if (cur(ps)->kind == TOK_LPAREN) { ps->lx = save; break; }
+            vol = 1; continue;
+        }
+        break;
     }
     return vol;
 }
@@ -403,6 +413,15 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
         expect(ps, TOK_RPAREN, "')' after typeof");
         return t;
     }
+    /* `_Atomic(type)` atomic-type-specifier — mapped to a volatile type. */
+    if (cur(ps)->kind == TOK_KW_ATOMIC) {
+        advance(ps);
+        expect(ps, TOK_LPAREN, "'(' after _Atomic");
+        struct type *t = parse_type_name(ps, parse_type_spec(ps, 0));
+        expect(ps, TOK_RPAREN, "')' after _Atomic(type)");
+        *vol = 1;
+        return t;
+    }
     /* struct/union/enum first (cannot mix with other specifiers) */
     if (cur(ps)->kind == TOK_KW_STRUCT || cur(ps)->kind == TOK_KW_UNION ||
         cur(ps)->kind == TOK_KW_ENUM) {
@@ -456,6 +475,12 @@ static struct type *parse_type_spec_inner(struct parser *ps, int allow_body,
             advance(ps); continue;
         }
         else if (k == TOK_KW_ALIGNAS) { consume_alignas(ps); continue; }
+        else if (k == TOK_KW_ATOMIC) {   /* qualifier form after a type spec */
+            struct lexer save = ps->lx;
+            advance(ps);
+            if (cur(ps)->kind == TOK_LPAREN) { ps->lx = save; break; }
+            *vol = 1; continue;
+        }
         else break;
         any++;
         advance(ps);
