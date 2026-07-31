@@ -190,22 +190,21 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
  * prologue-save set — a function saves at most these five. */
 #define NCALLEE 5
 
-/* A non-leaf function's pool. Beyond the callee-saved five it also gets the two
- * caller-saved GPRs that are NEVER an argument register — r10, r11 — but only
- * for a value whose live range does not cross a call (a call clobbers them;
- * see `crosses` below). They come first so a short-lived value prefers them and
- * skips the prologue save. r8/r9 are deliberately excluded: they ARE argument
- * registers, and the sequential argument-setup move (case IR_CALL) would clobber
- * a source still held in one before it is read. */
-#define NNONLEAF 7
-static const int NONLEAF_POOL[NNONLEAF] = { 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
+/* A VARIADIC function's pool: the callee-saved five plus the two caller-saved
+ * GPRs that are not part of the argument register file — r10, r11. r8/r9 are
+ * held out because a variadic prologue saves the six integer arg registers
+ * (rdi..r9) to the register-save area. The caller-saved pair come first so a
+ * short-lived value prefers them and skips the prologue save. */
+#define NVARIADIC 7
+static const int VARIADIC_POOL[NVARIADIC] = { 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
 
-/* A LEAF, non-variadic function may also use the caller-saved r8..r11 with NO
- * save/restore: codegen touches those only at call sites (a leaf has none) and
- * the variadic register-save (excluded). They come first in the pool so they
- * are preferred and the prologue save is skipped entirely; the callee-saved
- * five follow as overflow (and are still saved if used). NLEAF sizes the
- * allocator's per-colour arrays for either pool. */
+/* Every non-variadic function's pool: the four caller-saved GPRs r8..r11 first
+ * (preferred, no prologue save), then the callee-saved five. A caller-saved
+ * register is only sound for a value that does NOT cross a call (a call clobbers
+ * them) and, for r8/r9, is not itself a call argument (the sequential arg-setup
+ * move would clobber a source still held there) — enforced by the `crosses` /
+ * `is_arg` masks in colouring. A leaf function has neither constraint, so it
+ * gets all nine freely. NLEAF sizes the allocator's per-colour arrays. */
 #define NLEAF 9
 static const int LEAF_POOL[NLEAF] = { 8, 9, 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
 
@@ -386,14 +385,13 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     *nused_out = 0;
     if (nvr == 0) return loc;
 
-    /* A leaf, non-variadic function gets the wider pool (caller-saved r8..r11
-     * first, no save/restore); everything else uses the callee-saved five. */
-    int is_leaf = 1;
-    for (int i = 0; i < nins; i++)
-        if (fn->ins[i].op == IR_CALL) { is_leaf = 0; break; }
-    int use_leaf = is_leaf && !fn->src->is_varargs;
-    const int *POOL = use_leaf ? LEAF_POOL : NONLEAF_POOL;
-    int NP = use_leaf ? NLEAF : NNONLEAF;
+    /* Non-variadic functions get the full nine-register pool; caller-saved
+     * registers in it are then masked per value by `crosses`/`is_arg` below (a
+     * leaf, having no calls, is never masked). A variadic function reserves the
+     * argument register file, so it drops r8/r9. */
+    int variadic = fn->src->is_varargs;
+    const int *POOL = variadic ? VARIADIC_POOL : LEAF_POOL;
+    int NP = variadic ? NVARIADIC : NLEAF;
 
     int *first = xmalloc((size_t)nvr * sizeof *first);
     int *last  = xmalloc((size_t)nvr * sizeof *last);
@@ -406,28 +404,38 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     unsigned long *liveout = compute_live_intervals(fn, first, last,
                                                     &livein, &defv, &lwords);
 
-    /* A value LIVE-OUT of a call survives it, so it cannot sit in a caller-saved
-     * register (the call clobbers those) — it must take a callee-saved reg or
-     * memory. The call's own result (defv[i]) is born at the call, so it does
-     * not "cross" this one. Only meaningful for the non-leaf pool, whose first
-     * entries are caller-saved; a leaf has no calls, so `crosses` stays all-0. */
+    /* Two constraints on putting a value in a caller-saved register, both keyed
+     * off the calls in this function (a leaf has none, so both stay all-0):
+     *   crosses[v] — v is LIVE-OUT of a call, so it survives the call's clobber
+     *     of every caller-saved register; it must take a callee-saved reg or
+     *     memory. The call's own result (defv[i]) is born at the call, so it
+     *     does not cross THIS one.
+     *   is_arg[v]  — v is passed AS an argument to a call. Argument setup moves
+     *     sources into rdi..r9 in sequence, so a value that is both an argument
+     *     and held in r8/r9 could be clobbered before it is read. Keeping such a
+     *     value out of r8/r9 (it may still use r10/r11) makes the existing
+     *     in-order arg setup safe without a parallel move. */
     char *crosses = xcalloc((size_t)(nvr ? nvr : 1), 1);
-    if (!use_leaf)
-        for (int i = 0; i < nins; i++) {
-            if (fn->ins[i].op != IR_CALL)
-                continue;
-            unsigned long *lo = liveout + (size_t)i * lwords;
-            for (int w = 0; w < lwords; w++) {
-                unsigned long bits = lo[w];
-                while (bits) {
-                    int b = 0; unsigned long t = bits;
-                    while (!(t & 1)) { t >>= 1; b++; }
-                    int v = w * 64 + b;
-                    if (v < nvr && v != defv[i]) crosses[v] = 1;
-                    bits &= bits - 1;
-                }
+    char *is_arg  = xcalloc((size_t)(nvr ? nvr : 1), 1);
+    for (int i = 0; i < nins; i++) {
+        if (fn->ins[i].op != IR_CALL)
+            continue;
+        unsigned long *lo = liveout + (size_t)i * lwords;
+        for (int w = 0; w < lwords; w++) {
+            unsigned long bits = lo[w];
+            while (bits) {
+                int b = 0; unsigned long t = bits;
+                while (!(t & 1)) { t >>= 1; b++; }
+                int v = w * 64 + b;
+                if (v < nvr && v != defv[i]) crosses[v] = 1;
+                bits &= bits - 1;
             }
         }
+        for (int k = 0; k < fn->ins[i].nargs; k++) {
+            int av = fn->ins[i].argv[k].vreg;
+            if (av >= 0 && av < nvr) is_arg[av] = 1;
+        }
+    }
     for (int v = 0; v < nvr; v++) {
         if (v >= nvars) {
             elig[v] = 1;                          /* a temp */
@@ -636,11 +644,20 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 bits &= bits - 1;
             }
         }
-        /* A value that crosses a call may not take a caller-saved register: a
-         * call clobbers those, so forbid them here (leaving callee-saved/spill). */
-        if (crosses[eidx[e]])
-            for (int k = 0; k < NP; k++)
-                if (!is_callee_saved(POOL[k])) taken |= 1 << k;
+        /* Forbid the caller-saved registers a value may not take: all of them if
+         * it crosses a call, and r8/r9 additionally if it is a call argument.
+         * What remains is callee-saved (or a spill). */
+        {
+            int v = eidx[e];
+            if (crosses[v] || is_arg[v])
+                for (int k = 0; k < NP; k++) {
+                    int reg = POOL[k];
+                    if (is_callee_saved(reg))
+                        continue;
+                    if (crosses[v] || (reg == 8 || reg == 9))
+                        taken |= 1 << k;
+                }
+        }
         /* preferred colours: registers a colored, non-interfering move-partner
          * already holds (and that are still free) */
         int want = 0;
@@ -692,7 +709,7 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (reg_used[k] && is_callee_saved(POOL[k])) used_out[nu++] = POOL[k];
     *nused_out = nu;
 
-    free(first); free(last); free(elig); free(crosses);
+    free(first); free(last); free(elig); free(crosses); free(is_arg);
     free(eof); free(eidx); free(adj); free(pref);
     free(members); free(order);
     free(liveout); free(livein); free(defv);
