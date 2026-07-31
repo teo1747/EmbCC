@@ -1277,6 +1277,26 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_movs_store(text, 0, sd[i->dst], i->w);
                 break;
             }
+            /* Address-generation fusion: an `ADD base, X` whose SOLE use is the
+             * immediately-following load folds into that load's addressing,
+             * dropping the address computation. X a register -> base+index
+             * (`p[i]`); X a constant -> base+disp (`p->field`). */
+            if (g_regcache && usecnt && i->op == IR_ADD &&
+                in_reg(i->a) && n + 1 < fn->nins &&
+                fn->ins[n + 1].op == IR_LOAD && fn->ins[n + 1].a == i->dst &&
+                usecnt[i->dst] == 1 &&
+                (i->imm_b ? 1 : in_reg(i->b))) {
+                struct ir_ins *ld = &fn->ins[n + 1];
+                if (i->imm_b)
+                    x86_load_basedisp_rax(text, g_loc[i->a], (int)i->imm,
+                                          ld->size, ld->sign, ld->w);
+                else
+                    x86_load_baseindex_rax(text, g_loc[i->a], g_loc[i->b], 1,
+                                           ld->size, ld->sign, ld->w);
+                cg_store(text, sd, ld->dst, ld->w);
+                n++;                               /* consume the fused load */
+                break;
+            }
             {
                 int aop = i->op == IR_ADD ? '+' :
                           i->op == IR_SUB ? '-' :

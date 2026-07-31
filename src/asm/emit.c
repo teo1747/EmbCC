@@ -479,6 +479,99 @@ static void modrm_base0(struct code *c, int reg, int base)
     }
 }
 
+/* ModRM+SIB for [base + index*scale], disp 0, register field `reg`. Always uses
+ * a SIB byte (rm=100). A base whose low 3 bits are 101 (rbp/r13) still needs a
+ * mod=01 disp8=0. The index is an allocated register, never rsp, so rm-index 100
+ * (= "no index") never collides. */
+static void modrm_baseindex0(struct code *c, int reg, int base, int index,
+                             int scale)
+{
+    int ss = scale == 8 ? 3 : scale == 4 ? 2 : scale == 2 ? 1 : 0;
+    int mod = (base & 7) == 5 ? 1 : 0;
+    code_byte(c, (mod << 6) | ((reg & 7) << 3) | 4);          /* rm=100 -> SIB */
+    code_byte(c, (ss << 6) | ((index & 7) << 3) | (base & 7));
+    if (mod == 1)
+        code_byte(c, 0x00);
+}
+
+/* Load into rax from [base + index*scale] (scale 1/2/4/8), same extension matrix
+ * as x86_load_mem_rax — folds an address computation into the load. REX.X/REX.B
+ * carry high index/base registers. */
+void x86_load_baseindex_rax(struct code *c, int base, int index, int scale,
+                            int size, int sign, int w)
+{
+    int rexXB = ((index & 8) ? 2 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexXB;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_baseindex0(c, 0, base, index, scale);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexXB);
+            code_byte(c, 0x63);
+        } else {
+            int rex = 0x40 | rexXB;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_baseindex0(c, 0, base, index, scale);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexXB);
+        code_byte(c, 0x8b);
+        modrm_baseindex0(c, 0, base, index, scale);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
+/* Load into rax from [base + disp], same extension matrix as x86_load_mem_rax —
+ * folds a constant-offset address (a struct field, `p->m`) into the load.
+ * modrm_base carries the disp and the rsp/r12 SIB case; REX.B a high base. */
+void x86_load_basedisp_rax(struct code *c, int base, int disp,
+                           int size, int sign, int w)
+{
+    int rexb = (base & 8) ? 1 : 0;
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexb;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base(c, 0, base, disp);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexb);
+            code_byte(c, 0x63);
+        } else {
+            int rex = 0x40 | rexb;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_base(c, 0, base, disp);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexb);
+        code_byte(c, 0x8b);
+        modrm_base(c, 0, base, disp);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
 /* Load into rax straight from [base], with the same extension matrix as
  * x86_load_mem_rax — no `mov base,rax` first. REX.B carries a high base
  * (r8..r15); modrm_base0 handles the rsp/rbp/r12/r13 addressing traps. */
