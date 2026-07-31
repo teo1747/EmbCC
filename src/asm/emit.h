@@ -126,6 +126,7 @@ void x86_test_eax(struct code *c, int w);
 int x86_jz_rel32(struct code *c);
 int x86_jnz_rel32(struct code *c);
 int x86_jmp_rel32(struct code *c);
+int x86_jcc_rel32(struct code *c, int setcc); /* setcc cond byte (0x9x) -> Jcc rel32 */
 
 /* call rel32 with a zero placeholder; returns the rel32 field offset. */
 int x86_call_rel32(struct code *c);

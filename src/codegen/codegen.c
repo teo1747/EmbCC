@@ -814,6 +814,57 @@ struct sites {
 
 /* setcc opcode byte per predicate; pointers and unsigned integers use
  * the unsigned condition set (b/be/a/ae). */
+/* The negated predicate — for fusing a comparison into the branch that consumes
+ * it: `brz (a EQ b)` jumps exactly when `a NE b`. */
+static enum binop negate_pred(enum binop p)
+{
+    switch (p) {
+    case B_EQ: return B_NE; case B_NE: return B_EQ;
+    case B_LT: return B_GE; case B_GE: return B_LT;
+    case B_GT: return B_LE; case B_LE: return B_GT;
+    default:   return p;
+    }
+}
+
+/* Per-vreg use count over the whole function (a source operand appearing once
+ * per instruction it is read in), mirroring the liveness USE enumeration. Used
+ * to prove a comparison result feeds nothing but the branch that follows it, so
+ * the two can fuse into a single `cmp; jcc`. cnt has fn->nvregs entries. */
+static void count_vreg_uses(struct ir_func *fn, int *cnt)
+{
+    for (int v = 0; v < fn->nvregs; v++) cnt[v] = 0;
+#define UZ(x) do { int _v=(x); if (_v>=0 && _v<fn->nvregs) cnt[_v]++; } while (0)
+    for (int i = 0; i < fn->nins; i++) {
+        struct ir_ins *s = &fn->ins[i];
+        switch (s->op) {
+        case IR_MOV: case IR_NEG: case IR_BNOT: case IR_EXT: case IR_BSWAP:
+        case IR_I2F: case IR_F2I: case IR_F2F: case IR_LOAD: case IR_LDVAR:
+        case IR_ADDR: case IR_STVAR: case IR_VA_START:
+        case IR_RET: case IR_BRZ: case IR_BRNZ:
+            UZ(s->a); break;
+        case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+        case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SHR:
+        case IR_CMP: case IR_STORE: case IR_MEMCPY: case IR_MEMZERO:
+        case IR_XCHG: case IR_XADD:
+            UZ(s->a); UZ(s->b); break;
+        case IR_CMPXCHG:
+            UZ(s->a); UZ(s->b); UZ(s->c); break;
+        case IR_CALL:
+            if (s->indirect) UZ(s->a);
+            for (int k = 0; k < s->nargs; k++) UZ(s->argv[k].vreg);
+            break;
+        case IR_ASM:
+            if (s->asm_ir) {
+                for (int k = 0; k < s->asm_ir->nin; k++) UZ(s->asm_ir->in[k].temp);
+                for (int k = 0; k < s->asm_ir->nout; k++) UZ(s->asm_ir->out[k].temp);
+            }
+            break;
+        default: break;
+        }
+    }
+#undef UZ
+}
+
 static int cc_for(enum binop pred, int sign)
 {
     switch (pred) {
@@ -1122,6 +1173,11 @@ static void gen_func(struct ir_func *fn, struct code *text,
 
     rc_nvars = fn->src->nvars;
     cg_reset();
+    /* Use counts drive comparison/branch fusion below (a compare feeding only
+     * the next branch). Built once; freed after the loop. */
+    int *usecnt = fn->nvregs
+        ? xmalloc((size_t)fn->nvregs * sizeof *usecnt) : (int *)0;
+    if (usecnt) count_vreg_uses(fn, usecnt);
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
         /* -g: a row where the source line changes. text->len is the .text
@@ -1284,6 +1340,35 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                          i->pred == B_LE ? B_GE : i->pred,
                                          0));
                 cg_store(text, sd, i->dst, 4);   /* the 0/1 result is an int */
+                break;
+            }
+            /* Fuse an integer comparison into the branch that solely consumes
+             * it: `cmp; jcc` instead of setcc/movzx/store then load/test/jz.
+             * Sound only when the next op is that branch on this result and the
+             * result is used nowhere else. Gated to the optimizing path so -O0
+             * stays byte-identical (the self-host fixed point). */
+            if (g_regcache && usecnt && n + 1 < fn->nins &&
+                (fn->ins[n + 1].op == IR_BRZ || fn->ins[n + 1].op == IR_BRNZ) &&
+                fn->ins[n + 1].a == i->dst && usecnt[i->dst] == 1) {
+                struct ir_ins *br = &fn->ins[n + 1];
+                cg_load(text, sd, i->a, i->w, 0, i->w);
+                if (in_reg(i->b))
+                    x86_cmp_rr(text, REG_RAX, g_loc[i->b], i->w);
+                else
+                    x86_cmp_eax_mem(text, sd[i->b], i->w);
+                /* BRNZ jumps when the comparison is true; BRZ when it is false. */
+                enum binop jp = br->op == IR_BRNZ ? i->pred
+                                                  : negate_pred(i->pred);
+                int patch = x86_jcc_rel32(text, cc_for(jp, i->sign));
+                cg_reset();                       /* control splits here */
+                if (nbrs == capbrs) {
+                    capbrs = capbrs ? capbrs * 2 : 16;
+                    brs = xrealloc(brs, (size_t)capbrs * sizeof *brs);
+                }
+                brs[nbrs].patch_off = patch;
+                brs[nbrs].label = br->label;
+                nbrs++;
+                n++;                              /* consume the fused branch */
                 break;
             }
             cg_load(text, sd, i->a, i->w, 0, i->w);
@@ -1756,6 +1841,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
     free(label_off);
     free(sd);
     free(loc);
+    free(usecnt);
     g_loc = NULL;
 
     f->code_len = text->len - f->code_off;

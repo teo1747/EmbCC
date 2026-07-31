@@ -776,6 +776,17 @@ int x86_jmp_rel32(struct code *c)
     return off;
 }
 
+/* Conditional jump rel32 for a setcc condition byte (0x9x, as cc_for returns):
+ * the Jcc opcode shares the condition's low nibble (0f 8x). Patch offset back. */
+int x86_jcc_rel32(struct code *c, int setcc)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0x80 | (setcc & 0x0f));
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
 int x86_call_rel32(struct code *c)
 {
     code_byte(c, 0xe8);
