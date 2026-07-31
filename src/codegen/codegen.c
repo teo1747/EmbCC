@@ -404,19 +404,13 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     unsigned long *liveout = compute_live_intervals(fn, first, last,
                                                     &livein, &defv, &lwords);
 
-    /* Two constraints on putting a value in a caller-saved register, both keyed
-     * off the calls in this function (a leaf has none, so both stay all-0):
-     *   crosses[v] — v is LIVE-OUT of a call, so it survives the call's clobber
-     *     of every caller-saved register; it must take a callee-saved reg or
-     *     memory. The call's own result (defv[i]) is born at the call, so it
-     *     does not cross THIS one.
-     *   is_arg[v]  — v is passed AS an argument to a call. Argument setup moves
-     *     sources into rdi..r9 in sequence, so a value that is both an argument
-     *     and held in r8/r9 could be clobbered before it is read. Keeping such a
-     *     value out of r8/r9 (it may still use r10/r11) makes the existing
-     *     in-order arg setup safe without a parallel move. */
+    /* A value LIVE-OUT of a call survives it, so it cannot sit in a caller-saved
+     * register (the call clobbers all of them) — it takes a callee-saved reg or
+     * memory. The call's own result (defv[i]) is born at the call, so it does
+     * not cross THIS one. A value that is merely a call ARGUMENT may still use
+     * r8/r9: the parallel move in case IR_CALL shuffles arguments already held
+     * in r8/r9 without clobbering. A leaf has no calls, so `crosses` stays 0. */
     char *crosses = xcalloc((size_t)(nvr ? nvr : 1), 1);
-    char *is_arg  = xcalloc((size_t)(nvr ? nvr : 1), 1);
     for (int i = 0; i < nins; i++) {
         if (fn->ins[i].op != IR_CALL)
             continue;
@@ -430,10 +424,6 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 if (v < nvr && v != defv[i]) crosses[v] = 1;
                 bits &= bits - 1;
             }
-        }
-        for (int k = 0; k < fn->ins[i].nargs; k++) {
-            int av = fn->ins[i].argv[k].vreg;
-            if (av >= 0 && av < nvr) is_arg[av] = 1;
         }
     }
     for (int v = 0; v < nvr; v++) {
@@ -644,20 +634,11 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 bits &= bits - 1;
             }
         }
-        /* Forbid the caller-saved registers a value may not take: all of them if
-         * it crosses a call, and r8/r9 additionally if it is a call argument.
-         * What remains is callee-saved (or a spill). */
-        {
-            int v = eidx[e];
-            if (crosses[v] || is_arg[v])
-                for (int k = 0; k < NP; k++) {
-                    int reg = POOL[k];
-                    if (is_callee_saved(reg))
-                        continue;
-                    if (crosses[v] || (reg == 8 || reg == 9))
-                        taken |= 1 << k;
-                }
-        }
+        /* A value that crosses a call may not take a caller-saved register: the
+         * call clobbers them, so forbid them here (leaving callee-saved/spill). */
+        if (crosses[eidx[e]])
+            for (int k = 0; k < NP; k++)
+                if (!is_callee_saved(POOL[k])) taken |= 1 << k;
         /* preferred colours: registers a colored, non-interfering move-partner
          * already holds (and that are still free) */
         int want = 0;
@@ -709,7 +690,7 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (reg_used[k] && is_callee_saved(POOL[k])) used_out[nu++] = POOL[k];
     *nused_out = nu;
 
-    free(first); free(last); free(elig); free(crosses); free(is_arg);
+    free(first); free(last); free(elig); free(crosses);
     free(eof); free(eidx); free(adj); free(pref);
     free(members); free(order);
     free(liveout); free(livein); free(defv);
@@ -1127,6 +1108,43 @@ static int cg_reg_move(struct code *text, int dst, int a, int w)
     if (g_loc[a] != g_loc[dst])
         x86_mov_rr_w(text, g_loc[dst], g_loc[a], w);
     return 1;
+}
+
+/* Emit a set of register-to-register moves that must take effect "in parallel":
+ * every dest receives its src's ORIGINAL value even when a dest is another
+ * move's src (a chain) or two moves swap (a cycle). All dests are distinct.
+ * Emit any move whose dest no pending move still needs as a source; when only
+ * cycles remain, break one by parking its dest in `scratch` (a register outside
+ * every src and dest — rax at a call site) and pointing its readers there. Used
+ * to shuffle call arguments among rdi..r9 when some already sit in r8/r9. */
+static void emit_reg_parallel_move(struct code *text, int *dest, int *src,
+                                   int n, int scratch)
+{
+    char done[16];
+    int remaining = 0;
+    for (int i = 0; i < n; i++) {
+        done[i] = (dest[i] == src[i]);       /* an identity move is a no-op */
+        if (!done[i]) remaining++;
+    }
+    while (remaining > 0) {
+        int progressed = 0;
+        for (int i = 0; i < n; i++) {
+            if (done[i]) continue;
+            int blocked = 0;
+            for (int j = 0; j < n; j++)
+                if (!done[j] && j != i && src[j] == dest[i]) { blocked = 1; break; }
+            if (blocked) continue;
+            x86_mov_reg_reg(text, dest[i], src[i]);
+            done[i] = 1; remaining--; progressed = 1;
+        }
+        if (progressed)
+            continue;
+        int c = -1;                          /* only cycles left: break one */
+        for (int i = 0; i < n; i++) if (!done[i]) { c = i; break; }
+        x86_mov_reg_reg(text, scratch, dest[c]);
+        for (int j = 0; j < n; j++)
+            if (!done[j] && src[j] == dest[c]) src[j] = scratch;
+    }
 }
 
 static void gen_func(struct ir_func *fn, struct code *text,
@@ -1819,6 +1837,37 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                  scratch_base + i->scratch);
                 ireg++;
             }
+            /* Register arguments already in a register (r8..r15/rbx) are moved
+             * as ONE parallel move: an argument sitting in r8/r9 must not be
+             * clobbered by an earlier argument's write to that same register.
+             * The indirect target (-> r11) joins the same shuffle. Memory- and
+             * xmm-sourced placements read from the frame, so they cannot clobber
+             * a register source and are emitted afterward. rax is the scratch:
+             * not an argument register, and free until the al count below. */
+            int mvdest[16], mvsrc[16], nmv = 0;
+            {
+                int pireg = ireg, pfreg = freg;
+                for (int k = 0; k < i->nargs; k++) {
+                    struct ir_arg *a = &i->argv[k];
+                    if (a->on_stack)
+                        continue;
+                    if (a->is_struct) {
+                        for (int q = 0; q < a->nclass; q++)
+                            if (a->cls[q] == CLASS_SSE) pfreg++; else pireg++;
+                    } else if (a->cls[0] == CLASS_SSE) {
+                        pfreg++;
+                    } else if (in_reg(a->vreg)) {
+                        mvdest[nmv] = x86_argreg(pireg++);
+                        mvsrc[nmv] = g_loc[a->vreg]; nmv++;
+                    } else {
+                        pireg++;
+                    }
+                }
+                if (i->indirect && in_reg(i->a)) {
+                    mvdest[nmv] = 11 /*r11*/; mvsrc[nmv] = g_loc[i->a]; nmv++;
+                }
+            }
+            emit_reg_parallel_move(text, mvdest, mvsrc, nmv, REG_RAX);
             for (int k = 0; k < i->nargs; k++) {
                 struct ir_arg *a = &i->argv[k];
                 if (a->on_stack)
@@ -1838,16 +1887,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 if (a->cls[0] == CLASS_SSE)
                     x86_movs_load(text, freg++, sd[a->vreg], a->size);
                 else if (in_reg(a->vreg))
-                    x86_mov_reg_reg(text, x86_argreg(ireg++), g_loc[a->vreg]);
+                    ireg++;              /* already placed by the parallel move */
                 else
                     x86_load_arg(text, ireg++, sd[a->vreg]);
             }
-            if (i->indirect) {
-                if (in_reg(i->a))
-                    x86_mov_reg_reg(text, 11 /*r11*/, g_loc[i->a]);
-                else
-                    x86_mov_r11_slot(text, sd[i->a]);
-            }
+            if (i->indirect && !in_reg(i->a))
+                x86_mov_r11_slot(text, sd[i->a]);   /* in-reg case done above */
             /* al = the number of VECTOR registers used. Zero was right
              * only while no floats existed; a variadic callee reads it
              * to find the register save area, so a wrong al is exactly
