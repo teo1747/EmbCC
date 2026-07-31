@@ -355,12 +355,17 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_FNUM:
         /* type assigned by the parser from the literal's shape */
         break;
-    case EXPR_STR:
-        /* char[N], decaying to char* like any array (sizeof sees the
-         * array through `undecayed`) */
-        e->undecayed = ty_array(ty_base(TY_CHAR, 0), (int)e->num);
-        e->ty = ty_ptr(ty_base(TY_CHAR, 0));
+    case EXPR_STR: {
+        /* char[N] (or wchar_t/char16_t/char32_t[N] for a wide literal),
+         * decaying to a pointer like any array (sizeof sees the array through
+         * `undecayed`). e->num is the element count including the NUL. */
+        struct type *elem = e->str_width == 4 ? ty_base(TY_INT, 0)
+                          : e->str_width == 2 ? ty_base(TY_SHORT, 1)
+                          : ty_base(TY_CHAR, 0);
+        e->undecayed = ty_array(elem, (int)e->num);
+        e->ty = ty_ptr(elem);
         break;
+    }
     case EXPR_VAR: {
         int i = scope_find(sc, e->name);
         if (i >= 0) {
@@ -1259,10 +1264,13 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
     }
     if (init->kind != EXPR_INITLIST) {
         if (ty->kind == TY_ARRAY) {
-            /* char a[] = "..." — the literal's bytes ARE the object */
+            /* char a[] = "..." (or a wide array from L""/u""/U"") — the
+             * literal's elements ARE the object. The array element must be an
+             * integer whose size matches the literal's element width. */
             if (init->kind == EXPR_STR &&
-                ty->pointee->kind == TY_CHAR) {
-                int len = (int)init->num;
+                ty_is_integer(ty->pointee) &&
+                ty_size(ty->pointee) == (init->str_width ? init->str_width : 1)) {
+                int len = (int)init->num, esz = ty_size(ty->pointee);
                 if (ty->count && ty->count < len - 1)
                     diag_at(u->file, init->line, init->col,
                                "initializer is longer than the array");
@@ -1272,8 +1280,8 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                     ch->kind = EXPR_NUM;
                     ch->line = init->line;
                     ch->num = (unsigned char)init->name[i];
-                    ch->ty = ty_base(TY_CHAR, 0);
-                    init_push(out, off + i, ty->pointee, ch);
+                    ch->ty = ty->pointee;
+                    init_push(out, off + i * esz, ty->pointee, ch);
                 }
                 return;
             }
@@ -1459,6 +1467,8 @@ static void lower_static_bytes(struct unit *u, int line, int size,
             rel[nrel].off = v[k].off;
             rel[nrel].str = (gt || ft) ? NULL : core->name;
             rel[nrel].str_len = (gt || ft) ? 0 : (int)core->num;
+            rel[nrel].str_width = (gt || ft) ? 1
+                                  : (core->str_width ? core->str_width : 1);
             rel[nrel].gtarget = gt;
             rel[nrel].ftarget = ft;
             rel[nrel].addend = addend;
@@ -1712,11 +1722,15 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             }
             if (s->expr && s->dty->kind == TY_ARRAY &&
                 s->expr->kind == EXPR_STR) {
-                /* char a[] = "..." : an omitted size is the literal's */
-                if (s->dty->pointee->kind != TY_CHAR)
+                /* char a[] = "..." (or a wide array from L""/u""/U"") : the
+                 * element must be an integer matching the literal's width; an
+                 * omitted size is the literal's element count. */
+                int w = s->expr->str_width ? s->expr->str_width : 1;
+                if (!ty_is_integer(s->dty->pointee) ||
+                    ty_size(s->dty->pointee) != w)
                     diag_at(u->file, s->line, s->col,
-                               "only a char array can be initialized "
-                               "from a string");
+                               "a string literal can only initialize an integer "
+                               "array whose element width matches it");
                 if (s->dty->count == 0)
                     s->dty = ty_array(s->dty->pointee,
                                       (int)s->expr->num);

@@ -53,6 +53,7 @@ struct expr {
     struct func *fref;    /* EXPR_VAR: a function used as a value —
                            * decays to pointer-to-function (sema) */
     int str_index;        /* EXPR_STR: unit string table slot (irgen) */
+    int str_width;        /* EXPR_STR: bytes/element (1 char, 2 char16, 4 wide) */
     enum binop op;        /* EXPR_BINOP */
     struct expr *lhs, *rhs; /* BINOP + ASSIGN(lhs=target);
                              * NOT/NEG/BNOT/DEREF/ADDR/CAST use rhs only */
@@ -111,7 +112,8 @@ struct initelem {
 struct greloc {
     int off;              /* byte offset within the object */
     const char *str;      /* a string-literal target (NULL if a global/func) */
-    int str_len;          /* including its NUL */
+    int str_len;          /* element count including its NUL */
+    int str_width;        /* bytes per element (1 char, 2/4 wide) */
     int str_off;          /* driver: the target's offset inside .rodata */
     struct global *gtarget; /* an &global target, else NULL */
     struct func *ftarget; /* a function-address target, else NULL */

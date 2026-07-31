@@ -109,7 +109,8 @@ struct token {
     enum tok_kind kind;
     int line;
     int col;       /* 1-based column of the token's first character */
-    long num;      /* TOK_NUM; TOK_STR: byte length INCLUDING the NUL */
+    long num;      /* TOK_NUM; TOK_STR: element count INCLUDING the NUL */
+    int str_width; /* TOK_STR: bytes per element — 1 char, 2 char16, 4 wchar/32 */
     int num_long;  /* TOK_NUM: type is long (L suffix or magnitude) */
     int num_uns;   /* TOK_NUM: type is unsigned (U suffix or hex range) */
     double fnum;   /* TOK_FNUM */

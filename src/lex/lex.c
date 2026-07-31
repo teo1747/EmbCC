@@ -173,10 +173,33 @@ void lex_next(struct lexer *lx)
     t->col = (int)(lx->p - lx->line_start) + 1;
     t->text = NULL;
     t->num = 0;
+    t->str_width = 1;
 
     if (!*lx->p) {
         t->kind = TOK_EOF;
         return;
+    }
+
+    /* An encoding prefix on a string or char literal: L"" u8"" u"" U"" and
+     * L'' u'' U''. Consume it and remember the element width; the '"' / '\''
+     * lexing below then runs at lx->p. A wide CHAR constant stays a plain int
+     * (its value is the code point); only a wide STRING carries its width so
+     * its .rodata is emitted at 2 or 4 bytes per element. */
+    {
+        const char *q = lx->p;
+        int w = 0, adv = 0;
+        if ((q[0] == 'L' || q[0] == 'U') && (q[1] == '"' || q[1] == '\'')) {
+            w = 4; adv = 1;
+        } else if (q[0] == 'u' && q[1] == '8' && q[2] == '"') {
+            w = 1; adv = 2;
+        } else if (q[0] == 'u' && (q[1] == '"' || q[1] == '\'')) {
+            w = 2; adv = 1;
+        }
+        if (adv) {
+            lx->p += adv;
+            if (*lx->p == '"')
+                t->str_width = w;   /* a char constant ignores width (int value) */
+        }
     }
 
     /* A floating constant: digits with a '.', or an exponent, or the

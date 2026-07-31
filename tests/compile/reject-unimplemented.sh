@@ -109,7 +109,7 @@ check too-many-initializers \
     "past the end of an array of 2"
 check non-char-array-from-string \
     'int main(void) { int a[4] = "abc"; return a[0]; }' \
-    "only a char array"
+    "element width matches"
 check array-index-past-end \
     'int a[3] = { [5] = 1 };
 int main(void) { return 0; }' \

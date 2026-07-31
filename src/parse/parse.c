@@ -985,6 +985,7 @@ static struct expr *parse_primary(struct parser *ps)
          * each join drops the running string's terminator and appends
          * the next literal's bytes (including its NUL). */
         e = new_expr(EXPR_STR, t->line, t->col);
+        e->str_width = t->str_width;
         size_t len = (size_t)t->num;
         char *bytes = xmalloc(len);
         memcpy(bytes, t->text, len);
@@ -2012,7 +2013,8 @@ static struct global *parse_global(struct parser *ps, struct type *ty,
             if (g->ty->kind == TY_ARRAY && g->ty->count == 0) {
                 struct expr *ie = g->init_expr;
                 if (ie->kind == EXPR_STR &&
-                    g->ty->pointee->kind == TY_CHAR)
+                    ty_is_integer(g->ty->pointee) &&
+                    ty_size(g->ty->pointee) == (ie->str_width ? ie->str_width : 1))
                     g->ty = ty_array(g->ty->pointee, (int)ie->num);
                 else if (ie->kind == EXPR_INITLIST)
                     g->ty = ty_array(g->ty->pointee,
