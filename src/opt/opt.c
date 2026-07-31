@@ -1716,20 +1716,31 @@ static void opt_func(struct ir_func *fn)
 {
     if (g_mem2reg)
         pass_mem2reg(fn);         /* global mem2reg (subsumes store-forwarding) */
-    int changed = 1, guard = 0;
-    while (changed && guard++ < 1000) {
-        changed = 0;
-        changed |= pass_storefwd(fn); /* forward local stores to loads (mem2reg-lite) */
-        changed |= pass_fold(fn);
-        changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
-        if (g_gcse)
-            changed |= pass_gcse(fn); /* CSE across the dominator tree */
-        if (g_loadcse)
-            changed |= pass_loadcse(fn); /* reuse loads redundant on every path */
-        if (g_sccp)
-            changed |= pass_sccp(fn); /* resolve const branches, drop dead blocks */
-        changed |= pass_copyprop(fn);
-        changed |= pass_dce(fn);
+    /* Global load CSE is the expensive pass (CFG + an available-expressions
+     * dataflow), so it runs ONCE per outer round instead of on every inner
+     * iteration. When it exposes copies, the inner fixpoint reconverges and we
+     * round again — it settles in one or two rounds. */
+    int outer = 1, oguard = 0;
+    while (outer && oguard++ < 100) {
+        outer = 0;
+        int changed = 1, guard = 0;
+        while (changed && guard++ < 1000) {
+            changed = 0;
+            changed |= pass_storefwd(fn); /* forward local stores to loads (mem2reg-lite) */
+            changed |= pass_fold(fn);
+            changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
+            if (g_gcse)
+                changed |= pass_gcse(fn); /* CSE across the dominator tree */
+            if (g_sccp)
+                changed |= pass_sccp(fn); /* resolve const branches, drop dead blocks */
+            changed |= pass_copyprop(fn);
+            changed |= pass_dce(fn);
+        }
+        if (g_loadcse && pass_loadcse(fn)) {   /* reuse loads redundant on every path */
+            pass_copyprop(fn);
+            pass_dce(fn);
+            outer = 1;
+        }
     }
     /* After the fixpoint: fold constant operands into immediates, then DCE the
      * CONSTs that leaves unreferenced. Kept out of the fixpoint so the earlier
