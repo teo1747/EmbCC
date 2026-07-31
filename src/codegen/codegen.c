@@ -630,6 +630,24 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (pick >= 0) { loc[eidx[e]] = POOL[pick]; reg_used[pick] = 1; }
     }
 
+    /* Inline asm can hard-code a callee-saved register the allocator never sees
+     * — cpuid writes RBX (its "=b" output), and any operand fixed to rbx/r12..r15
+     * loads or overwrites that register. Such a register is clobbered by this
+     * function all the same, so the prologue must preserve it: mark it used.
+     * (Without this a caller that keeps a live value in rbx across the call gets
+     * it silently corrupted — invisible until an optimization puts one there.) */
+    for (int n = 0; n < fn->nins; n++) {
+        if (fn->ins[n].op != IR_ASM || !fn->ins[n].asm_ir)
+            continue;
+        struct ir_asm *a = fn->ins[n].asm_ir;
+        for (int j = 0; j < a->nout; j++)
+            for (int k = 0; k < NP; k++)
+                if (POOL[k] == a->out[j].reg) reg_used[k] = 1;
+        for (int j = 0; j < a->nin; j++)
+            for (int k = 0; k < NP; k++)
+                if (POOL[k] == a->in[j].reg) reg_used[k] = 1;
+    }
+
     /* Only the callee-saved registers actually used need a prologue save. */
     int nu = 0;
     for (int k = 0; k < NP; k++)
