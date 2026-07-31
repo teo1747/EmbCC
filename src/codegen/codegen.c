@@ -952,6 +952,22 @@ static void cg_load_rcx(struct code *text, const int *sd, int vreg, int w)
         x86_mov_ecx_mem(text, sd[vreg], w);
 }
 
+/* A plain reg-to-reg copy dst<-a of `w` bytes when BOTH vregs are register-
+ * resident: emit a single move (or nothing when they already share a register)
+ * instead of routing the value through RAX (mov a,%rax; mov %rax,dst). RAX and
+ * its residency cache are left untouched — the move never reads or writes RAX,
+ * so a value cached there stays valid. Returns 1 if it handled the copy, 0 to
+ * fall back to the cg_load/cg_store path. Inert unless -O2 (in_reg needs
+ * regalloc), so -O0/-O1 output is byte-identical. */
+static int cg_reg_move(struct code *text, int dst, int a, int w)
+{
+    if (!in_reg(a) || !in_reg(dst))
+        return 0;
+    if (g_loc[a] != g_loc[dst])
+        x86_mov_rr_w(text, g_loc[dst], g_loc[a], w);
+    return 1;
+}
+
 static void gen_func(struct ir_func *fn, struct code *text,
                      struct sites *st)
 {
@@ -1138,13 +1154,19 @@ static void gen_func(struct ir_func *fn, struct code *text,
                        "floating point needs SSE, which -mno-sse forbids");
         switch (i->op) {
         case IR_CONST:
-            x86_mov_eax_imm(text, i->imm, i->w);
+            /* -O2: materialise zero with `xor eax,eax` (2 bytes, upper zeroed)
+             * rather than a 7-byte `mov`. Gated to keep -O0/-O1 byte-identical;
+             * safe because no comparison's flags are live across a CONST. */
+            if (g_regalloc && i->imm == 0)
+                x86_zero_eax(text);
+            else
+                x86_mov_eax_imm(text, i->imm, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_MOV:
-            /* a coalesced copy whose source and dest share a register is a
-             * no-op — emit nothing (move coalescing). */
-            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst])
+            /* Two register-resident vregs: a direct reg-reg move (or nothing
+             * when coalesced onto the same register) — no RAX round-trip. */
+            if (cg_reg_move(text, i->dst, i->a, 8))
                 break;
             cg_load(text, sd, i->a, 8, 0, 8);
             cg_store(text, sd, i->dst, 8);
@@ -1165,13 +1187,35 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_movs_store(text, 0, sd[i->dst], i->w);
                 break;
             }
-            cg_load(text, sd, i->a, i->w, 0, i->w);
             {
                 int aop = i->op == IR_ADD ? '+' :
                           i->op == IR_SUB ? '-' :
                           i->op == IR_MUL ? '*' :
                           i->op == IR_AND ? '&' :
                           i->op == IR_OR ? '|' : '^';
+                /* All three operands register-resident: compute in the dest
+                 * register, no RAX detour. dst = a OP b becomes an in-place
+                 * `OP b,dst` when dst already holds a (the common case after
+                 * coalescing), else `mov a,dst; OP b,dst`. The one hazard is
+                 * dst sharing b's register with a non-commutative SUB — fall
+                 * back to RAX there. RAX (and its cache) is left untouched. */
+                if (in_reg(i->dst) && in_reg(i->a) && in_reg(i->b)) {
+                    int D = g_loc[i->dst], A = g_loc[i->a], B = g_loc[i->b];
+                    int commut = i->op != IR_SUB;
+                    if (D == A) {
+                        x86_alu_rr(text, aop, D, B, i->w);
+                        break;
+                    } else if (D != B) {
+                        x86_mov_rr_w(text, D, A, i->w);
+                        x86_alu_rr(text, aop, D, B, i->w);
+                        break;
+                    } else if (commut) {              /* D holds b; a OP b == b OP a */
+                        x86_alu_rr(text, aop, D, A, i->w);
+                        break;
+                    }
+                    /* SUB with D == B != A: fall through to the RAX path. */
+                }
+                cg_load(text, sd, i->a, i->w, 0, i->w);
                 /* a register-resident second operand is a reg-reg op; a memory
                  * one keeps the direct memory-operand form (no extra load). */
                 if (in_reg(i->b))
@@ -1268,17 +1312,20 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_LDVAR:
             /* coalesced plain load whose local and temp share a register: no-op
              * (only when no extension is emitted — see ldvar_plain). */
-            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst] &&
-                ldvar_plain(i->size, i->sign, i->w))
+            /* A plain (non-extending) read of a register-resident local into a
+             * register-resident temp is a direct reg-reg move — no RAX detour.
+             * The narrow-value invariant holds: a 4-byte move zero-extends. */
+            if (ldvar_plain(i->size, i->sign, i->w) &&
+                cg_reg_move(text, i->dst, i->a, i->size == 8 ? 8 : 4))
                 break;
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STVAR:
-            /* coalesced self-copy (local and value share a register): no-op. The
-             * shared low bytes already carry the (truncated) value; a later read
-             * of the local movsx/movzx-extends from them. */
-            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst])
+            /* Both register-resident: a direct reg-reg move (coalesced same-reg
+             * writes vanish). The written local keeps the value in its low
+             * i->size bytes; a later read movsx/movzx-extends from them. */
+            if (cg_reg_move(text, i->dst, i->a, i->size))
                 break;
             cg_load(text, sd, i->a, 8, 0, 8);
             if (in_reg(i->dst))                          /* register-resident local */
