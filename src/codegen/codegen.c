@@ -1278,24 +1278,38 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 break;
             }
             /* Address-generation fusion: an `ADD base, X` whose SOLE use is the
-             * immediately-following load folds into that load's addressing,
-             * dropping the address computation. X a register -> base+index
-             * (`p[i]`); X a constant -> base+disp (`p->field`). */
+             * immediately-following memory access folds into that access's
+             * addressing, dropping the address computation. X a constant ->
+             * base+disp (`p->field`); X a register -> base+index (`p[i]`). The
+             * ADD's result is never materialised (the fusion reads base/index,
+             * not the sum), so no register is needed for it. */
             if (g_regcache && usecnt && i->op == IR_ADD &&
-                in_reg(i->a) && n + 1 < fn->nins &&
-                fn->ins[n + 1].op == IR_LOAD && fn->ins[n + 1].a == i->dst &&
-                usecnt[i->dst] == 1 &&
+                in_reg(i->a) && n + 1 < fn->nins && usecnt[i->dst] == 1 &&
                 (i->imm_b ? 1 : in_reg(i->b))) {
-                struct ir_ins *ld = &fn->ins[n + 1];
-                if (i->imm_b)
-                    x86_load_basedisp_rax(text, g_loc[i->a], (int)i->imm,
-                                          ld->size, ld->sign, ld->w);
-                else
-                    x86_load_baseindex_rax(text, g_loc[i->a], g_loc[i->b], 1,
-                                           ld->size, ld->sign, ld->w);
-                cg_store(text, sd, ld->dst, ld->w);
-                n++;                               /* consume the fused load */
-                break;
+                struct ir_ins *nx = &fn->ins[n + 1];
+                int base = g_loc[i->a], index = i->imm_b ? 0 : g_loc[i->b];
+                if (nx->op == IR_LOAD && nx->a == i->dst) {
+                    if (i->imm_b)
+                        x86_load_basedisp_rax(text, base, (int)i->imm,
+                                              nx->size, nx->sign, nx->w);
+                    else
+                        x86_load_baseindex_rax(text, base, index, 1,
+                                               nx->size, nx->sign, nx->w);
+                    cg_store(text, sd, nx->dst, nx->w);
+                    n++;                           /* consume the fused load */
+                    break;
+                }
+                if (nx->op == IR_STORE && nx->a == i->dst) {
+                    /* value -> rax (rax never aliases base/index), then store
+                     * through the folded address. */
+                    cg_load(text, sd, nx->b, 8, 0, 8);
+                    if (i->imm_b)
+                        x86_store_basedisp_rax(text, base, (int)i->imm, nx->size);
+                    else
+                        x86_store_baseindex_rax(text, base, index, 1, nx->size);
+                    n++;                           /* consume the fused store */
+                    break;
+                }
             }
             {
                 int aop = i->op == IR_ADD ? '+' :

@@ -633,6 +633,36 @@ void x86_store_mem_rcx(struct code *c, int size)
     code_byte(c, 0x01); /* ModRM: [rcx], eax/rax */
 }
 
+/* Store rax to [base + disp] (a struct-field store, `p->m = x`), sized. reg
+ * field is rax(0); modrm_base carries disp and the rsp/r12 SIB case. */
+void x86_store_basedisp_rax(struct code *c, int base, int disp, int size)
+{
+    int rexb = (base & 8) ? 1 : 0;
+    switch (size) {
+    case 1: if (rexb) code_byte(c, 0x41);        code_byte(c, 0x88); break;
+    case 2: code_byte(c, 0x66); if (rexb) code_byte(c, 0x41); code_byte(c, 0x89); break;
+    case 4: if (rexb) code_byte(c, 0x41);        code_byte(c, 0x89); break;
+    case 8: code_byte(c, 0x48 | rexb);           code_byte(c, 0x89); break;
+    default: fprintf(stderr, "embcc: internal: bad store size %d\n", size); exit(1);
+    }
+    modrm_base(c, 0, base, disp);
+}
+
+/* Store rax to [base + index*scale] (an array-element store, `p[i] = x`). */
+void x86_store_baseindex_rax(struct code *c, int base, int index, int scale,
+                             int size)
+{
+    int rexXB = ((index & 8) ? 2 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1: if (rexXB) code_byte(c, 0x40 | rexXB);        code_byte(c, 0x88); break;
+    case 2: code_byte(c, 0x66); if (rexXB) code_byte(c, 0x40 | rexXB); code_byte(c, 0x89); break;
+    case 4: if (rexXB) code_byte(c, 0x40 | rexXB);        code_byte(c, 0x89); break;
+    case 8: code_byte(c, 0x48 | rexXB);                   code_byte(c, 0x89); break;
+    default: fprintf(stderr, "embcc: internal: bad store size %d\n", size); exit(1);
+    }
+    modrm_baseindex0(c, 0, base, index, scale);
+}
+
 void x86_mov_rcx_slot(struct code *c, int disp)
 {
     code_byte(c, 0x48);
