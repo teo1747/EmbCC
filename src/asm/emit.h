@@ -45,6 +45,7 @@ void x86_store_slot(struct code *c, int disp, int size);
 /* Loads/stores through a pointer: address in rax (load) or rcx (store,
  * value in eax/rax). */
 void x86_load_mem_rax(struct code *c, int size, int sign, int w);
+void x86_load_base_rax(struct code *c, int base, int size, int sign, int w); /* rax = *base */
 void x86_store_mem_rcx(struct code *c, int size);
 void x86_mov_rcx_slot(struct code *c, int disp);  /* mov rcx,[rbp+disp] */
 void x86_lea_rax_slot(struct code *c, int disp);  /* lea rax,[rbp+disp] */

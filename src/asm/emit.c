@@ -461,6 +461,61 @@ void x86_load_mem_rax(struct code *c, int size, int sign, int w)
     }
 }
 
+/* ModRM for [base] (disp 0) with register field `reg`, in the shortest correct
+ * form. The r/m encoding has two traps: base whose low 3 bits are 100 (rsp/r12)
+ * needs a SIB byte, and 101 (rbp/r13) collides with RIP-relative at mod=00 so it
+ * takes a mod=01 disp8 of zero. */
+static void modrm_base0(struct code *c, int reg, int base)
+{
+    int lo = base & 7;
+    if (lo == 5) {          /* rbp / r13 */
+        code_byte(c, (1 << 6) | ((reg & 7) << 3) | 5);
+        code_byte(c, 0x00);
+    } else if (lo == 4) {   /* rsp / r12 */
+        code_byte(c, ((reg & 7) << 3) | 4);
+        code_byte(c, 0x24); /* SIB: base=r/sp/r12, no index */
+    } else {
+        code_byte(c, ((reg & 7) << 3) | lo);
+    }
+}
+
+/* Load into rax straight from [base], with the same extension matrix as
+ * x86_load_mem_rax — no `mov base,rax` first. REX.B carries a high base
+ * (r8..r15); modrm_base0 handles the rsp/rbp/r12/r13 addressing traps. */
+void x86_load_base_rax(struct code *c, int base, int size, int sign, int w)
+{
+    int rexb = (base & 8) ? 1 : 0;
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexb;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base0(c, 0, base);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexb);
+            code_byte(c, 0x63);      /* movsxd rax, [base] */
+        } else {
+            if (rexb) code_byte(c, 0x41);
+            code_byte(c, 0x8b);
+        }
+        modrm_base0(c, 0, base);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexb);
+        code_byte(c, 0x8b);
+        modrm_base0(c, 0, base);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
 void x86_store_mem_rcx(struct code *c, int size)
 {
     switch (size) {

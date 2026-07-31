@@ -1534,6 +1534,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
         case IR_LOAD:
+            /* Address already in a register: load straight from [reg], skipping
+             * the `mov reg,rax`. dst is a temp (cacheable), so cg_store below
+             * fixes the residency cache. */
+            if (in_reg(i->a)) {
+                x86_load_base_rax(text, g_loc[i->a], i->size, i->sign, i->w);
+                cg_store(text, sd, i->dst, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);       /* the address */
             x86_load_mem_rax(text, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
