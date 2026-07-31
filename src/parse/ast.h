@@ -39,6 +39,7 @@ enum binop {
 struct expr {
     enum expr_kind kind;
     int line;
+    int col;              /* 1-based column, for caret diagnostics (0 = unknown) */
     struct type *ty;      /* set by sema on every node */
     struct type *undecayed; /* sema: original array type when ty is the
                              * decayed pointer (sizeof needs it) */
@@ -157,6 +158,7 @@ struct asm_stmt {
 struct stmt {
     enum stmt_kind kind;
     int line;
+    int col;              /* 1-based column, for caret diagnostics (0 = unknown) */
     const char *name;     /* STMT_DECL */
     struct type *dty;     /* STMT_DECL: declared type */
     int is_static;        /* STMT_DECL: a static local -> its own global */

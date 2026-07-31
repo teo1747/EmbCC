@@ -68,15 +68,15 @@ static const char *const reserved_unsupported[] = {
     "auto", "goto", "register",
 };
 
-static void reject_reserved(struct parser *ps, const char *name, int line)
+static void reject_reserved(struct parser *ps, const char *name, int line, int col)
 {
     for (size_t i = 0;
          i < sizeof reserved_unsupported / sizeof reserved_unsupported[0];
          i++)
         if (strcmp(reserved_unsupported[i], name) == 0)
-            diag_fatal(ps->lx.file, line,
-                       "'%s' is not supported yet (see docs/ROADMAP.md M2)",
-                       name);
+            diag_at(ps->lx.file, line, col,
+                    "'%s' is not supported yet (see docs/ROADMAP.md M2)",
+                    name);
 }
 
 /* ---- types ---- */
@@ -809,11 +809,12 @@ static void parse_enum_body(struct parser *ps)
 
 /* ---- expressions ---- */
 
-static struct expr *new_expr(enum expr_kind kind, int line)
+static struct expr *new_expr(enum expr_kind kind, int line, int col)
 {
     struct expr *e = xcalloc(1, sizeof *e);
     e->kind = kind;
     e->line = line;
+    e->col = col;
     e->desig_index = -1;      /* positional unless a [i] designator sets it */
     e->desig_index_hi = -1;
     return e;
@@ -836,7 +837,7 @@ static struct expr *parse_primary(struct parser *ps)
          * type-directed selection; sema picks the matching arm. */
         advance(ps);
         expect(ps, TOK_LPAREN, "'(' after _Generic");
-        e = new_expr(EXPR_GENERIC, t->line);
+        e = new_expr(EXPR_GENERIC, t->line, t->col);
         e->lhs = parse_expr(ps);          /* the controlling expression */
         int cap = 0;
         while (cur(ps)->kind == TOK_COMMA) {
@@ -861,13 +862,13 @@ static struct expr *parse_primary(struct parser *ps)
         return e;
     }
     case TOK_NUM:
-        e = new_expr(EXPR_NUM, t->line);
+        e = new_expr(EXPR_NUM, t->line, t->col);
         e->num = t->num;
         e->ty = ty_base(t->num_long ? TY_LONG : TY_INT, t->num_uns);
         advance(ps);
         return e;
     case TOK_FNUM:
-        e = new_expr(EXPR_FNUM, t->line);
+        e = new_expr(EXPR_FNUM, t->line, t->col);
         e->fnum = t->fnum;
         e->ty = ty_base(t->fnum_is_float ? TY_FLOAT : TY_DOUBLE, 0);
         advance(ps);
@@ -877,7 +878,7 @@ static struct expr *parse_primary(struct parser *ps)
          * "foo" "bar" is one literal "foobar". num counts the NUL, so
          * each join drops the running string's terminator and appends
          * the next literal's bytes (including its NUL). */
-        e = new_expr(EXPR_STR, t->line);
+        e = new_expr(EXPR_STR, t->line, t->col);
         size_t len = (size_t)t->num;
         char *bytes = xmalloc(len);
         memcpy(bytes, t->text, len);
@@ -900,7 +901,7 @@ static struct expr *parse_primary(struct parser *ps)
         if (cur(ps)->kind == TOK_LBRACE) {
             /* GNU statement expression `({ ... })`: the block's value is its
              * last statement when that is an expression statement. */
-            e = new_expr(EXPR_STMTEXPR, t->line);
+            e = new_expr(EXPR_STMTEXPR, t->line, t->col);
             e->body = parse_block(ps);
             expect(ps, TOK_RPAREN, "')' to close a statement expression");
             return e;
@@ -916,7 +917,7 @@ static struct expr *parse_primary(struct parser *ps)
             int line = t->line;
             advance(ps);
             expect(ps, TOK_LPAREN, "'(' after __builtin_va_arg");
-            e = new_expr(EXPR_VA_ARG, line);
+            e = new_expr(EXPR_VA_ARG, line, 0);
             e->lhs = parse_expr(ps);
             expect(ps, TOK_COMMA, "',' before the va_arg type");
             e->cast_ty = parse_type_name(ps, parse_type_spec(ps, 0));
@@ -967,13 +968,13 @@ static struct expr *parse_primary(struct parser *ps)
                 break;
             }
             expect(ps, TOK_RPAREN, "')' to close __builtin_offsetof");
-            e = new_expr(EXPR_NUM, line);
+            e = new_expr(EXPR_NUM, line, 0);
             e->num = off;
             e->ty = ty_base(TY_LONG, 1);   /* size_t */
             return e;
         }
-        reject_reserved(ps, t->text, t->line);
-        e = new_expr(EXPR_VAR, t->line);
+        reject_reserved(ps, t->text, t->line, t->col);
+        e = new_expr(EXPR_VAR, t->line, t->col);
         e->name = t->text;
         advance(ps);
         return e;
@@ -989,7 +990,7 @@ static struct expr *incdec(struct parser *ps, struct expr *target,
                            int line, int is_post, int delta)
 {
     (void)ps;
-    struct expr *e = new_expr(EXPR_INCDEC, line);
+    struct expr *e = new_expr(EXPR_INCDEC, line, 0);
     e->lhs = target;
     e->is_post = is_post;
     e->delta = delta;
@@ -1006,7 +1007,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
             /* a call — through a name or any pointer-valued expression */
             int line = cur(ps)->line;
             advance(ps);
-            struct expr *call = new_expr(EXPR_CALL, line);
+            struct expr *call = new_expr(EXPR_CALL, line, 0);
             call->lhs = e;
             if (e->kind == EXPR_VAR)
                 call->name = e->name;
@@ -1031,7 +1032,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
             advance(ps);
             struct expr *idx = parse_expr(ps);
             expect(ps, TOK_RBRACKET, "']'");
-            struct expr *d = new_expr(EXPR_DEREF, line);
+            struct expr *d = new_expr(EXPR_DEREF, line, 0);
             d->rhs = binop(B_ADD, e, idx);
             e = d;
         } else if (cur(ps)->kind == TOK_DOT ||
@@ -1043,7 +1044,7 @@ static struct expr *parse_postfix_ops(struct parser *ps, struct expr *e)
                 diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                            "expected a member name before %s",
                            tok_describe(cur(ps)));
-            struct expr *m = new_expr(EXPR_MEMBER, line);
+            struct expr *m = new_expr(EXPR_MEMBER, line, 0);
             m->lhs = e;
             m->name = cur(ps)->text;
             m->is_arrow = is_arrow;
@@ -1073,7 +1074,7 @@ static struct expr *parse_unary(struct parser *ps)
 
     switch (t->kind) {
     case TOK_BANG:
-        e = new_expr(EXPR_NOT, t->line);
+        e = new_expr(EXPR_NOT, t->line, t->col);
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
@@ -1083,22 +1084,22 @@ static struct expr *parse_unary(struct parser *ps)
         advance(ps);
         return parse_unary(ps);
     case TOK_MINUS:
-        e = new_expr(EXPR_NEG, t->line);
+        e = new_expr(EXPR_NEG, t->line, t->col);
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
     case TOK_TILDE:
-        e = new_expr(EXPR_BNOT, t->line);
+        e = new_expr(EXPR_BNOT, t->line, t->col);
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
     case TOK_STAR:
-        e = new_expr(EXPR_DEREF, t->line);
+        e = new_expr(EXPR_DEREF, t->line, t->col);
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
     case TOK_AMP:
-        e = new_expr(EXPR_ADDR, t->line);
+        e = new_expr(EXPR_ADDR, t->line, t->col);
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
@@ -1112,7 +1113,7 @@ static struct expr *parse_unary(struct parser *ps)
     case TOK_KW_SIZEOF: {
         int line = t->line;
         advance(ps);
-        e = new_expr(EXPR_SIZEOF, line);
+        e = new_expr(EXPR_SIZEOF, line, 0);
         if (cur(ps)->kind == TOK_LPAREN) {
             struct lexer save = ps->lx;
             advance(ps);
@@ -1136,12 +1137,12 @@ static struct expr *parse_unary(struct parser *ps)
             /* `(type){ ... }` is a compound literal (an unnamed object),
              * not a cast — it can even take postfix operators. */
             if (cur(ps)->kind == TOK_LBRACE) {
-                e = new_expr(EXPR_COMPLIT, t->line);
+                e = new_expr(EXPR_COMPLIT, t->line, t->col);
                 e->cast_ty = ct;
                 e->lhs = parse_initializer(ps);
                 return parse_postfix_ops(ps, e);
             }
-            e = new_expr(EXPR_CAST, t->line);
+            e = new_expr(EXPR_CAST, t->line, t->col);
             e->cast_ty = ct;
             e->rhs = parse_unary(ps);
             return e;
@@ -1156,7 +1157,7 @@ static struct expr *parse_unary(struct parser *ps)
 
 static struct expr *binop(enum binop op, struct expr *lhs, struct expr *rhs)
 {
-    struct expr *e = new_expr(EXPR_BINOP, lhs->line);
+    struct expr *e = new_expr(EXPR_BINOP, lhs->line, lhs->col);
     e->op = op;
     e->lhs = lhs;
     e->rhs = rhs;
@@ -1231,7 +1232,7 @@ static struct expr *parse_comma(struct parser *ps)
 {
     struct expr *e = parse_expr(ps);
     while (cur(ps)->kind == TOK_COMMA) {
-        struct expr *c = new_expr(EXPR_COMMA, cur(ps)->line);
+        struct expr *c = new_expr(EXPR_COMMA, cur(ps)->line, cur(ps)->col);
         advance(ps);
         c->lhs = e;
         c->rhs = parse_expr(ps);
@@ -1245,7 +1246,7 @@ static struct expr *parse_cond(struct parser *ps)
     struct expr *e = parse_lor(ps);
     if (cur(ps)->kind != TOK_QUESTION)
         return e;
-    struct expr *r = new_expr(EXPR_COND, cur(ps)->line);
+    struct expr *r = new_expr(EXPR_COND, cur(ps)->line, cur(ps)->col);
     advance(ps);
     r->args[0] = e;
     r->nargs = 1;
@@ -1277,7 +1278,7 @@ static struct expr *parse_expr(struct parser *ps)
     advance(ps);
 
     if (comp < 0) {
-        struct expr *a = new_expr(EXPR_ASSIGN, line);
+        struct expr *a = new_expr(EXPR_ASSIGN, line, 0);
         a->lhs = e;
         a->rhs = parse_expr(ps);
         return a;
@@ -1285,7 +1286,7 @@ static struct expr *parse_expr(struct parser *ps)
     /* `x op= y` keeps its own node rather than desugaring to
      * `x = x op y`: through a pointer or a member the address must be
      * evaluated ONCE, and the desugared form evaluates it twice. */
-    struct expr *a = new_expr(EXPR_COMPOUND, line);
+    struct expr *a = new_expr(EXPR_COMPOUND, line, 0);
     a->op = compound_assign[comp].op;
     a->lhs = e;
     a->rhs = parse_expr(ps);
@@ -1294,11 +1295,12 @@ static struct expr *parse_expr(struct parser *ps)
 
 /* ---- statements ---- */
 
-static struct stmt *new_stmt(enum stmt_kind kind, int line)
+static struct stmt *new_stmt(enum stmt_kind kind, int line, int col)
 {
     struct stmt *s = xcalloc(1, sizeof *s);
     s->kind = kind;
     s->line = line;
+    s->col = col;
     return s;
 }
 
@@ -1329,7 +1331,7 @@ static struct expr *parse_initializer(struct parser *ps)
     if (cur(ps)->kind != TOK_LBRACE)
         return parse_expr(ps);
 
-    struct expr *e = new_expr(EXPR_INITLIST, cur(ps)->line);
+    struct expr *e = new_expr(EXPR_INITLIST, cur(ps)->line, cur(ps)->col);
     int cap = 0;
     advance(ps);
     while (cur(ps)->kind != TOK_RBRACE) {
@@ -1394,7 +1396,7 @@ static struct stmt *parse_controlled(struct parser *ps)
 
 static struct stmt *parse_block(struct parser *ps)
 {
-    struct stmt *s = new_stmt(STMT_BLOCK, cur(ps)->line);
+    struct stmt *s = new_stmt(STMT_BLOCK, cur(ps)->line, cur(ps)->col);
     expect(ps, TOK_LBRACE, "'{'");
     struct stmt **tail = &s->body;
     while (cur(ps)->kind != TOK_RBRACE) {
@@ -1468,7 +1470,7 @@ static void parse_asm_operands(struct parser *ps, struct asm_operand **out,
  *     [ : outputs [ : inputs [ : clobbers ] ] ] ) ;  */
 static struct stmt *parse_asm_stmt(struct parser *ps)
 {
-    struct stmt *s = new_stmt(STMT_ASM, cur(ps)->line);
+    struct stmt *s = new_stmt(STMT_ASM, cur(ps)->line, cur(ps)->col);
     struct asm_stmt *a = xcalloc(1, sizeof *a);
     s->asm_s = a;
     advance(ps); /* 'asm' / '__asm__' */
@@ -1523,7 +1525,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     /* A block-scope `_Static_assert`: checked now, emits nothing. */
     if (t->kind == TOK_KW_STATIC_ASSERT) {
         parse_static_assert(ps);
-        return new_stmt(STMT_BLOCK, t->line);
+        return new_stmt(STMT_BLOCK, t->line, t->col);
     }
 
     /* Block-scope `typedef` and `extern`: declarations that emit no code and
@@ -1574,7 +1576,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
                 struct type *ety = cur(ps)->kind == TOK_LPAREN
                                  ? parse_fn_params(ps, dty)
                                  : parse_array_dims(ps, dty);
-                struct stmt *sd = new_stmt(STMT_DECL, dline);
+                struct stmt *sd = new_stmt(STMT_DECL, dline, 0);
                 sd->dty = ety; sd->name = dname; sd->is_extern = 1;
                 *etail = sd; etail = &sd->next;
             }
@@ -1584,7 +1586,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         expect(ps, TOK_SEMI, "';'");
         if (ehead)
             return ehead;                    /* extern declarations (sema-handled) */
-        s = new_stmt(STMT_BLOCK, t->line);   /* typedef only -> no code */
+        s = new_stmt(STMT_BLOCK, t->line, t->col);   /* typedef only -> no code */
         return s;
     }
 
@@ -1618,7 +1620,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         struct type *base = parse_type_spec(ps, 1);
         struct stmt *head = NULL, **dtail = &head;
         for (;;) {
-            s = new_stmt(STMT_DECL, t->line);
+            s = new_stmt(STMT_DECL, t->line, t->col);
             const char *dname;
             s->dty = parse_declarator(ps, base, &dname);
             if (s->dty->kind == TY_VOID || s->dty->kind == TY_FUNC)
@@ -1698,7 +1700,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         advance(ps);
         if (cur(ps)->kind == TOK_COLON) {
             advance(ps);                       /* consume ':' */
-            s = new_stmt(STMT_LABEL, lline);
+            s = new_stmt(STMT_LABEL, lline, 0);
             s->name = lname;
             s->body = parse_stmt(ps, allow_decl);
             return s;
@@ -1708,11 +1710,11 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
 
     switch (t->kind) {
     case TOK_SEMI:                             /* the null statement */
-        s = new_stmt(STMT_BLOCK, t->line);     /* an empty block does nothing */
+        s = new_stmt(STMT_BLOCK, t->line, t->col);     /* an empty block does nothing */
         advance(ps);
         return s;
     case TOK_KW_GOTO:
-        s = new_stmt(STMT_GOTO, t->line);
+        s = new_stmt(STMT_GOTO, t->line, t->col);
         advance(ps);
         if (cur(ps)->kind != TOK_IDENT)
             diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
@@ -1724,14 +1726,14 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     case TOK_LBRACE:
         return parse_block(ps);
     case TOK_KW_RETURN:
-        s = new_stmt(STMT_RETURN, t->line);
+        s = new_stmt(STMT_RETURN, t->line, t->col);
         advance(ps);
         if (cur(ps)->kind != TOK_SEMI)
             s->expr = parse_expr(ps); /* NULL = bare return (void) */
         expect(ps, TOK_SEMI, "';'");
         return s;
     case TOK_KW_IF:
-        s = new_stmt(STMT_IF, t->line);
+        s = new_stmt(STMT_IF, t->line, t->col);
         advance(ps);
         expect(ps, TOK_LPAREN, "'('");
         s->cond = parse_expr(ps);
@@ -1743,7 +1745,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         }
         return s;
     case TOK_KW_WHILE:
-        s = new_stmt(STMT_WHILE, t->line);
+        s = new_stmt(STMT_WHILE, t->line, t->col);
         advance(ps);
         expect(ps, TOK_LPAREN, "'('");
         s->cond = parse_expr(ps);
@@ -1751,7 +1753,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         s->body = parse_controlled(ps);
         return s;
     case TOK_KW_FOR:
-        s = new_stmt(STMT_FOR, t->line);
+        s = new_stmt(STMT_FOR, t->line, t->col);
         advance(ps);
         expect(ps, TOK_LPAREN, "'('");
         if (at_type_start(ps)) {
@@ -1774,7 +1776,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         s->body = parse_controlled(ps);
         return s;
     case TOK_KW_DO:
-        s = new_stmt(STMT_DO, t->line);
+        s = new_stmt(STMT_DO, t->line, t->col);
         advance(ps);
         s->body = parse_controlled(ps);
         if (cur(ps)->kind != TOK_KW_WHILE)
@@ -1788,7 +1790,7 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
         expect(ps, TOK_SEMI, "';'");
         return s;
     case TOK_KW_SWITCH:
-        s = new_stmt(STMT_SWITCH, t->line);
+        s = new_stmt(STMT_SWITCH, t->line, t->col);
         advance(ps);
         expect(ps, TOK_LPAREN, "'('");
         s->cond = parse_comma(ps);
@@ -1798,23 +1800,23 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     case TOK_KW_CASE:
         /* a position MARKER in the switch body's list, not a wrapper —
          * C's fallthrough is what forces that shape */
-        s = new_stmt(STMT_CASE, t->line);
+        s = new_stmt(STMT_CASE, t->line, t->col);
         advance(ps);
         s->expr = parse_cond(ps); /* folded to a constant by sema */
         expect(ps, TOK_COLON, "':'");
         return s;
     case TOK_KW_DEFAULT:
-        s = new_stmt(STMT_DEFAULT, t->line);
+        s = new_stmt(STMT_DEFAULT, t->line, t->col);
         advance(ps);
         expect(ps, TOK_COLON, "':'");
         return s;
     case TOK_KW_BREAK:
-        s = new_stmt(STMT_BREAK, t->line);
+        s = new_stmt(STMT_BREAK, t->line, t->col);
         advance(ps);
         expect(ps, TOK_SEMI, "';'");
         return s;
     case TOK_KW_CONTINUE:
-        s = new_stmt(STMT_CONTINUE, t->line);
+        s = new_stmt(STMT_CONTINUE, t->line, t->col);
         advance(ps);
         expect(ps, TOK_SEMI, "';'");
         return s;
@@ -1831,8 +1833,8 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     case TOK_MINUSMINUS:
         /* expression statement: assignment, call, or ++/-- */
         if (t->kind == TOK_IDENT)
-            reject_reserved(ps, t->text, t->line);
-        s = new_stmt(STMT_EXPR, t->line);
+            reject_reserved(ps, t->text, t->line, t->col);
+        s = new_stmt(STMT_EXPR, t->line, t->col);
         s->expr = parse_comma(ps);
         expect(ps, TOK_SEMI, "';'");
         return s;
@@ -2021,7 +2023,7 @@ static void parse_top(struct parser *ps, struct unit *u,
         return;
     }
     if (cur(ps)->kind == TOK_IDENT)
-        reject_reserved(ps, cur(ps)->text, cur(ps)->line);
+        reject_reserved(ps, cur(ps)->text, cur(ps)->line, cur(ps)->col);
     struct type *base = parse_type_spec(ps, 1);
     if (!base)
         diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
@@ -2106,7 +2108,7 @@ static void parse_top(struct parser *ps, struct unit *u,
                 break;
             }
             if (cur(ps)->kind == TOK_IDENT)
-                reject_reserved(ps, cur(ps)->text, cur(ps)->line);
+                reject_reserved(ps, cur(ps)->text, cur(ps)->line, cur(ps)->col);
             struct type *spec = parse_type_spec(ps, 0);
             if (!spec)
                 diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
