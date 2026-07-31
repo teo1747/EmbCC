@@ -1039,6 +1039,93 @@ static int pass_mem2reg(struct ir_func *fn)
     return 1;
 }
 
+/* ---- global common-subexpression elimination (dominator-scoped VN) ----
+ *
+ * pass_lvn reuses an identical computation only within a block. Global CSE
+ * carries a value across the dominator tree: a value computed in a block is
+ * available to every block that block dominates. Sound because the operand
+ * temps are single-assignment (equal temps => equal value) and the producing
+ * temp, defined in a dominator, is live on every path to the reuse. Only
+ * position-independent, non-memory pure ops are numbered — arithmetic, compares,
+ * extends, address computations, constants; a memory read (LDVAR/LOAD) depends
+ * on a store history that crosses blocks, so pass_lvn keeps those local. */
+static int gcse_numberable(enum ir_op op)
+{
+    switch (op) {
+    /* Only genuinely COMPUTED values. A cheap single-instruction
+     * materialization (CONST, a lea for &local/&global/string/func, a
+     * sign/zero-extend, a bswap) costs less to recompute than to keep live
+     * across the dominated region — global-CSEing those only lengthens a live
+     * range (forcing a spill or a callee-saved reg) for no win. Redundant
+     * arithmetic/compares are the profitable case. Memory reads (LDVAR/LOAD)
+     * stay with the memory-versioned pass_lvn. */
+    case IR_ADD: case IR_SUB: case IR_MUL:
+    case IR_DIV: case IR_MOD: case IR_AND: case IR_OR: case IR_XOR:
+    case IR_SHL: case IR_SHR: case IR_CMP: case IR_NEG: case IR_BNOT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int pass_gcse(struct ir_func *fn)
+{
+    if (fn->nins == 0)
+        return 0;
+    int nbb, *l2b;
+    struct bb *bb = build_cfg(fn, &nbb, &l2b);
+    int *order = xmalloc((size_t)nbb * sizeof *order), norder;
+    compute_rpo(bb, nbb, order, &norder);
+    if (norder != nbb) {   /* unreachable blocks: dominance is not total, bail */
+        free(order); free(l2b);
+        for (int i = 0; i < nbb; i++) free(bb[i].pred);
+        free(bb); return 0;
+    }
+    compute_idom(bb, order, norder);
+
+    /* An active table holding the current block's and its dominators' values,
+     * pushed on enter and truncated back on leave — an explicit dom-tree DFS so
+     * siblings never see each other's values (they do not dominate each other). */
+    struct vn *tab = NULL; int ntab = 0, captab = 0, changed = 0;
+    int *dstk = xmalloc((size_t)nbb * sizeof *dstk);
+    int *mark = xmalloc((size_t)nbb * sizeof *mark);
+    char *entered = xcalloc((size_t)nbb, 1);
+    int dsp = 0; dstk[dsp++] = 0;
+    while (dsp) {
+        int b = dstk[dsp - 1];
+        if (!entered[b]) {
+            entered[b] = 1;
+            mark[b] = ntab;
+            for (int n = bb[b].start; n < bb[b].end; n++) {
+                struct ir_ins *i = &fn->ins[n];
+                struct vn k;
+                if (i->dst < 0 || !gcse_numberable(i->op) || !vn_key(i, 0, &k))
+                    continue;
+                int hit = -1;
+                for (int t = 0; t < ntab; t++)
+                    if (vn_eq(&tab[t], &k)) { hit = tab[t].result; break; }
+                if (hit >= 0 && hit != i->dst) {
+                    to_mov(i, hit); changed = 1;
+                } else if (hit < 0) {
+                    if (ntab == captab) { captab = captab ? captab * 2 : 64;
+                        tab = xrealloc(tab, (size_t)captab * sizeof *tab); }
+                    k.result = i->dst; tab[ntab++] = k;
+                }
+            }
+            for (int c = 0; c < nbb; c++)
+                if (c != 0 && bb[c].idom == b && !entered[c]) dstk[dsp++] = c;
+        } else {
+            ntab = mark[b];    /* leaving b: drop its (and its subtree's) values */
+            dsp--;
+        }
+    }
+    free(tab); free(dstk); free(mark); free(entered);
+    free(order); free(l2b);
+    for (int i = 0; i < nbb; i++) free(bb[i].pred);
+    free(bb);
+    return changed;
+}
+
 /* ---- local store-forwarding (a lightweight mem2reg) ----
  *
  * EmbIR keeps locals in memory (STVAR/LDVAR). Within an extended basic block a
@@ -1350,6 +1437,7 @@ static void inline_unit(struct ir_unit *iu)
 /* ---- driver ---- */
 
 static int g_mem2reg;   /* -O2: promote locals to SSA before the fixpoint */
+static int g_gcse;      /* -O2: dominator-scoped global CSE inside the fixpoint */
 
 static void opt_func(struct ir_func *fn)
 {
@@ -1361,6 +1449,8 @@ static void opt_func(struct ir_func *fn)
         changed |= pass_storefwd(fn); /* forward local stores to loads (mem2reg-lite) */
         changed |= pass_fold(fn);
         changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
+        if (g_gcse)
+            changed |= pass_gcse(fn); /* CSE across the dominator tree */
         changed |= pass_copyprop(fn);
         changed |= pass_dce(fn);
     }
@@ -1376,6 +1466,7 @@ void opt_run(struct ir_unit *iu, int level)
     if (level < 1)
         return;
     g_mem2reg = level >= 2;       /* SSA mem2reg: promote scalar locals to temps */
+    g_gcse = level >= 2;          /* global CSE across the dominator tree */
     if (level >= 2)               /* inline before the per-function passes clean up */
         inline_unit(iu);
     for (int f = 0; f < iu->nfuncs; f++)
