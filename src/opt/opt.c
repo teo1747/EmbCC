@@ -1126,6 +1126,176 @@ static int pass_gcse(struct ir_func *fn)
     return changed;
 }
 
+/* ---- global redundant-load elimination (available-expressions) ------------ *
+ *
+ * pass_gcse leaves memory reads (LDVAR/LOAD) to the block-local pass_lvn: their
+ * value depends on a store history that crosses blocks, which dominance alone
+ * cannot reason about (a store on a non-dominator-tree path still kills a load).
+ * This pass does the real thing — an available-expressions dataflow. A load is
+ * redundant at a point if an identical earlier load reaches it on EVERY path
+ * with no intervening write that could alias it; the reload becomes a copy.
+ *
+ * Soundness rests on three things:
+ *   - the meet is "same representative TEMP from all predecessors", so the reused
+ *     value is one dominating definition (loads produce single-def temps), never
+ *     a per-path phi;
+ *   - a LOAD is keyed only when its address temp is single-def, so the address
+ *     cannot change between the two loads;
+ *   - the kill model separates a store to a non-address-taken local (kills only
+ *     that local's LDVARs) from a real memory write / call / asm (kills every
+ *     LOAD and every address-taken local's LDVAR — no finer alias analysis).
+ */
+struct lkey { enum ir_op op; int a, size, sign, w; };
+
+static int lcse_kills_mem(enum ir_op op)
+{
+    switch (op) {
+    case IR_STORE: case IR_CALL: case IR_MEMCPY: case IR_MEMZERO:
+    case IR_XCHG: case IR_XADD: case IR_CMPXCHG: case IR_ASM: case IR_VA_START:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int pass_loadcse(struct ir_func *fn)
+{
+    int nvars = fn->src->nvars;
+    if (fn->nins == 0)
+        return 0;
+    struct defs d;
+    compute_defs(fn, &d);
+    int nbb, *l2b;
+    struct bb *bb = build_cfg(fn, &nbb, &l2b);
+    int *order = xmalloc((size_t)nbb * sizeof *order), norder;
+    compute_rpo(bb, nbb, order, &norder);
+    if (norder != nbb) {
+        free(order); free(l2b);
+        for (int i = 0; i < nbb; i++) free(bb[i].pred);
+        free(bb); free_defs(&d); return 0;
+    }
+
+    char *taken = xcalloc((size_t)(nvars ? nvars : 1), 1);
+    for (int i = 0; i < fn->nins; i++)
+        if (fn->ins[i].op == IR_ADDR && fn->ins[i].a >= 0 && fn->ins[i].a < nvars)
+            taken[fn->ins[i].a] = 1;
+
+    /* Enumerate distinct load keys; keyidx[i] maps a load instruction to one. */
+    struct lkey *keys = NULL; int nk = 0, capk = 0;
+    int *keyidx = xmalloc((size_t)fn->nins * sizeof *keyidx);
+    for (int i = 0; i < fn->nins; i++) {
+        keyidx[i] = -1;
+        struct ir_ins *in = &fn->ins[i];
+        struct lkey k;
+        if (in->op == IR_LDVAR && !in->vol && in->a >= 0 && in->a < nvars) {
+            k = (struct lkey){ IR_LDVAR, in->a, in->size, in->sign, in->w };
+        } else if (in->op == IR_LOAD && !in->vol && in->a >= 0 &&
+                   in->a < fn->nvregs && d.cnt[in->a] == 1) {
+            k = (struct lkey){ IR_LOAD, in->a, in->size, in->sign, in->w };
+        } else {
+            continue;
+        }
+        int found = -1;
+        for (int j = 0; j < nk; j++)
+            if (keys[j].op == k.op && keys[j].a == k.a && keys[j].size == k.size &&
+                keys[j].sign == k.sign && keys[j].w == k.w) { found = j; break; }
+        if (found < 0) {
+            if (nk == capk) { capk = capk ? capk * 2 : 32;
+                keys = xrealloc(keys, (size_t)capk * sizeof *keys); }
+            keys[nk] = k; found = nk++;
+        }
+        keyidx[i] = found;
+    }
+    if (nk == 0) {
+        free(order); free(l2b); free(taken); free(keyidx); free(keys);
+        for (int i = 0; i < nbb; i++) free(bb[i].pred);
+        free(bb); free_defs(&d); return 0;
+    }
+    /* is_mem[k]: a LOAD or an address-taken local's LDVAR (killed by any write).
+     * A non-address-taken local's LDVAR is killed only by a store to that local. */
+    char *is_mem = xmalloc((size_t)nk);
+    for (int k = 0; k < nk; k++)
+        is_mem[k] = keys[k].op == IR_LOAD ||
+                    (keys[k].op == IR_LDVAR && taken[keys[k].a]);
+
+    /* Dataflow. avail[b][k]: -2 top (init), -1 not available, >=0 the temp. */
+    int *aout = xmalloc((size_t)nbb * (size_t)nk * sizeof *aout);
+    int *ain  = xmalloc((size_t)nbb * (size_t)nk * sizeof *ain);
+    for (int i = 0; i < nbb * nk; i++) aout[i] = -2;
+    int *s = xmalloc((size_t)nk * sizeof *s);
+
+    for (int iter = 0, changed = 1; changed && iter < nbb + 2; iter++) {
+        changed = 0;
+        for (int oi = 0; oi < nbb; oi++) {
+            int b = order[oi];
+            int *in = ain + (size_t)b * nk;
+            if (b == 0) {
+                for (int k = 0; k < nk; k++) in[k] = -1;   /* entry: empty */
+            } else {
+                for (int k = 0; k < nk; k++) in[k] = -2;    /* top */
+                for (int p = 0; p < bb[b].npred; p++) {
+                    int *po = aout + (size_t)bb[b].pred[p] * nk;
+                    for (int k = 0; k < nk; k++) {
+                        int m = in[k], v = po[k];        /* three-valued meet */
+                        in[k] = (m == -1 || v == -1) ? -1
+                              : (m == -2) ? v : (v == -2) ? m
+                              : (m == v) ? m : -1;
+                    }
+                }
+                for (int k = 0; k < nk; k++) if (in[k] == -2) in[k] = -1;
+            }
+            for (int k = 0; k < nk; k++) s[k] = in[k];
+            for (int i = bb[b].start; i < bb[b].end; i++) {
+                struct ir_ins *ins = &fn->ins[i];
+                if (ins->op == IR_STVAR) {
+                    for (int k = 0; k < nk; k++)
+                        if ((keys[k].op == IR_LDVAR && keys[k].a == ins->dst) ||
+                            (taken[ins->dst] && is_mem[k]))
+                            s[k] = -1;
+                } else if (lcse_kills_mem(ins->op)) {
+                    for (int k = 0; k < nk; k++) if (is_mem[k]) s[k] = -1;
+                }
+                int k = keyidx[i];
+                if (k >= 0 && s[k] < 0) s[k] = ins->dst;   /* first def of the value */
+            }
+            int *out = aout + (size_t)b * nk;
+            for (int k = 0; k < nk; k++)
+                if (out[k] != s[k]) { out[k] = s[k]; changed = 1; }
+        }
+    }
+
+    /* Replacement: replay each block from its (now stable) avail_in. */
+    int changed = 0;
+    for (int b = 0; b < nbb; b++) {
+        int *in = ain + (size_t)b * nk;
+        for (int k = 0; k < nk; k++) s[k] = in[k];
+        for (int i = bb[b].start; i < bb[b].end; i++) {
+            struct ir_ins *ins = &fn->ins[i];
+            if (ins->op == IR_STVAR) {
+                for (int k = 0; k < nk; k++)
+                    if ((keys[k].op == IR_LDVAR && keys[k].a == ins->dst) ||
+                        (taken[ins->dst] && is_mem[k]))
+                        s[k] = -1;
+            } else if (lcse_kills_mem(ins->op)) {
+                for (int k = 0; k < nk; k++) if (is_mem[k]) s[k] = -1;
+            }
+            int k = keyidx[i];
+            if (k < 0) continue;
+            if (s[k] >= 0 && s[k] != ins->dst) {
+                to_mov(ins, s[k]); changed = 1;            /* redundant reload */
+            } else if (s[k] < 0) {
+                s[k] = ins->dst;
+            }
+        }
+    }
+
+    free(order); free(l2b); free(taken); free(keyidx); free(keys);
+    free(is_mem); free(aout); free(ain); free(s);
+    for (int i = 0; i < nbb; i++) free(bb[i].pred);
+    free(bb); free_defs(&d);
+    return changed;
+}
+
 /* ---- conditional constant propagation (the reachability half of SCCP) ----
  *
  * A conditional branch whose condition is a known constant has one live edge.
@@ -1539,6 +1709,7 @@ static void inline_unit(struct ir_unit *iu)
 
 static int g_mem2reg;   /* -O2: promote locals to SSA before the fixpoint */
 static int g_gcse;      /* -O2: dominator-scoped global CSE inside the fixpoint */
+static int g_loadcse;   /* -O2: global redundant-load elimination (avail. exprs) */
 static int g_sccp;      /* -O2: const-branch resolution + unreachable-block drop */
 
 static void opt_func(struct ir_func *fn)
@@ -1553,6 +1724,8 @@ static void opt_func(struct ir_func *fn)
         changed |= pass_lvn(fn);      /* CSE: reuse identical computations */
         if (g_gcse)
             changed |= pass_gcse(fn); /* CSE across the dominator tree */
+        if (g_loadcse)
+            changed |= pass_loadcse(fn); /* reuse loads redundant on every path */
         if (g_sccp)
             changed |= pass_sccp(fn); /* resolve const branches, drop dead blocks */
         changed |= pass_copyprop(fn);
@@ -1571,6 +1744,7 @@ void opt_run(struct ir_unit *iu, int level)
         return;
     g_mem2reg = level >= 2;       /* SSA mem2reg: promote scalar locals to temps */
     g_gcse = level >= 2;          /* global CSE across the dominator tree */
+    g_loadcse = level >= 2;       /* global redundant-load elimination */
     g_sccp = level >= 2;          /* conditional constant propagation */
     if (level >= 2)               /* inline before the per-function passes clean up */
         inline_unit(iu);
