@@ -1732,8 +1732,51 @@ static int g_gcse;      /* -O2: dominator-scoped global CSE inside the fixpoint 
 static int g_loadcse;   /* -O2: global redundant-load elimination (avail. exprs) */
 static int g_sccp;      /* -O2: const-branch resolution + unreachable-block drop */
 
+/* ---- IR verifier (opt-in via EMBCC_VERIFY) --------------------------------
+ * A cheap post-optimization sanity net for the two invariants a silent
+ * miscompile breaks, and which the 99-test suite did NOT catch when var_scope
+ * went stale: (1) every TEMP a surviving instruction reads still has a
+ * definition — a pass that drops a live value trips this; (2) var_scope_lo/hi,
+ * when present, index into the CURRENT instruction stream — a pass that
+ * renumbers instructions without remapping (the DCE bug) trips this. Off by
+ * default so normal builds pay nothing; the test suite runs with it set.
+ * Aborts loudly (THE RULE) rather than let wrong code through. */
+struct vrfy { struct defs *d; int np, nv; struct ir_func *fn; const char *tag; };
+static void vrfy_read_cb(int *p, void *ctx)
+{
+    struct vrfy *v = ctx;
+    int r = *p;
+    if (r < 0 || r < v->nv)          /* param or local: a local may be read uninit'd */
+        return;
+    if (r < v->fn->nvregs && v->d->cnt[r] > 0)   /* a temp with a definition: fine */
+        return;
+    diag_fatal(v->fn->src->file, 0,
+        "internal: %s reads temp %%%d with no definition (after %s) — an optimizer "
+        "pass dropped a value that is still used", v->fn->src->name, r, v->tag);
+}
+static void verify_func(struct ir_func *fn, const char *tag)
+{
+    struct defs d;
+    compute_defs(fn, &d);
+    struct vrfy v = { &d, fn->src->nparams, fn->src->nvars, fn, tag };
+    for (int n = 0; n < fn->nins; n++)
+        each_read(&fn->ins[n], vrfy_read_cb, &v);
+    if (fn->var_scope_lo)
+        for (int i = 0; i < fn->src->nvars; i++) {
+            int lo = fn->var_scope_lo[i], hi = fn->var_scope_hi[i];
+            if (lo < 0 || lo > fn->nins || hi < lo || hi > fn->nins)
+                diag_fatal(fn->src->file, 0,
+                    "internal: %s local %d has out-of-range scope [%d,%d] for nins=%d "
+                    "(after %s) — a pass renumbered instructions without remapping "
+                    "var_scope", fn->src->name, i, lo, hi, fn->nins, tag);
+        }
+    free_defs(&d);
+}
+
 static void opt_func(struct ir_func *fn)
 {
+    int verify = getenv("EMBCC_VERIFY") != NULL;
+    if (verify) verify_func(fn, "irgen");
     if (g_mem2reg)
         pass_mem2reg(fn);         /* global mem2reg (subsumes store-forwarding) */
     /* Global load CSE is the expensive pass (CFG + an available-expressions
@@ -1767,6 +1810,7 @@ static void opt_func(struct ir_func *fn)
      * passes never reason about the imm_b form. */
     if (pass_immfold(fn))
         pass_dce(fn);
+    if (verify) verify_func(fn, "opt");
 }
 
 void opt_run(struct ir_unit *iu, int level)
