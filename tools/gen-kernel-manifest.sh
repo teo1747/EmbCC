@@ -19,11 +19,15 @@ SRCROOT=/data/src/kernel
 OUTDIR=/data/build/out/kernel
 EMBCC=/data/apps/embcc/embcc.elf
 EMBLD=/data/apps/embld/embld.elf
+# embcc's freestanding headers (<stdint.h>, <stddef.h>, ...) ship beside the
+# binary; the kernel is freestanding but still includes them, so the compile
+# needs this on the include path or on-OS embcc can't find <stdint.h>.
+EMBCC_INC=$(dirname "$EMBCC")/include
 
 # Kernel compile flags (myos Makefile CFLAGS, minus gcc-only -ffreestanding/
 # -nostdlib which embcc is by nature) and the higher-half link (kernel/linker.ld
 # expressed as EmbLD flags: base 0xFFFFFFFF80100000, LMA offset the virtual base).
-CFLAGS="-mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -I$SRCROOT -O2"
+CFLAGS="-mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel -I$SRCROOT -I$EMBCC_INC -O2"
 LDFLAGS="-e _start -Ttext 0xFFFFFFFF80100000 --lma-offset 0xFFFFFFFF80000000"
 
 # The 6 hand-written .asm linked into the kernel image (ELF objects; the flat
