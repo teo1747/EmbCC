@@ -467,7 +467,9 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         case IR_CMPXCHG:
             OPAQUE(in->a); OPAQUE(in->b); OPAQUE(in->c); break;
         case IR_MEMCPY: case IR_MEMZERO:
-            OPAQUE(in->a); OPAQUE(in->b); break;
+            /* addresses are register-aware (used directly as the copy/zero base);
+             * only the operands are addresses, so nothing here is opaque now. */
+            break;
         case IR_RET:
             /* a scalar return is register-aware; a struct/float one reads its
              * slot raw, so its operand must stay in memory. */
@@ -1805,33 +1807,40 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_store(text, sd, i->dst, 4);
             break;
         case IR_MEMCPY: {
-            /* a struct copy: 8 bytes at a time, then the tail */
+            /* a struct copy: 8 bytes at a time, then the tail. A register-held
+             * address is used directly as the base (no slot->rcx/rdx load) — the
+             * reason its temp can be register-allocated (OPAQUE dropped). */
             cg_reset();
-            x86_load_slot(text, sd[i->a], 8, 0, 8);
-            x86_mov_reg_reg(text, REG_RCX, REG_RAX);       /* dst */
-            x86_load_slot(text, sd[i->b], 8, 0, 8);
-            x86_mov_reg_reg(text, REG_RDX, REG_RAX);       /* src */
+            int dbase, sbase;
+            if (in_reg(i->a)) dbase = g_loc[i->a];
+            else { x86_load_slot(text, sd[i->a], 8, 0, 8);
+                   x86_mov_reg_reg(text, REG_RCX, REG_RAX); dbase = REG_RCX; }
+            if (in_reg(i->b)) sbase = g_loc[i->b];
+            else { x86_load_slot(text, sd[i->b], 8, 0, 8);
+                   x86_mov_reg_reg(text, REG_RDX, REG_RAX); sbase = REG_RDX; }
             int off = 0;
             while (off < i->size) {
                 int chunk = i->size - off;
                 chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4 : chunk >= 2 ? 2 : 1;
-                x86_load_reg_mem(text, REG_RAX, REG_RDX, off, chunk);
-                x86_store_mem_reg(text, REG_RCX, off, REG_RAX, chunk);
+                x86_load_reg_mem(text, REG_RAX, sbase, off, chunk);
+                x86_store_mem_reg(text, dbase, off, REG_RAX, chunk);
                 off += chunk;
             }
             break;
         }
         case IR_MEMZERO: {
             cg_reset();
-            x86_load_slot(text, sd[i->a], 8, 0, 8);
-            x86_mov_reg_reg(text, REG_RCX, REG_RAX);
+            int dbase;
+            if (in_reg(i->a)) dbase = g_loc[i->a];
+            else { x86_load_slot(text, sd[i->a], 8, 0, 8);
+                   x86_mov_reg_reg(text, REG_RCX, REG_RAX); dbase = REG_RCX; }
             x86_mov_eax_imm(text, 0, 8);
             int off = 0;
             while (off < i->size) {
                 int chunk = i->size - off;
                 chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4
                       : chunk >= 2 ? 2 : 1;
-                x86_store_mem_reg(text, REG_RCX, off, REG_RAX, chunk);
+                x86_store_mem_reg(text, dbase, off, REG_RAX, chunk);
                 off += chunk;
             }
             break;
