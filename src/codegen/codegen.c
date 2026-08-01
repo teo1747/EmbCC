@@ -1255,6 +1255,15 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_movs_store_base(text, REG_RBP, va_save + 48 + r * 16,
                                     r, 8);
     }
+    /* -O2 (non-variadic, non-debug): a register-allocated scalar-integer param
+     * that arrives in an arg register moves STRAIGHT into its allocated register
+     * via one parallel move — no home-slot store + reload. Debug builds keep the
+     * slots (DWARF fbreg reads them); variadic keeps the current handling (the
+     * arg registers are already spilled to the save area). */
+    int pmove = g_regalloc && g_loc && !g_want_debug && !f->is_varargs;
+    int pmv_src[MAX_PARAMS], pmv_dst[MAX_PARAMS], npmv = 0;
+    char pmoved[MAX_PARAMS];
+    for (int p = 0; p < MAX_PARAMS; p++) pmoved[p] = 0;
     {   /* The same two-file split, in reverse. A hidden return pointer
          * (sret) consumes rdi BEFORE any real parameter, and MEMORY
          * parameters arrive on the caller's stack at [rbp+16...]. */
@@ -1283,6 +1292,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
                     incoming += 8;
                 } else if (ty_is_float(pt)) {
                     x86_movs_store(text, freg++, sd[i], ty_size(pt));
+                } else if (pmove && g_loc[i] >= 0) {
+                    pmv_src[npmv] = x86_argreg(ireg++);   /* arg reg -> its own */
+                    pmv_dst[npmv] = g_loc[i];             /* allocated register */
+                    npmv++; pmoved[i] = 1;
                 } else {
                     x86_store_arg(text, ireg++, sd[i]);
                 }
@@ -1313,6 +1326,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                       x86_argreg(ireg++), 8);
             }
         }
+        /* Shuffle the collected arg registers into their allocated registers at
+         * once (handles the r8/r9 overlap and any cycle via RAX, which is free
+         * here and never an arg or allocated register). */
+        if (npmv) emit_reg_parallel_move(text, pmv_dst, pmv_src, npmv, REG_RAX);
         va_named_int = ireg;
         va_named_sse = freg;
         va_overflow = incoming;
@@ -1323,7 +1340,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
      * signed read re-extends, so no widening subtlety.) */
     if (g_regalloc && g_loc)
         for (int p = 0; p < f->nparams; p++) {
-            if (g_loc[p] < 0) continue;
+            if (g_loc[p] < 0 || pmoved[p]) continue;   /* pmoved: already in reg */
             struct type *pt = f->param_tys[p];
             int psz = ty_size(pt);
             /* Load the home slot straight into the param's register — no RAX
