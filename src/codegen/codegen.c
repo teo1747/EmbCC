@@ -1304,9 +1304,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
             if (g_loc[p] < 0) continue;
             struct type *pt = f->param_tys[p];
             int psz = ty_size(pt);
-            int psign = ty_signed_int(pt);
-            x86_load_slot(text, sd[p], psz, psign, 8);   /* slot -> rax */
-            x86_mov_rr_w(text, g_loc[p], REG_RAX, 8);    /* rax -> reg */
+            /* Load the home slot straight into the param's register — no RAX
+             * detour. Only the low psz bytes matter (a later read re-extends);
+             * regalloc promotes only size-4/8 scalars, and x86_load_reg_mem
+             * zero-extends a 4-byte load, which is the register narrow-value
+             * invariant. Halves the per-param materialisation. */
+            x86_load_reg_mem(text, g_loc[p], REG_RBP, sd[p], psz);
         }
 
     rc_nvars = fn->src->nvars;
@@ -1370,6 +1373,15 @@ static void gen_func(struct ir_func *fn, struct code *text,
              * when coalesced onto the same register) — no RAX round-trip. */
             if (cg_reg_move(text, i->dst, i->a, 8))
                 break;
+            /* dst register-resident, source in memory: load straight into dst's
+             * register instead of memory->RAX->dst. Regalloc never hands out
+             * RAX, so g_loc[dst] != RAX and the RAX residency cache is left
+             * intact. Halves the very common LDVAR-of-a-local-into-a-temp
+             * sequence (`mov slot,%rax; mov %rax,%rN` -> `mov slot,%rN`). */
+            if (in_reg(i->dst)) {
+                x86_load_reg_mem(text, g_loc[i->dst], REG_RBP, sd[i->a], 8);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);
             cg_store(text, sd, i->dst, 8);
             break;
@@ -1636,6 +1648,17 @@ static void gen_func(struct ir_func *fn, struct code *text,
             if (ldvar_plain(i->size, i->sign, i->w) &&
                 cg_reg_move(text, i->dst, i->a, i->size == 8 ? 8 : 4))
                 break;
+            /* A plain (non-extending) load into a register-resident temp from a
+             * MEMORY local: load straight into the temp's register instead of
+             * memory->RAX->reg. x86_load_reg_mem zero-extends narrow reads, which
+             * matches ldvar_plain's non-signed-widen loads exactly; regalloc
+             * never hands out RAX so its residency cache is untouched. This is
+             * the hot LDVAR-of-a-param/local case (`mov slot,%rax; mov %rax,%rN`
+             * -> `mov slot,%rN`). */
+            if (ldvar_plain(i->size, i->sign, i->w) && in_reg(i->dst)) {
+                x86_load_reg_mem(text, g_loc[i->dst], REG_RBP, sd[i->a], i->size);
+                break;
+            }
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
