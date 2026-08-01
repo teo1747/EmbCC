@@ -512,6 +512,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->ty = ty_ptr(e->ty->pointee);
         }
         break;
+    case EXPR_LABELADDR:
+        /* &&label: a void* to a code location (GNU computed goto). The label's
+         * existence is resolved in irgen (labels may be forward-referenced). */
+        e->ty = ty_ptr(ty_base(TY_VOID, 0));
+        break;
     case EXPR_ADDR:
         check_expr(u, f, sc, e->rhs);
         if (e->rhs->fref) {
@@ -1908,6 +1913,12 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             break;
         case STMT_GOTO:
             /* target existence is validated function-wide at codegen */
+            if (s->expr) {   /* computed goto `goto *expr` (GNU) */
+                check_expr(u, f, sc, s->expr);
+                if (s->expr->ty->kind != TY_PTR)
+                    diag_at(u->file, s->line, s->col,
+                            "computed goto ('goto *') needs a pointer operand");
+            }
             break;
         }
     }

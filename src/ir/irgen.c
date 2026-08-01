@@ -709,6 +709,13 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return emit_const(fn, e->num, ty_w(e->ty));
     case EXPR_FNUM:
         return emit_fconst(fn, e->fnum, ty_size(e->ty));
+    case EXPR_LABELADDR: {   /* &&label -> a void* to the label's code location */
+        struct ir_ins *i = emit(fn);
+        i->op = IR_LABELADDR;
+        i->label = g_labels[label_idx(fn, e->name, e->line)].label;
+        i->dst = new_temp(fn);
+        return i->dst;
+    }
     case EXPR_STR: {
         int w = e->str_width ? e->str_width : 1;
         if (w == 1) {
@@ -2129,7 +2136,14 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             break;
         }
         case STMT_GOTO:
-            emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
+            if (s->expr) {   /* computed goto: goto *expr (GNU) */
+                int v = gen_expr(fn, s->expr);
+                struct ir_ins *i = emit(fn);
+                i->op = IR_IGOTO;
+                i->a = v;
+            } else {
+                emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
+            }
             break;
         case STMT_DECL:
             if (s->is_extern)

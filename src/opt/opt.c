@@ -1603,6 +1603,11 @@ static int inlinable(struct ir_func *cf)
         const struct ir_ins *in = &cf->ins[i];
         if (in->op == IR_ASM || in->op == IR_VA_START || in->flt)
             return 0;
+        /* Computed goto: a label address / indirect jump can't be inlined —
+         * the callee's label ids would need remapping into the caller, and the
+         * caller then can't be optimized either (opt_func bails on it). */
+        if (in->op == IR_LABELADDR || in->op == IR_IGOTO)
+            return 0;
         if (in->op == IR_CALL && in->retsize)
             return 0;
     }
@@ -1775,6 +1780,13 @@ static void verify_func(struct ir_func *fn, const char *tag)
 
 static void opt_func(struct ir_func *fn)
 {
+    /* Computed goto (`goto *p`) makes the CFG imprecise — an indirect jump can
+     * reach any address-taken label — which the dominance/liveness passes are
+     * not built to model. Such functions are rare; leave them unoptimized
+     * (still correct, memory-model codegen) rather than risk a mis-analysis. */
+    for (int n = 0; n < fn->nins; n++)
+        if (fn->ins[n].op == IR_IGOTO || fn->ins[n].op == IR_LABELADDR)
+            return;
     int verify = getenv("EMBCC_VERIFY") != NULL;
     if (verify) verify_func(fn, "irgen");
     if (g_mem2reg)

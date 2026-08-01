@@ -1025,6 +1025,14 @@ int x86_jmp_rel32(struct code *c)
     return off;
 }
 
+/* jmp *reg  (FF /4) — the indirect jump a GNU computed goto lowers to. */
+void x86_jmp_reg(struct code *c, int reg)
+{
+    if (reg >= 8) code_byte(c, 0x41);     /* REX.B for r8..r15 */
+    code_byte(c, 0xff);
+    code_byte(c, 0xe0 + (reg & 7));       /* ModRM mod=11 /4 rm=reg */
+}
+
 /* Conditional jump rel32 for a setcc condition byte (0x9x, as cc_for returns):
  * the Jcc opcode shares the condition's low nibble (0f 8x). Patch offset back. */
 int x86_jcc_rel32(struct code *c, int setcc)

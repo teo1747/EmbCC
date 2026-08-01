@@ -41,6 +41,8 @@ static int g_want_debug;
 static int g_regalloc;          /* defined below; -O2 register allocation is on */
 static const int *g_loc;        /* per-vreg physical register at -O2, or -1 */
 static int g_opt_frames;        /* -O1+: dead temps take no stack slot (frame shrink) */
+static int g_has_cgoto;         /* function has a computed goto: liveness is
+                                 * imprecise -> no regalloc / no slot coalescing */
 
 static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
 {
@@ -151,7 +153,7 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
                 slot[k] = g_opt_frames ? -1 : pool++;
                 continue;
             }
-            int coalescable = (blk[first[k]] == blk[last[k]]);
+            int coalescable = (blk[first[k]] == blk[last[k]]) && !g_has_cgoto;
             /* expire actives dead before this temp is defined */
             for (int a = 0; a < nact; ) {
                 if (act_last[a] < first[k]) {
@@ -239,6 +241,7 @@ static int ins_def(const struct ir_ins *in)
     case IR_SHR: case IR_XCHG: case IR_XADD: case IR_CMPXCHG:
     case IR_STVAR:            /* the local written */
     case IR_CALL:             /* always stores a (possibly-unused) result temp */
+    case IR_LABELADDR:        /* dst = &&label */
         return in->dst;
     default:
         return -1;            /* STORE, RET, LABEL, JMP, branches, MEMCPY, ... */
@@ -720,7 +723,7 @@ static int *coalesce_locals(struct ir_func *fn, int *nslots_out)
 {
     int n = fn->src->nvars;
     int *slot = xmalloc((size_t)(n ? n : 1) * sizeof *slot);
-    if (n == 0 || g_want_debug || !fn->var_scope_lo) {
+    if (n == 0 || g_want_debug || g_has_cgoto || !fn->var_scope_lo) {
         for (int i = 0; i < n; i++) slot[i] = i;   /* one slot each */
         *nslots_out = n;
         return slot;
@@ -1038,7 +1041,7 @@ static const int *g_loc;      /* per-vreg physical register, or -1; NULL when of
 
 static void cg_reset(void) { rc_vreg = -1; rc_zx = 0; }
 
-static int in_reg(int vreg) { return g_regalloc && g_loc[vreg] >= 0; }
+static int in_reg(int vreg) { return g_regalloc && g_loc && g_loc[vreg] >= 0; }
 
 /* Is vreg cacheable in RAX? Register-resident vregs and memory TEMPS are (their
  * value is never aliased through memory); a memory LOCAL is not (a store through
@@ -1166,6 +1169,22 @@ static void gen_func(struct ir_func *fn, struct code *text,
     int sret_slot;
     int va_save, va_tag;
 
+    /* A computed goto's indirect jump makes the CFG imprecise (it can reach any
+     * address-taken label), so the liveness the allocator and slot-coalescing
+     * rely on is unsound here. Keep such functions in the plain memory model:
+     * no register allocation, and every temp/local gets its own slot. */
+    g_has_cgoto = 0;
+    for (int n = 0; n < fn->nins; n++)
+        if (fn->ins[n].op == IR_IGOTO || fn->ins[n].op == IR_LABELADDR)
+            { g_has_cgoto = 1; break; }
+    /* Give such a function the plain memory model for its whole codegen: no
+     * register allocation and no RAX residency cache. Both reason about values
+     * across straight-line control flow, which an indirect jump violates (the
+     * cache would elide the reload before `jmp *rax`, jumping through a stale
+     * register). Restored at the single exit so other functions are unaffected. */
+    int saved_regalloc = g_regalloc, saved_regcache = g_regcache;
+    if (g_has_cgoto) { g_regalloc = 0; g_regcache = 0; }
+
     /* -O2: allocate eligible vregs to callee-saved registers first, so the
      * frame can reserve a save slot for each register the allocator uses.
      * When regalloc is off, loc is all -1 and nsave 0 — every path below is a
@@ -1173,7 +1192,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
      * cg_load_rcx via in_reg(). */
     int used_callee[NCALLEE], nsave = 0;
     int *loc = NULL;
-    if (g_regalloc) {
+    if (g_regalloc && !g_has_cgoto) {
         loc = regalloc(fn, used_callee, &nsave);
         g_loc = loc;
     } else {
@@ -1299,7 +1318,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
     /* -O2: params were stored to their slots above; move each register-resident
      * param's incoming value into its register. (Its low bits are the value; a
      * signed read re-extends, so no widening subtlety.) */
-    if (g_regalloc)
+    if (g_regalloc && g_loc)
         for (int p = 0; p < f->nparams; p++) {
             if (g_loc[p] < 0) continue;
             struct type *pt = f->param_tys[p];
@@ -1824,6 +1843,27 @@ static void gen_func(struct ir_func *fn, struct code *text,
             nbrs++;
             break;
         }
+        case IR_LABELADDR: {
+            /* dst = &&label: `lea rax,[rip+disp32]`, the disp32 patched to the
+             * label's code offset via the SAME list and formula as a rel32
+             * branch (target - (patch_off + 4)). */
+            int patch = x86_lea_rax_rip(text);
+            if (nbrs == capbrs) {
+                capbrs = capbrs ? capbrs * 2 : 16;
+                brs = xrealloc(brs, (size_t)capbrs * sizeof *brs);
+            }
+            brs[nbrs].patch_off = patch;
+            brs[nbrs].label = i->label;
+            nbrs++;
+            cg_store(text, sd, i->dst, 8);
+            break;
+        }
+        case IR_IGOTO:
+            /* goto *a: jump to the computed code address held in a. */
+            cg_load(text, sd, i->a, 8, 0, 8);
+            cg_reset();
+            x86_jmp_reg(text, REG_RAX);
+            break;
         case IR_CALL: {
             /* SysV walks TWO register files independently: integers and
              * pointers take rdi..r9, floats take xmm0..7. */
@@ -2162,6 +2202,8 @@ static void gen_func(struct ir_func *fn, struct code *text,
     free(loc);
     free(usecnt);
     g_loc = NULL;
+    g_regalloc = saved_regalloc;      /* restore (a cgoto function forced them off) */
+    g_regcache = saved_regcache;
 
     f->code_len = text->len - f->code_off;
 }

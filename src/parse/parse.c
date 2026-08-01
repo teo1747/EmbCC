@@ -1210,6 +1210,17 @@ static struct expr *parse_unary(struct parser *ps)
         advance(ps);
         e->rhs = parse_unary(ps);
         return e;
+    case TOK_ANDAND:
+        /* GNU computed-goto label address: `&&label` yields a void* to that
+         * label's code location, the target of a later `goto *expr`. */
+        advance(ps);
+        if (cur(ps)->kind != TOK_IDENT)
+            diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
+                    "expected a label name after '&&'");
+        e = new_expr(EXPR_LABELADDR, t->line, t->col);
+        e->name = cur(ps)->text;
+        advance(ps);
+        return e;
     case TOK_PLUSPLUS:
     case TOK_MINUSMINUS: {
         int delta = t->kind == TOK_PLUSPLUS ? 1 : -1;
@@ -1844,6 +1855,14 @@ static struct stmt *parse_stmt(struct parser *ps, int allow_decl)
     case TOK_KW_GOTO:
         s = new_stmt(STMT_GOTO, t->line, t->col);
         advance(ps);
+        if (cur(ps)->kind == TOK_STAR) {
+            /* GNU computed goto: `goto *expr` jumps to the label address in
+             * expr (a void*). s->expr set, s->name NULL marks the indirect form. */
+            advance(ps);
+            s->expr = parse_expr(ps);
+            expect(ps, TOK_SEMI, "';'");
+            return s;
+        }
         if (cur(ps)->kind != TOK_IDENT)
             diag_at(ps->lx.file, cur(ps)->line, cur(ps)->col,
                        "expected a label name after 'goto'");

@@ -21,7 +21,7 @@ enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF, EXPR_ALIGNOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
                  EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT,
-                 EXPR_GENERIC, EXPR_STMTEXPR };
+                 EXPR_GENERIC, EXPR_STMTEXPR, EXPR_LABELADDR };
 
 struct stmt;   /* a statement expression `({ ... })` carries a block */
 
