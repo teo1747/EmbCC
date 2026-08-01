@@ -1463,6 +1463,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_load_reg_mem(text, g_loc[i->dst], REG_RBP, sd[i->a], 8);
                 break;
             }
+            /* source register-resident, dest in memory: store straight to the
+             * slot (`mov %rN,slot`) instead of routing through RAX (`mov %rN,%rax;
+             * mov %rax,slot`). RAX and its residency cache are untouched — the
+             * value already in RAX (if any) stays valid. */
+            if (in_reg(i->a)) {
+                x86_store_mem_reg(text, REG_RBP, sd[i->dst], g_loc[i->a], 8);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);
             cg_store(text, sd, i->dst, 8);
             break;
@@ -1743,6 +1751,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
              * i->size bytes; a later read movsx/movzx-extends from them. */
             if (cg_reg_move(text, i->dst, i->a, i->size))
                 break;
+            /* register-resident source into a MEMORY local: store the register's
+             * low i->size bytes straight to the slot (`mov %rN,slot`) instead of
+             * `mov %rN,%rax; mov %rax,slot`. A local's slot holds only its low
+             * i->size bytes (reads movsx/movzx-extend), so this writes exactly
+             * what the RAX path would, byte-for-byte, at any width. RAX and its
+             * residency cache are untouched. */
+            if (in_reg(i->a) && !in_reg(i->dst)) {
+                x86_store_mem_reg(text, REG_RBP, sd[i->dst], g_loc[i->a], i->size);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);
             if (in_reg(i->dst))                          /* register-resident local */
                 x86_mov_rr_w(text, g_loc[i->dst], REG_RAX, i->size);
