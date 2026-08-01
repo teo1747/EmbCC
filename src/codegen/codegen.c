@@ -1126,6 +1126,39 @@ static int cg_reg_move(struct code *text, int dst, int a, int w)
     return 1;
 }
 
+/* Emit the flag-setting form of an integer IR_CMP `i` (`cmp b,a` / `test a`),
+ * leaving the 0/1 result UNMATERIALISED — the caller then either branches (jcc)
+ * or setcc's it. The point is operand `a`: a comparison only reads its operands,
+ * so when `a` is register-resident we compare straight from its register instead
+ * of the old `mov a,%rax; cmp ...` staging move. `a` is staged through RAX only
+ * when it isn't in a register, or when `b` sits in memory (there is no
+ * register-vs-memory compare encoder, so the register operand must be RAX for
+ * `cmp mem,%rax`). When regalloc is off in_reg() is always false, so this always
+ * falls to the cg_load path and stays byte-identical to the pre-existing code.
+ *
+ * Cache: on the register-direct paths RAX is untouched, but the caller's
+ * following setcc/jcc clobbers or resets it, so this leaves the residency cache
+ * alone and relies on the caller (cg_store after setcc, cg_reset after jcc). */
+static void cg_icmp_flags(struct code *text, const int *sd, struct ir_ins *i)
+{
+    int b_mem = !i->imm_b && !in_reg(i->b);
+    int areg;
+    if (in_reg(i->a) && !b_mem) {
+        areg = g_loc[i->a];                       /* read a from its register */
+    } else {
+        cg_load(text, sd, i->a, i->w, 0, i->w);   /* stage a in RAX */
+        areg = REG_RAX;
+    }
+    if (i->imm_b) {
+        if (i->imm == 0) x86_test_reg(text, areg, i->w);
+        else             x86_alu_reg_imm(text, 'c', areg, i->imm, i->w);
+    } else if (in_reg(i->b)) {
+        x86_cmp_rr(text, areg, g_loc[i->b], i->w);
+    } else {
+        x86_cmp_eax_mem(text, sd[i->b], i->w);    /* areg == RAX here */
+    }
+}
+
 /* Emit a set of register-to-register moves that must take effect "in parallel":
  * every dest receives its src's ORIGINAL value even when a dest is another
  * move's src (a chain) or two moves swap (a cycle). All dests are distinct.
@@ -1646,15 +1679,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 (fn->ins[n + 1].op == IR_BRZ || fn->ins[n + 1].op == IR_BRNZ) &&
                 fn->ins[n + 1].a == i->dst && usecnt[i->dst] == 1) {
                 struct ir_ins *br = &fn->ins[n + 1];
-                cg_load(text, sd, i->a, i->w, 0, i->w);
-                if (i->imm_b) {
-                    if (i->imm == 0) x86_test_reg(text, REG_RAX, i->w);
-                    else x86_alu_reg_imm(text, 'c', REG_RAX, i->imm, i->w);
-                } else if (in_reg(i->b)) {
-                    x86_cmp_rr(text, REG_RAX, g_loc[i->b], i->w);
-                } else {
-                    x86_cmp_eax_mem(text, sd[i->b], i->w);
-                }
+                cg_icmp_flags(text, sd, i);
                 /* BRNZ jumps when the comparison is true; BRZ when it is false. */
                 enum binop jp = br->op == IR_BRNZ ? i->pred
                                                   : negate_pred(i->pred);
@@ -1670,15 +1695,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 n++;                              /* consume the fused branch */
                 break;
             }
-            cg_load(text, sd, i->a, i->w, 0, i->w);
-            if (i->imm_b) {
-                if (i->imm == 0) x86_test_reg(text, REG_RAX, i->w);
-                else x86_alu_reg_imm(text, 'c', REG_RAX, i->imm, i->w);
-            } else if (in_reg(i->b)) {
-                x86_cmp_rr(text, REG_RAX, g_loc[i->b], i->w);
-            } else {
-                x86_cmp_eax_mem(text, sd[i->b], i->w);
-            }
+            cg_icmp_flags(text, sd, i);
             x86_setcc_eax(text, cc_for(i->pred, i->sign));
             cg_store(text, sd, i->dst, 4);        /* the 0/1 result is an int */
             break;
