@@ -1815,6 +1815,22 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         }
         case IR_LOAD:
+            /* Register-resident dest: load straight into it, no result-carrying
+             * `mov %rax,%rN`. The address is either already in a register (RAX
+             * wholly untouched — cache preserved) or staged into RAX as the base
+             * (RAX still holds that address afterward, so its cache entry stays
+             * valid — the load reads [rax], it does not overwrite rax). */
+            if (in_reg(i->dst)) {
+                if (in_reg(i->a)) {
+                    x86_load_base_reg(text, g_loc[i->dst], g_loc[i->a],
+                                      i->size, i->sign, i->w);
+                    break;
+                }
+                cg_load(text, sd, i->a, 8, 0, 8);       /* the address -> rax */
+                x86_load_base_reg(text, g_loc[i->dst], REG_RAX,
+                                  i->size, i->sign, i->w);
+                break;
+            }
             /* Address already in a register: load straight from [reg], skipping
              * the `mov reg,rax`. dst is a temp (cacheable), so cg_store below
              * fixes the residency cache. */
