@@ -561,27 +561,45 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         }
     }
 
-    /* Move-preference (coalescing) graph: a plain copy `dst = a` costs nothing
-     * if dst and a share a register, so record a preference edge between them
-     * when they do NOT interfere. Colouring then biases each vreg toward a
-     * move-partner's colour and codegen drops the now-identical self-move. Only
-     * IR_MOV and IR_STVAR are always plain copies; an IR_LDVAR only when it
-     * emits no extension (ldvar_plain) — a narrow or signed-widening load must
-     * keep its movsx/movzx. */
+    /* Move-preference (coalescing) graph: two vregs that share a register let
+     * codegen drop a move, so record a preference edge between them when they do
+     * NOT interfere; colouring then biases each toward a move-partner's colour.
+     * Two sources of a preferred pair:
+     *  - a plain copy `dst = a` (IR_MOV / IR_STVAR / non-extending IR_LDVAR):
+     *    same register makes the copy a self-move that vanishes.
+     *  - a two-address binop `dst = a OP b`: codegen emits `OP b,dst` with no
+     *    setup move when dst holds operand a (`dst == a`), or the commuted
+     *    `OP a,dst` when dst holds b and OP commutes. So dst prefers a, and for a
+     *    commutative op with a register b, dst prefers b too. SUB/SHL/SHR do not
+     *    commute (dst == b would force the RAX fallback), so only a is preferred.
+     * Each edge is a BIAS, not a constraint, and is dropped when the pair
+     * interferes — which is exactly when operand a is still live after the op, so
+     * a genuinely reusable (dying) operand is the only one ever coalesced. */
     unsigned long *pref = E ? xcalloc((size_t)E * ew, sizeof *pref) : NULL;
     for (int i = 0; pref && i < nins; i++) {
         struct ir_ins *in = &fn->ins[i];
         enum ir_op op = in->op;
-        if (op != IR_MOV && op != IR_STVAR &&
-            !(op == IR_LDVAR && ldvar_plain(in->size, in->sign, in->w)))
-            continue;
-        int d = fn->ins[i].dst, a = fn->ins[i].a;
-        if (d < 0 || d >= nvr || a < 0 || a >= nvr) continue;
-        int ed = eof[d], ea = eof[a];
-        if (ed < 0 || ea < 0 || ed == ea) continue;
-        if (adj[(size_t)ed * ew + (ea >> 6)] & (1UL << (ea & 63))) continue;
-        pref[(size_t)ed * ew + (ea >> 6)] |= 1UL << (ea & 63);
-        pref[(size_t)ea * ew + (ed >> 6)] |= 1UL << (ed & 63);
+        int d = in->dst, partner[2], np = 0;
+        if (op == IR_MOV || op == IR_STVAR ||
+            (op == IR_LDVAR && ldvar_plain(in->size, in->sign, in->w))) {
+            partner[np++] = in->a;
+        } else if (op == IR_ADD || op == IR_SUB || op == IR_MUL ||
+                   op == IR_AND || op == IR_OR || op == IR_XOR ||
+                   op == IR_SHL || op == IR_SHR) {
+            partner[np++] = in->a;                       /* dst prefers a */
+            int commut = op == IR_ADD || op == IR_MUL || op == IR_AND ||
+                         op == IR_OR || op == IR_XOR;
+            if (commut && !in->imm_b) partner[np++] = in->b;
+        }
+        for (int k = 0; k < np; k++) {
+            int a = partner[k];
+            if (d < 0 || d >= nvr || a < 0 || a >= nvr) continue;
+            int ed = eof[d], ea = eof[a];
+            if (ed < 0 || ea < 0 || ed == ea) continue;
+            if (adj[(size_t)ed * ew + (ea >> 6)] & (1UL << (ea & 63))) continue;
+            pref[(size_t)ed * ew + (ea >> 6)] |= 1UL << (ea & 63);
+            pref[(size_t)ea * ew + (ed >> 6)] |= 1UL << (ed & 63);
+        }
     }
 
     /* Chaitin-Briggs simplify order. Repeatedly remove a node of degree < NCALLEE
