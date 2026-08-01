@@ -1013,6 +1013,24 @@ void x86_ucomis_mem(struct code *c, int disp, int w)
     modrm_rbp(c, 0, disp);
 }
 
+/* setcc + zero-extend into an ARBITRARY register (register-targeted
+ * x86_setcc_eax; identical bytes when reg == rax). Writes reg's low byte then
+ * movzx-widens it in place -- RAX is never touched. Valid for the -O2 register
+ * pool {r8..r15, rbx}: rbx maps to the directly-addressable bl and r8..r15 use
+ * REX.B, so the ah/ch/dh/bh aliasing trap (rm 4..7 with no REX) never arises. */
+void x86_setcc_reg(struct code *c, int cc, int reg)
+{
+    if (reg & 8) code_byte(c, 0x41);          /* REX.B: setcc r8b..r15b */
+    code_byte(c, 0x0f);
+    code_byte(c, cc);                          /* setcc r/m8 */
+    code_byte(c, 0xc0 | (reg & 7));
+    { int rex = 0x40 | ((reg & 8) ? 5 : 0);   /* REX.R|REX.B when extended */
+      if (rex != 0x40) code_byte(c, rex); }
+    code_byte(c, 0x0f);                        /* movzx reg32, reg8 */
+    code_byte(c, 0xb6);
+    code_byte(c, 0xc0 | ((reg & 7) << 3) | (reg & 7));
+}
+
 void x86_set_float_eq(struct code *c, int ne)
 {
     /* ucomis sets ZF=PF=CF=1 for unordered. == must be false for NaN,

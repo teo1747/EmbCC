@@ -135,6 +135,7 @@ void x86_lock_cmpxchg_rcx(struct code *c, int size);
  * cc is the setcc opcode byte (0x92..0x9f), chosen by codegen. */
 void x86_cmp_eax_mem(struct code *c, int disp, int w);
 void x86_setcc_eax(struct code *c, int cc);
+void x86_setcc_reg(struct code *c, int cc, int reg); /* setcc+movzx into any reg */
 
 /* Branches: test eax/rax; jz/jmp with a zero rel32 placeholder — both
  * return the patch offset, resolved per-function by codegen. */

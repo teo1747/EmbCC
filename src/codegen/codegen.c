@@ -1713,6 +1713,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 break;
             }
             cg_icmp_flags(text, sd, i);
+            /* Register-resident dest: setcc + widen straight into it, no
+             * result-carrying `mov %eax,%rN`. setcc_reg touches only the home
+             * register, so a value cached in RAX (e.g. operand a, if it was
+             * staged) survives. */
+            if (in_reg(i->dst)) {
+                x86_setcc_reg(text, cc_for(i->pred, i->sign), g_loc[i->dst]);
+                break;
+            }
             x86_setcc_eax(text, cc_for(i->pred, i->sign));
             cg_store(text, sd, i->dst, 4);        /* the 0/1 result is an int */
             break;
