@@ -1302,27 +1302,36 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 continue;
             }
             if (n == 0) {
-                /* MEMORY: copy it out of the caller's frame into ours,
-                 * so its address is a normal local. */
+                /* MEMORY: copy it out of the caller's frame into ours, so its
+                 * address is a normal local. RAX carries each eightbyte, so the
+                 * destination pointer needs a DIFFERENT scratch — and not an
+                 * integer arg register (RCX would drop a later scalar param that
+                 * arrives in it). r11 is caller-saved, never an arg register, and
+                 * free at prologue time (params reach their allocated registers
+                 * only in the parallel move that runs after this loop). */
                 int sz = ty_size(pt);
-                x86_lea_reg_slot(text, REG_RCX, sd[i]);
+                x86_lea_reg_slot(text, 11 /*r11*/, sd[i]);
                 for (int off = 0; off < sz; off += 8) {
                     int chunk = sz - off >= 8 ? 8 : sz - off;
                     x86_load_reg_mem(text, REG_RAX, REG_RBP,
                                      incoming + off, chunk >= 8 ? 8 : chunk);
-                    x86_store_mem_reg(text, REG_RCX, off, REG_RAX,
+                    x86_store_mem_reg(text, 11 /*r11*/, off, REG_RAX,
                                       chunk >= 8 ? 8 : chunk);
                 }
                 incoming += (sz + 7) & ~7;
                 continue;
             }
-            /* registers -> the parameter's own storage */
-            x86_lea_reg_slot(text, REG_RCX, sd[i]);
+            /* registers -> the parameter's own storage. The slot-address scratch
+             * must NOT be an integer arg register: RCX (the 4th int arg) would be
+             * clobbered here before a later scalar param arriving in it is stored
+             * (`f(struct{long,long} s, long a, long b)` -> b lost). RAX is free at
+             * prologue time and is never an argument register. */
+            x86_lea_reg_slot(text, REG_RAX, sd[i]);
             for (int k = 0; k < n; k++) {
                 if (cls[k] == CLASS_SSE)
-                    x86_movs_store_base(text, REG_RCX, k * 8, freg++, 8);
+                    x86_movs_store_base(text, REG_RAX, k * 8, freg++, 8);
                 else
-                    x86_store_mem_reg(text, REG_RCX, k * 8,
+                    x86_store_mem_reg(text, REG_RAX, k * 8,
                                       x86_argreg(ireg++), 8);
             }
         }
