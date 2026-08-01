@@ -1571,6 +1571,16 @@ static void gen_func(struct ir_func *fn, struct code *text,
         }
         case IR_NEG:
         case IR_BNOT:
+            /* Both register-resident: negate/complement in the dest register
+             * (in place when dst and a coalesced onto one), no RAX detour. */
+            if (in_reg(i->dst) && in_reg(i->a)) {
+                int D = g_loc[i->dst], A = g_loc[i->a];
+                if (D != A)
+                    x86_mov_rr_w(text, D, A, i->w);
+                if (i->op == IR_NEG) x86_neg_reg(text, D, i->w);
+                else                 x86_not_reg(text, D, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->w, 0, i->w);
             if (i->op == IR_NEG)
                 x86_neg_eax(text, i->w);

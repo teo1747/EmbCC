@@ -117,6 +117,8 @@ void x86_div_rr(struct code *c, int src, int sign, int w);    /* [rdx:rax]/src *
 /* argument registers by index, for aggregates arriving in pieces */
 int  x86_argreg(int index);
 void x86_not_eax(struct code *c, int w);
+void x86_neg_reg(struct code *c, int reg, int w);   /* neg reg, in place */
+void x86_not_reg(struct code *c, int reg, int w);   /* not reg, in place */
 void x86_bswap(struct code *c, int size);
 void x86_mfence(struct code *c);
 void x86_ud2(struct code *c);

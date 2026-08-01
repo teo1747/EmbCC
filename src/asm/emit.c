@@ -876,6 +876,20 @@ void x86_not_eax(struct code *c, int w)
     code_byte(c, 0xf7); /* not: /2 */
     code_byte(c, 0xd0);
 }
+/* neg/not on an arbitrary register (reg in the r/m field, /3 and /2). Lets a
+ * register-resident unary op stay in place, no RAX round-trip. */
+void x86_neg_reg(struct code *c, int reg, int w)
+{
+    rex_rb(c, w == 8 ? 1 : 0, 0, reg);
+    code_byte(c, 0xf7);
+    code_byte(c, 0xd8 + (reg & 7)); /* mod=11 /3 rm=reg */
+}
+void x86_not_reg(struct code *c, int reg, int w)
+{
+    rex_rb(c, w == 8 ? 1 : 0, 0, reg);
+    code_byte(c, 0xf7);
+    code_byte(c, 0xd0 + (reg & 7)); /* mod=11 /2 rm=reg */
+}
 
 /* The SSE2 prefix that selects scalar single vs scalar double. */
 static void sse_prefix(struct code *c, int w)
