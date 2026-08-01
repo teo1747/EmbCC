@@ -459,7 +459,8 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (is_float) { OPAQUE(in->dst); OPAQUE(in->a); OPAQUE(in->b); }
         switch (in->op) {
         case IR_ADDR:      OPAQUE(in->a); break;          /* address-taken */
-        case IR_STORE:     OPAQUE(in->a); break;          /* raw address slot */
+        /* IR_STORE's address is register-aware now (codegen stores to [reg]),
+         * so it is NOT opaque — only its raw value path was. */
         case IR_VA_START:  OPAQUE(in->a); break;
         case IR_XCHG: case IR_XADD:
             OPAQUE(in->a); OPAQUE(in->b); break;          /* raw addr/val slots */
@@ -1745,6 +1746,14 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STORE:
+            /* Address already in a register (mirrors IR_LOAD): store straight to
+             * [reg], skipping the slot->rcx load — which is what lets the address
+             * temp be register-allocated at all (its OPAQUE marking is dropped). */
+            if (in_reg(i->a)) {
+                cg_load(text, sd, i->b, 8, 0, 8);           /* the value -> rax */
+                x86_store_mem_reg(text, g_loc[i->a], 0, REG_RAX, i->size);
+                break;
+            }
             x86_mov_rcx_slot(text, sd[i->a]);       /* the address -> rcx */
             cg_load(text, sd, i->b, 8, 0, 8);       /* the value -> rax */
             x86_store_mem_rcx(text, i->size);
