@@ -687,6 +687,42 @@ int x86_lea_rax_rip(struct code *c)
     return off;
 }
 
+/* lea reg, [rip+rel32] into an arbitrary register (byte-identical to the rax
+ * form when reg == rax). Returns the rel32 patch offset, as x86_lea_rax_rip. */
+int x86_lea_reg_rip(struct code *c, int reg)
+{
+    code_byte(c, 0x48 | ((reg & 8) ? 4 : 0));    /* REX.W (+REX.R) */
+    code_byte(c, 0x8d);
+    code_byte(c, 0x05 | ((reg & 7) << 3));        /* mod=00 reg rm=101 = RIP */
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
+/* mov reg, imm into an arbitrary register — the register-targeted form of
+ * x86_mov_eax_imm (identical bytes when reg == rax): 32-bit immediate,
+ * sign-extended 32-bit into a 64-bit register, or a full movabs imm64. */
+void x86_mov_reg_imm(struct code *c, int reg, long imm, int w)
+{
+    if (w == 4) {
+        if (reg & 8) code_byte(c, 0x41);          /* REX.B */
+        code_byte(c, 0xb8 | (reg & 7));           /* mov r32, imm32 */
+        code_u32(c, (unsigned long)imm);
+        return;
+    }
+    if (imm >= -2147483647L - 1 && imm <= 2147483647L) {
+        code_byte(c, 0x48 | ((reg & 8) ? 1 : 0)); /* REX.W (+REX.B) */
+        code_byte(c, 0xc7);
+        code_byte(c, 0xc0 | (reg & 7));           /* mov r/m64, imm32 (sext) */
+        code_u32(c, (unsigned long)imm);
+        return;
+    }
+    code_byte(c, 0x48 | ((reg & 8) ? 1 : 0));     /* REX.W (+REX.B) movabs */
+    code_byte(c, 0xb8 | (reg & 7));
+    code_u32(c, (unsigned long)imm & 0xffffffffUL);
+    code_u32(c, ((unsigned long)imm >> 32) & 0xffffffffUL);
+}
+
 void x86_zero_eax(struct code *c)
 {
     code_byte(c, 0x31); /* xor eax, eax */

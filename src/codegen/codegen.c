@@ -1440,6 +1440,15 @@ static void gen_func(struct ir_func *fn, struct code *text,
                        "floating point needs SSE, which -mno-sse forbids");
         switch (i->op) {
         case IR_CONST:
+            /* Register-resident dest: materialise the constant straight in its
+             * register (`xor D,D` for zero, else `mov $imm,D`), no RAX detour and
+             * no store. RAX is untouched, so a value cached there survives. */
+            if (in_reg(i->dst)) {
+                int D = g_loc[i->dst];
+                if (i->imm == 0) x86_alu_rr(text, '^', D, D, 4);
+                else             x86_mov_reg_imm(text, D, i->imm, i->w);
+                break;
+            }
             /* -O2: materialise zero with `xor eax,eax` (2 bytes, upper zeroed)
              * rather than a 7-byte `mov`. Gated to keep -O0/-O1 byte-identical;
              * safe because no comparison's flags are live across a CONST. */
@@ -1768,31 +1777,41 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_store_slot(text, sd[i->dst], i->size); /* dst is a local */
             break;
         case IR_ADDR:
+            /* Register-resident dest: lea straight into it, no RAX detour/store. */
+            if (in_reg(i->dst)) { x86_lea_reg_slot(text, g_loc[i->dst], sd[i->a]); break; }
             x86_lea_rax_slot(text, sd[i->a]);
             cg_store(text, sd, i->dst, 8);
             break;
         case IR_STRADDR: {
+            /* The lea's rel32 is relocated whether it targets RAX or a home
+             * register; only the destination register differs. */
+            int D = in_reg(i->dst);
             struct strsite ss;
-            ss.patch_off = x86_lea_rax_rip(text);
+            ss.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
+                             : x86_lea_rax_rip(text);
             ss.str_off = i->label;  /* resolved to an offset below */
             PUSH(st->str, st->nstr, st->capstr, ss);
-            cg_store(text, sd, i->dst, 8);
+            if (!D) cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_GADDR: {
+            int D = in_reg(i->dst);
             struct gsite gs;
-            gs.patch_off = x86_lea_rax_rip(text);
+            gs.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
+                             : x86_lea_rax_rip(text);
             gs.glob = i->glob;
             PUSH(st->g, st->ng, st->capg, gs);
-            cg_store(text, sd, i->dst, 8);
+            if (!D) cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_FADDR: {
+            int D = in_reg(i->dst);
             struct fsite fs;
-            fs.patch_off = x86_lea_rax_rip(text);
+            fs.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
+                             : x86_lea_rax_rip(text);
             fs.target = i->callee;
             PUSH(st->f, st->nf, st->capf, fs);
-            cg_store(text, sd, i->dst, 8);
+            if (!D) cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_LOAD:

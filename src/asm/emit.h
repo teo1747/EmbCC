@@ -58,6 +58,10 @@ void x86_mov_rcx_slot(struct code *c, int disp);  /* mov rcx,[rbp+disp] */
 void x86_lea_rax_slot(struct code *c, int disp);  /* lea rax,[rbp+disp] */
 /* lea rax,[rip+0]; returns the rel32 patch offset (for a relocation). */
 int x86_lea_rax_rip(struct code *c);
+/* Same into an arbitrary register (for -O2 register-resident address temps). */
+int x86_lea_reg_rip(struct code *c, int reg);
+/* mov reg,imm — register-targeted x86_mov_eax_imm (same bytes when reg==rax). */
+void x86_mov_reg_imm(struct code *c, int reg, long imm, int w);
 void x86_zero_eax(struct code *c); /* xor eax,eax — al=0 for varargs calls */
 
 void x86_alu_eax_mem(struct code *c, int op, int disp, int w); /* + - * & | ^ */
