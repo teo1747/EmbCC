@@ -575,6 +575,45 @@ void x86_load_base_reg(struct code *c, int dst, int base,
     }
 }
 
+/* dst = *(base+disp) with size/sign extension into an ARBITRARY register — the
+ * register-targeted form of x86_load_basedisp_rax (identical bytes when
+ * dst == rax). Used to extend a memory local/temp straight into its home reg. */
+void x86_load_reg_basedisp(struct code *c, int dst, int base, int disp,
+                           int size, int sign, int w)
+{
+    int rexRB = ((dst & 8) ? 4 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexRB;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base(c, dst, base, disp);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexRB);
+            code_byte(c, 0x63);      /* movsxd dst, [base+disp] */
+        } else {
+            int rex = 0x40 | rexRB;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_base(c, dst, base, disp);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexRB);
+        code_byte(c, 0x8b);
+        modrm_base(c, dst, base, disp);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
 void x86_load_basedisp_rax(struct code *c, int base, int disp,
                            int size, int sign, int w)
 {

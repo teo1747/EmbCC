@@ -51,6 +51,8 @@ void x86_load_baseindex_rax(struct code *c, int base, int index, int scale,
                             int size, int sign, int w); /* rax = *(base+index*scale) */
 void x86_load_basedisp_rax(struct code *c, int base, int disp,
                            int size, int sign, int w); /* rax = *(base+disp) */
+void x86_load_reg_basedisp(struct code *c, int dst, int base, int disp,
+                           int size, int sign, int w); /* dst = *(base+disp) */
 void x86_store_basedisp_rax(struct code *c, int base, int disp, int size); /* *(base+disp)=rax */
 void x86_store_baseindex_rax(struct code *c, int base, int index, int scale,
                              int size); /* *(base+index*scale)=rax */

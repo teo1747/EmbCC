@@ -1110,6 +1110,27 @@ static void cg_load_rcx(struct code *text, const int *sd, int vreg, int w)
         x86_mov_ecx_mem(text, sd[vreg], w);
 }
 
+/* Produce the size/sign/w-extended value of vreg `a` straight in register `dst`
+ * (never RAX): the "extend into the home register" analogue of cg_load, used for
+ * a register-resident LDVAR/EXT result whose load actually extends (movsx/movzx/
+ * movsxd). Mirrors cg_load's extension choices exactly. Leaves RAX and its
+ * residency cache untouched. */
+static void cg_ext_into(struct code *text, const int *sd, int dst, int a,
+                        int size, int sign, int w)
+{
+    if (in_reg(a)) {
+        int R = g_loc[a];
+        if (size == 1 || size == 2)
+            x86_movx_rr(text, dst, R, size, sign, w);
+        else if (size == 4 && sign && w == 8)
+            x86_movsxd_rr(text, dst, R);
+        else
+            x86_mov_rr_w(text, dst, R, size == 8 ? 8 : w);
+    } else {
+        x86_load_reg_basedisp(text, dst, REG_RBP, sd[a], size, sign, w);
+    }
+}
+
 /* A plain reg-to-reg copy dst<-a of `w` bytes when BOTH vregs are register-
  * resident: emit a single move (or nothing when they already share a register)
  * instead of routing the value through RAX (mov a,%rax; mov %rax,dst). RAX and
@@ -1759,6 +1780,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_load_reg_mem(text, g_loc[i->dst], REG_RBP, sd[i->a], i->size);
                 break;
             }
+            /* Extending read (movsx/movzx/movsxd) into a register-resident temp:
+             * extend straight into it, no RAX detour. */
+            if (in_reg(i->dst)) {
+                cg_ext_into(text, sd, g_loc[i->dst], i->a, i->size, i->sign, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
@@ -1866,6 +1893,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
             break;
         case IR_EXT:
             /* re-extend from the low `size` bytes of the temp's slot */
+            if (in_reg(i->dst)) {
+                cg_ext_into(text, sd, g_loc[i->dst], i->a, i->size, i->sign, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
