@@ -43,6 +43,8 @@ maphost() {
     case "$p" in
         /data/apps/embcc/embcc.elf) p="$HOST/embcc" ;;
         /data/apps/embld/embld.elf) p="$HOST/embld" ;;
+        /data/apps/embcc/include)   p="$HOST/include" ;;
+        /data/apps/embcc/include/*) p="$HOST/include/${p#/data/apps/embcc/include/}" ;;
         /data/src/kernel)           p="$MYOS/kernel" ;;
         /data/src/kernel/*)         p="$MYOS/kernel/${p#/data/src/kernel/}" ;;
         /data/build/out/kernel/*)   p="$STAGE/${p#/data/build/out/kernel/}" ;;
