@@ -448,23 +448,30 @@ bootloader loads. Invocation:
 embld -e _start -Ttext 0xFFFFFFFF80100000 -o kernel.elf <all .o> <nasm .o>
 ```
 
-### L1 — linker-defined symbols (`kernel_end`) — the ONE blocker
-The kernel's linker script ends with `kernel_end = .;` and `pmm.c` places the PMM
-bitmap at `kernel_end`. EmbLD has no `-T`/symbol-assignment, so:
+### L1 — linker-defined symbols (`kernel_end`) — DONE
+*It was the one blocker; option (b) below is what shipped.* EmbLD now
+auto-defines the end-of-image family — `kernel_end`, `_end`, `end`, `__bss_end`,
+`__kernel_end` — at the true end of `.bss`, only when referenced and otherwise
+undefined, so a real definition still wins and ordinary programs are untouched.
+The diagnostic stub is gone and **the kernel links with zero external tools.**
+
+*The problem, as it stood:* the kernel's linker script ends with
+`kernel_end = .;` and `pmm.c` places the PMM bitmap at `kernel_end`. EmbLD had
+no `-T`/symbol-assignment, so:
 
 ```
 embld: undefined symbol 'kernel_end' (referenced by …/pmm.c.o)
 ```
 
-It's the **only** thing missing — a diagnostic stub (`kernel_end equ <addr past
-the image>`) let the link succeed and the kernel boot to the desktop. **Fix
-options:** (a) minimal `-T` linker-script support handling `SYM = .` assignments
-(the general answer — also subsumes `-Ttext`/`-e`/`ENTRY()`); or (b) implicitly
-define end-of-image symbols and let the kernel script alias `kernel_end` to one.
-Once EmbLD defines `kernel_end` at the true end of `.bss`, the stub goes and the
-kernel links with **zero** external tools.
+It was the **only** thing missing — a diagnostic stub (`kernel_end equ <addr
+past the image>`) let the link succeed and the kernel boot to the desktop. **Fix
+options were:** (a) minimal `-T` linker-script support handling `SYM = .`
+assignments (the general answer — also subsumes `-Ttext`/`-e`/`ENTRY()`); or
+(b) implicitly define end-of-image symbols. **(b) shipped** — narrower, and it
+turned out `-T` was never needed for the kernel. Full linker scripts remain
+unimplemented, and no corpus has asked for them.
 
-### L2 — cosmetic: `AT()` LMA (p_paddr) — not a blocker
+### L2 — cosmetic: `AT()` LMA (p_paddr) — DONE (`--lma-offset`)
 EmbLD sets `p_paddr = p_vaddr` (no `AT()` load-address split), so the LOAD
 segments report a higher-half `PhysAddr`. Both loaders (stage2 and the UEFI
 loader) derive the physical destination from `p_vaddr − KERNEL_VIRTUAL_BASE` and
@@ -658,9 +665,16 @@ hitting a Tier-2 feature; full test suite + self-host fixed point stay green.
 
 ## Status
 
-All of Tier 1, Tier 2, and the Tier-3 `-isystem` item are DONE — each landed
-with a gcc-refereed exec test, the full suite green (80/80), and the self-host
-fixed point holding. The two initializer seams that were once refused loudly
+*(2026-09-08.)* All of Tier 1, Tier 2, and the Tier-3 `-isystem` item are DONE —
+each landed with a gcc-refereed exec test and the self-host fixed point holding.
+The suite is now **102/102**. Since that pass the C surface also gained C11
+`_Alignof`/`_Alignas` and the `_Atomic` qualifier, pointer-to-array declarators
+`int (*p)[N]`, GNU `typeof`, wide/prefixed string and character literals, and
+GNU computed `goto`.
+
+**What is still genuinely missing**, each refused loudly rather than
+miscompiled: **VLAs**, **`_Complex`**, and **80-bit `long double`**. Those are
+the remaining C-language gaps. The two initializer seams that were once refused loudly
 are now implemented too: braced initialization of **bitfields** (static/local/
 designated) and **file-scope compound literals** (direct value, nested, and
 `&(T){...}` via an anonymous global). The remaining Tier-3 entries are

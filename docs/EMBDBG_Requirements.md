@@ -1,10 +1,12 @@
 # EmbDBG — Debug Information Requirements
 
-*Status: **requirements and a format decision, no byte layout.** Written now, in
-the discipline this project insists on: the reasoning survives the gap between
-deciding and building, and the on-disk shape is derived **last**, from invariants
-that must exist first. This document governs the **producer** side (EmbCC) and
-still deliberately does NOT specify the `.embdbg` byte format — see §6.*
+*Status: **the plan below has been built through step 4, and the ordering it
+argued for is what actually happened.** `embcc -g` emits DWARF-4 line, frame and
+local information; **EmbDBG exists** (`tools/embdbg/`) and reads it back with no
+gdb in the loop; and the native `.embdbg` was derived from EmbDBG's real needs
+exactly as §6 insisted, rather than designed first. What remains is aggregate
+types in the producer and the live-debugging contract on the OS side — §4 marks
+each step. This document governs the **producer** side (EmbCC).*
 
 **The OS side now exists.** `myos/docs/EMBDBG_Specification.md` (2026-07-24)
 specifies the byte-exact `.embdbg` format **and** the kernel debugging contract
@@ -70,16 +72,17 @@ point plans against a fiction.
 | Piece | State |
 |---|---|
 | `file:line` at every AST node | **Exists** — it is what diagnostics already print (`diag_fatal`, the `# line` preprocessor markers the lexer consumes). The producer already *knows* answer (1) everywhere. |
-| Line info emitted into the object | **Absent.** EmbCC emits `.text`, `.rodata`, `.data`, `.bss`, `.symtab`, `.rela.text`. No `.debug_*`, no line table. |
+| Line info emitted into the object | **Exists.** `embcc -g` emits `.debug_line` + `.debug_info` + `.debug_abbrev` (DWARF v4, 32-bit, addr_size 8), with relocations so the ET_REL addresses resolve at link. |
 | Function/object symbols | **Exists** — `.symtab` carries STT_FUNC / STT_OBJECT with sizes, which a debugger can already use for coarse "which function" attribution. |
-| Local-variable locations | **Absent.** sema assigns every local a frame slot (`var_index` → `[rbp+disp]` in codegen), so the data exists at compile time; nothing records it. |
-| Type descriptions | **Absent.** The `struct type` graph is complete and precise; it is thrown away after codegen. |
-| A debugger to read any of it | **Absent.** EmbDBG does not exist. There is no `ptrace` equivalent, no breakpoint mechanism, no stack-unwind contract named on EmbLinkOS yet. |
+| Local-variable locations | **Exists.** `DW_TAG_formal_parameter`/`DW_TAG_variable` DIEs carry `DW_AT_location` as a single `DW_OP_fbreg` offset — the trivial case DWARF was over-built for, which is exactly what the uniform stack-slot model produces. |
+| Type descriptions | **Partial.** `DW_TAG_base_type` and `DW_TAG_pointer_type` are emitted, so scalars and pointers render. Aggregates — struct/union/enum members, arrays — are **not** yet emitted; the `struct type` graph has the offsets, nothing writes the DIEs. This is the open producer-side work (step 3). |
+| A debugger to read any of it | **Exists — EmbDBG v0** (`tools/embdbg/`): symbolize, backtrace, source context with locals in scope, per-function param/local listing, x86-64 disassembly with mixed source, kernel crash-dump analysis, a multi-panel TUI, and `emit` to convert DWARF into the native `.embdbg`. It reads an ELF's DWARF *or* a `.embdbg` directly. What is still absent is **live** debugging: no `ptrace` equivalent, no breakpoint/step mechanism on EmbLinkOS — that is the kernel contract in the OS-side spec (§8 Q1), reserved and not built. |
 
-The pattern to notice: **every input the first two layers need already exists
-inside the compiler.** The work is emission and a format, not analysis. That is
-what makes line info a genuinely small increment when its time comes — and what
-makes rushing the format the only real risk.
+The pattern to notice: **every input the first two layers need already existed
+inside the compiler.** The work was emission and a format, not analysis — which
+is why line info and locals landed as small increments, and why the remaining
+producer gap (aggregate type DIEs) is bounded: sema already computes every
+member offset exactly.
 
 ## 3. The format decision — DWARF, or native `.embdbg`?
 
@@ -145,20 +148,31 @@ look plausible."
    Not yet: emission at LINK time of the absolute-addressed native form, and
    proving it on a *linked* binary (EmbLD carrying/relocating `.debug_*`) —
    see "the producer finding" above; the object-level host proof stands.
-2. **Frame + locals.** `.debug_info` DIEs for each function and its locals with
-   `DW_AT_location` = a constant frame-base offset (EmbCC's uniform stack-slot
-   model makes every location a single `DW_OP_fbreg`, the trivial case DWARF
-   was over-built for). Acceptance: `gdb` prints a local by name at a
-   breakpoint with the right value.
-3. **Types.** DIEs for the `struct type` graph — base types, pointers, arrays,
-   structs/unions/enums with member offsets (which the SysV-classification work
-   already computes exactly). Acceptance: `gdb` renders a `struct value` with
-   named fields, matching a gcc-built program's rendering.
-4. **EmbDBG, and only then `.embdbg`.** A debugger native to EmbLinkOS — needing
-   the OS's own breakpoint/step/inspect contract, which is a **kernel** design
-   question and out of EmbCC's scope (D-007). When EmbDBG's needs are concrete,
-   the native `.embdbg` sidecar is derived from them and the DWARF emitter
-   becomes the host-debugging bridge it always was.
+2. **Frame + locals. DONE.** `.debug_info` DIEs for each function and its
+   locals with `DW_AT_location` = a constant frame-base offset (EmbCC's uniform
+   stack-slot model makes every location a single `DW_OP_fbreg`, the trivial
+   case DWARF was over-built for), plus `DW_TAG_base_type`/`DW_TAG_pointer_type`
+   so scalars and pointers render with their real types. EmbDBG's `info FUNC`
+   and `where ADDR` read exactly this.
+3. **Aggregate types. OPEN — the remaining producer gap.** DIEs for the rest of
+   the `struct type` graph: arrays, and structs/unions/enums with member offsets
+   (which the SysV-classification work already computes exactly). Acceptance
+   unchanged: a debugger renders a `struct` value with named fields, matching a
+   gcc-built program's rendering. Everything needed is in sema; this is emission
+   work, not analysis.
+4. **EmbDBG, and then `.embdbg`. DONE (v0), in that order.** EmbDBG exists
+   (`tools/embdbg/`) and reads DWARF directly — symbolize, backtrace, source
+   context with locals, disassembly with mixed source, kernel crash-dump
+   analysis, and a multi-panel TUI. The native `.embdbg` was then derived from
+   what EmbDBG actually turned out to need (`embdbg FILE.o emit OUT.embdbg`
+   converts), and the DWARF emitter became the host-debugging bridge it always
+   was — the ordering §6 argued for, followed.
+
+   **Still open past v0:** *live* debugging. EmbDBG v0 is a static reader and
+   crash analyzer; breakpoints, single-step and register inspection on a running
+   process need the OS's own contract (`CAP_DEBUG`, `SPAWN_ACTION_DEBUG`,
+   syscalls 69–75), which is a **kernel** design question and out of EmbCC's
+   scope (D-007). It is specified OS-side and reserved, not built.
 
 ## 5. Requirements the format must meet, whichever it is
 
@@ -189,26 +203,35 @@ than being discovered after it is frozen:
 **No byte layout.** Not the DWARF version to target, not a `.embdbg` header, not
 section offsets. This is not an omission; it is the decision.
 
-A byte-exact format needs a producer that emits the data (EmbCC emits none) and
-a consumer that reads it (EmbDBG does not exist). Designing the container first
-is precisely the inversion DECISIONS D-003 was reopened *with eyes open about*,
+A byte-exact format needs a producer that emits the data and a consumer that
+reads it — when this was written EmbCC emitted none and EmbDBG did not exist.
+Designing the container first is precisely the inversion DECISIONS D-003 was
+reopened *with eyes open about*,
 and the EMBX spec's own §4.2 refuses to repeat it inside one document — "defining
 an import/export format before EmbCC can emit a relocation is designing against a
 producer that does not exist." The debug channel is the same shape: define the
 model (§1–§5), build the producer against a **real** consumer (gdb, via DWARF),
 and derive the native on-disk shape **last**, from what EmbDBG turns out to need.
 
-## 7. Ordering
+*(2026-09-08.) This is what happened, and it is why this section still has no
+byte layout in it: the `.embdbg` bytes were derived from EmbDBG's needs once
+EmbDBG was real, and they are documented where the reader is — not here.*
 
-**After M3.** Self-hosting is the milestone that makes EmbCC a real compiler;
-debug info is a quality-of-life layer on top of a compiler that works, exactly as
-ARCHITECTURE §8 lists DWARF among the deliberate early non-goals ("none belong
-before a program runs") and VISION_LONGTERM gates it on "an EmbLinkOS debugger
-existing to consume it." The one honest exception is **step 1 (host DWARF line
-info)**: it is cheap, its consumer (gdb) already exists, and it would make every
-*later* milestone — including debugging the self-hosting compiler through M3 —
-materially easier. That single step is the one plausibly worth pulling earlier;
-everything past it waits for EmbDBG.
+## 7. Ordering — how it went
+
+**After M3**, as planned. Self-hosting is the milestone that made EmbCC a real
+compiler; debug info was a quality-of-life layer on top of a compiler that
+worked, exactly as ARCHITECTURE §8 listed DWARF among the deliberate early
+non-goals ("none belong before a program runs").
+
+The predicted exception held too: **step 1 (host DWARF line info)** was cheap,
+its consumer (gdb) already existed, and pulling it earlier did make later work
+easier. Steps 2 and 4 followed; step 3 (aggregate types) is what is left.
+
+`-g` remains **opt-in and deterministic**: with it off, output is byte-for-byte
+as before, which is why adding the debug channel never disturbed the self-host
+fixed point (`dwarf.c` self-compiles, and the fixed point now covers 16
+sources).
 
 ## 8. Open questions (for when this becomes concrete)
 

@@ -1,9 +1,11 @@
-# Architecture (intended)
+# Architecture
 
-*Design record, written before implementation. Everything here is a starting
-position chosen to serve ROADMAP M1 (emit something the OS runs) and the
-constraints in TARGET_ABI.md. It is meant to be revised by contact with reality
-— when it is, update this file and note why in DECISIONS.md.*
+*Originally a design record written before implementation, chosen to serve
+ROADMAP M1 (emit something the OS runs) and the constraints in TARGET_ABI.md.
+It has since been revised by contact with reality, which was always the
+intent — §3, §6 and §8 carry the revisions and say what changed. Keep doing
+that: when reality disagrees with this file, update it and note why in
+DECISIONS.md.*
 
 ## 1. Shape: one binary, all phases in-process
 
@@ -29,28 +31,41 @@ source ──► lex ──► parse ──► sema ──► IR ──► codeg
 | **driver** | argv, flags, deciding compile-vs-link, file discovery | Keep flags a *deliberate subset*; do not clone gcc's surface |
 | **lex** | tokens, including the preprocessor's needs | |
 | **cpp** | `#include`, `#define`, conditionals | Needed early — the OS's headers are real newlib headers (see §5) |
-| **parse** | C subset → AST | Grow the subset by need, not by standard-completeness |
+| **parse** | C → AST | The subset grew by need, not by standard-completeness; `todo.md` tracks what is left |
 | **sema** | types, declarations, conversions, diagnostics | Where most "real compiler" work lives |
 | **IR** | a small typed intermediate form | See §3 |
 | **codegen** | IR → x86-64, System V AMD64 | See §4 |
 | **asm** | encode instructions to bytes | Integrated; no external assembler exists on-OS |
 | **as** | standalone NASM/Intel `.asm` → ELF object | `embas` / `embcc -c foo.asm`; byte-identical to nasm on the kernel corpus (A1) |
-| **link** | objects + archives + (later) shared objects → ELF | See §6 — the most target-specific part |
+| **opt** | IR→IR optimization at `-O1`/`-O2` | See §3; SSA is built on demand here, not carried in the IR |
+| **debug** | DWARF-4 line/frame/local emission for `-g` | Read back by EmbDBG (`tools/embdbg`) |
+| **link** | objects + archives → ET_EXEC ELF and EMBX | See §6 — the most target-specific part |
 
-## 3. IR: start with something honest and small
+## 3. IR: something honest and small
 
-**Decision for M1–M2:** the simplest thing that lets codegen be written without
-lying — likely a linear three-address IR over virtual registers, with explicit
-types (integers by width and signedness, pointers, aggregates by size/align).
+**The decision, and it held:** a linear three-address IR over virtual
+registers, with explicit types (integers by width and signedness, pointers,
+aggregates by size/align). Correct-and-slow first — for a compiler that had
+never run a program, that was the right call, and the IR did not need replacing
+when the optimizer arrived.
 
-Explicitly **not** planned for the early milestones: SSA, a pass manager, an
-optimizer. Correct-and-slow first — for one that has never run a program that was
-the right call. *(Since then — well past those milestones — the compiler has
-grown a real optimizer: an IR-level pass set (folding, strength reduction, local
-value numbering/CSE, copy propagation, DCE — `src/opt`) plus codegen register
-allocation, stack-slot coalescing, and a residency cache — `src/codegen`. Still
-no SSA; the single-assignment temporaries make the local passes sound without
-it.)*
+SSA, a pass manager and an optimizer were explicitly **not** planned for the
+early milestones. All three have since landed, deliberately and in that order of
+difficulty:
+
+- **`src/opt`** runs a local pass set (folding, strength reduction, value
+  numbering/CSE, copy propagation, DCE, immediate folding, store forwarding) and
+  a global one at `-O2` — function inlining, SCCP, dominator-scoped global CSE,
+  and redundant-load elimination.
+- **SSA is built on demand**, not carried in the IR: `pass_mem` constructs the
+  CFG, the dominator tree (Cooper-Harvey-Kennedy) and dominance frontiers,
+  inserts phis, renames, and destructs SSA back to copies. The IR stays the
+  honest linear form it started as; SSA is a lens the optimizer puts on it.
+- **`src/codegen`** carries register allocation (Chaitin-Briggs), stack-slot
+  coalescing and a residency cache.
+
+The single-assignment temporaries are still what make the *local* passes sound
+with no analysis at all — that property is why the cheap passes came first.
 
 ## 4. Codegen: x86-64, System V AMD64
 
@@ -60,11 +75,11 @@ it.)*
 - **Explicit register constraints in inline asm are a first-class requirement**,
   not a nicety: the OS's syscall header binds `r10`/`r8`/`r9` by name, and TCC's
   inability to do so forced a `__TINYC__` workaround into the ABI header
-  (TARGET_ABI.md §3). EmbCC should support this properly and let that workaround
-  die.
-- **Intrinsics:** the moment codegen emits a libcall gcc inlines (`__floatundisf`
-  is the known first one), decide per TARGET_ABI.md §7 — inline it in codegen
-  (preferred) or ship an `libembcc1` runtime.
+  (TARGET_ABI.md §3). EmbCC supports this properly — fixed-register extended asm
+  with the kernel's full vocabulary — so that workaround can die.
+- **Intrinsics:** when codegen would emit a libcall gcc inlines (`__floatundisf`
+  was the first), TARGET_ABI.md §7 governs — inline it in codegen (what we do)
+  rather than shipping a `libembcc1` runtime.
 
 ## 5. The preprocessor is on the critical path
 
@@ -96,11 +111,18 @@ non-negotiables, each learned from a TCC failure:
 - **Dynamic output:** `ET_EXEC` only (never PIE), classic `DT_HASH`, and
   relocations confined to `RELATIVE/COPY/64/GLOB_DAT/JUMP_SLOT`.
 
-A defensible staging: **M1–M2 emit relocatable objects only** and let the
-existing toolchain link them (validating codegen independently of linking), then
-build the linker in M3 when self-hosting demands one binary that does everything.
+The staging that was chosen, and worked: **M1–M2 emitted relocatable objects
+only** and let the existing toolchain link them, validating codegen
+independently of linking; the linker was built for M3, when self-hosting
+demanded it.
 
-## 7. Source layout (proposed)
+**EmbLD exists and does all of the above** (`src/link`, the `embld` tool). It
+links EmbCC itself and it links the EmbLinkOS kernel — including
+linker-defined end symbols and higher-half LMA (`p_paddr`) — and it emits the
+native **EMBX** container as well as ET_EXEC ELF. The PLT, GOT and weak-symbol
+facts above are each covered by a golden test rather than a comment.
+
+## 7. Source layout
 
 ```
 src/
@@ -112,19 +134,24 @@ src/
   ir/         the intermediate form
   codegen/    x86-64 lowering + register allocation
   asm/        instruction encoding
-  link/       ELF reading/writing, relocation, archives
-  elf/        shared ELF structures used by asm + link
+  as/         EmbAS — standalone NASM/Intel assembler
+  opt/        IR-level optimizer (local + global passes, SSA on demand)
+  debug/      DWARF-4 emission for -g
+  embx/       the EMBX container, byte-exact
+  link/       EmbLD — ELF reading/writing, relocation, archives, EMBX output
+  elf/        shared ELF structures used by asm, as + link
 tests/
   exec/       programs compiled and RUN (the ones that count)
   compile/    programs that must compile (or must fail, with which diagnostic)
   golden/     output compared against gcc/TCC for agreed cases
 ```
 
-**Self-hosting constrains the source itself.** EmbCC must eventually compile
-EmbCC, so its own code should stay within the C subset it implements — no
-dependency on anything it cannot yet parse. Practically: plain C99, no
-sprawling third-party headers, and a periodic honest check of "could our own
-compiler read this file yet?"
+**Self-hosting constrains the source itself.** EmbCC compiles EmbCC, so its own
+code stays within the C subset it implements — no dependency on anything it
+cannot parse. Practically: plain C99, no sprawling third-party headers. This is
+no longer a periodic honest check but a hard gate: `tests/golden/self-host.sh`
+and the on-OS `test embcc self` oracle fail the moment a source drifts outside
+the subset.
 
 ## 8. Non-goals for the early milestones
 
@@ -132,9 +159,14 @@ Stated so they were not accidentally attempted before a program ran: optimizatio
 passes, debug info (DWARF), C++, TLS/`__thread`, PIE/PIC output, cross-targets
 other than x86-64, and the kernel's freestanding mode (DECISIONS D-007).
 
-*Since the early milestones closed, several have been done deliberately:*
-**optimization passes** (`-O1`/`-O2`, see §3 and `src/opt`/`src/codegen`),
-**debug info** (`-g` emits DWARF-4 line/frame/locals; there is an EmbDBG tool),
-and the **kernel's freestanding mode** (`-mno-sse -mcmodel=kernel` etc. — EmbCC
-compiles the whole EmbLinkOS kernel, which boots to the desktop). C++,
-TLS, and PIE/PIC remain out of scope.
+*Since the early milestones closed, three of these were done deliberately:*
+**optimization passes** (`-O1`/`-O2` — §3, `src/opt`/`src/codegen`), **debug
+info** (`-g` emits DWARF-4 line/frame/locals, and EmbDBG reads it back), and the
+**kernel's freestanding mode** (`-mno-sse`, `-mcmodel=kernel` and friends — EmbCC
+compiles the whole EmbLinkOS kernel, which boots to the desktop).
+
+**Still out of scope, and refused loudly rather than faked:** C++ (the intended
+second language, D-008, but a different project in size), TLS/`__thread`,
+PIE/PIC output, and cross-targets other than x86-64. The remaining C-language
+gaps — VLA, `_Complex`, 80-bit `long double` — are tracked in `todo.md` against
+a real corpus.

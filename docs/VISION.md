@@ -1,7 +1,9 @@
 # Vision — why EmbCC exists
 
-*Status: design record. Written before any code, so the reasoning survives the
-gap between deciding and building.*
+*Status: the founding design record, written before any code, so the reasoning
+survives the gap between deciding and building. The argument below still stands
+as written; §4–§6 carry dated notes where the project has since answered them.
+What was a thesis is now a working toolchain — see the README for state.*
 
 ## 1. The question that started it
 
@@ -57,9 +59,16 @@ each. The resolution EmbLinkOS has used at every previous fork applies here:
 > native one until something demands it.**
 
 That rule has resolved four forks already (the shell, the TTY, the userspace
-layout, the build tool). Applied to a compiler *today*, it says: **TCC works, so
-this is not urgent.** Which is exactly why EmbCC is a separate repository with a
-long clock, and why the OS depends on none of it.
+layout, the build tool). Applied to a compiler when this was written, it said:
+**TCC works, so this is not urgent.** Which is exactly why EmbCC is a separate
+repository with a long clock, and why the OS depends on none of it.
+
+*(2026-09-08.) The "concretely fail" half of the rule has since been met on one
+axis: TCC cannot build the EmbLinkOS kernel, and EmbCC can — it compiles all 89
+kernel units, EmbAS assembles the 6 `.asm`, EmbLD links, and the result boots.
+That does not auto-adopt anything; D-006 still governs, and the OS still ships
+TCC. It does mean the native-option case is now made of evidence rather than
+intent.)*
 
 ## 4. What would make EmbCC genuinely worth adopting
 
@@ -78,26 +87,41 @@ Not "we wrote it ourselves." Adoption should be earned by at least one of:
    EmbCC, built by EmbBuild, on the OS — is a real property, not just a stunt:
    it means the system can reproduce its own toolchain without an outside host.
 
-Until one of those lands, EmbCC is a study project that happens to be aimed at
-production. That is a fine thing to be, as long as the docs say so — and they do.
+*(2026-09-08.) Two of the three have landed.* **(1)** is met on the kernel:
+codegen quality and freestanding support TCC does not reach, and EmbCC now
+builds the kernel end to end. **(3)** is met: the self-hosting fixed point holds
+over all 16 sources, on the host and on the OS. **(2)** remains open by choice —
+D-008 demoted a language of our own, and C++ is the intended second language.
+
+That leaves **(4)**, someone choosing it over TCC for a real reason, as the one
+measure still outstanding. It is the only one that was ever going to be decided
+by other people rather than by us.
 
 ## 5. What EmbCC is *not*
 
 - **Not a TCC replacement on any schedule.** TCC is the OS's compiler until
   something better is proven better.
 - **Not a new executable format.** ELF stays. See DECISIONS D-003.
-- **Not the kernel's compiler.** The EmbLinkOS kernel is built with the cross
-  gcc and will be for the foreseeable future; "rebuild-self" in EmbLinkOS has
-  always meant the *userland*, honestly scoped.
+- ~~**Not the kernel's compiler.**~~ **Revised 2026-09-08.** This was written
+  when "rebuild-self" in EmbLinkOS honestly meant the *userland* only. It no
+  longer does: EmbCC compiles the whole kernel, EmbAS assembles its hand-written
+  `.asm` byte-identically to nasm, EmbLD links the image, and it boots to the
+  desktop behaviourally identical to the gcc build. The cross gcc is still what
+  the OS's official build uses; it is no longer the only thing that *can* build
+  the kernel.
 - **Not a reason to slow the OS down.** If EmbCC ever competes with OS work for
   attention, the OS wins. It is the parent project.
 
 ## 6. The measure of success, in order
 
-1. It compiles a C program that **runs on EmbLinkOS** (exit 42).
-2. It compiles **itself**.
-3. **EmbBuild builds it, on the OS, from `/data/src`.**
-4. Someone chooses it over TCC for a real reason.
+1. ~~It compiles a C program that **runs on EmbLinkOS** (exit 42).~~ **Done**
+   — M1, confirmed on the OS 2026-07-20.
+2. ~~It compiles **itself**.~~ **Done** — M3, the fixed point closed on the OS
+   2026-07-24 and still holds over 16 sources.
+3. **EmbBuild builds it, on the OS, from `/data/src`.** *In progress* — the
+   manifest exists and builds EmbCC on the host; running it on the metal is the
+   open step (M4).
+4. Someone chooses it over TCC for a real reason. **Open.**
 
 Steps 1–3 are engineering. Step 4 is the only one that makes it a compiler
 rather than an exercise — and it is allowed to take years.

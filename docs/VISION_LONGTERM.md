@@ -8,6 +8,13 @@ DECISIONS D-006: a capability is added for a stated reason, never because a
 compiler "should" have it. Where this document and a decision record disagree,
 the decision record wins.*
 
+*Several items below have since landed off this list and are marked **Done** or
+**Underway** in place — diagnostics, optimization, debug info and the inline-asm
+work, each pulled forward because a concrete need arrived, which is exactly the
+D-006 test. The rest is still horizon. Read the marks: this file deliberately
+keeps finished items rather than deleting them, so the reasoning that justified
+them stays visible.*
+
 EmbCC is more than a compiler that translates C source into machine code. Its
 long-term goal is to become the complete native compiler infrastructure for
 EmbLinkOS — deeply integrated with the operating system, the development tools,
@@ -19,25 +26,33 @@ and the build system.
   program demands it, with "full C" as the limit of that process rather than an
   up-front target.
 * In the long term, **C++** — the second and final planned language (D-008),
-  taken up only after the C compiler closes the M4 loop.
+  taken up only after the C compiler closes the M4 loop. **Still ahead.**
 * Produce well-optimized native executables — *after* correct ones
   (ARCHITECTURE §3: correct-and-slow first; codegen quality is the first honest
-  post-M4 reason to prefer EmbCC over TCC).
-* Become self-hosting by compiling EmbCC with EmbCC (ROADMAP M3).
+  post-M4 reason to prefer EmbCC over TCC). **Underway** — `src/opt` runs SSA
+  mem2reg, inlining, SCCP and global CSE; `src/codegen` does Chaitin-Briggs
+  register allocation. `-O2` `.text` is at 1.63× gcc `-O0`, down from 2.81×.
+* Become self-hosting by compiling EmbCC with EmbCC (ROADMAP M3). **Done** —
+  the fixed point closed on the OS 2026-07-24 and holds over 16 sources.
 * Fast compilation without sacrificing code quality.
-* Modern, clear, actionable diagnostics (this one is *not* deferred — M2
-  requires diagnostics a human can act on).
+* Modern, clear, actionable diagnostics (this one was *not* deferred — M2
+  required diagnostics a human can act on). **Done** — clang-style carets with
+  real columns for semantic as well as syntax errors, colour, span underlines,
+  "did you mean?", and macro-expansion / previous-declaration notes.
 
 ## Native EmbLinkOS integration
 
 EmbCC is designed specifically for EmbLinkOS and understands its architecture.
 
 * Direct support for the EmbLinkOS ABI ([TARGET_ABI.md](TARGET_ABI.md)).
-* **Executable format: ELF, always** — including any future native capability.
-  Per D-003 (firm), a native format is an **ELF superset**: plain ELF the
-  existing in-kernel loader already reads, plus `.note` sections a newer loader
-  understands. Additive by construction — there is deliberately no second
-  format, no migration, and no converter tax. The first candidate extension
+* **Executable format: ELF *and* EMBX.** ~~Per D-003 (firm), a native format is
+  an **ELF superset**.~~ **D-003 was REVISED 2026-07-24** once the OS's
+  capability model landed: EmbLinkOS has its own capability-carrying container,
+  **EMBX**, and EmbLD emits it directly (`--embx --cap NAME`) alongside ET_EXEC
+  ELF. ELF remains the porting lane — a dual *loader*, not a converter, mirroring
+  EMBKFS's native-plus-FAT32 split. Read D-003 for why the superset plan was
+  abandoned with eyes open. The `.note`-section idea below is superseded, kept
+  because the reasoning is still instructive. The first candidate extension
   remains a declared capability manifest, gated on the capability model
   existing first.
 * Tight integration with EmbBuild (M4 makes this real: EmbBuild builds EmbCC on
@@ -52,17 +67,20 @@ EmbCC is designed specifically for EmbLinkOS and understands its architecture.
   the `inline` keyword — enough that the gcc branch of `embk_syscall.h`
   compiles under EmbCC, so the `__TINYC__` workaround dies for EmbCC. Proven
   on the OS: EmbCC-compiled `int $0x80` stubs made real write(1,…) and
-  exit(42) syscalls (kernel `test embcc asm`). Scope is the userland rim
-  only (the kernel's asm stays the cross gcc's — DECISIONS); the template
-  vocabulary is `int $imm` today, a deliberate seam. **File-scope asm
+  exit(42) syscalls (kernel `test embcc asm`). *(Scope was the userland rim only,
+  "the kernel's asm stays the cross gcc's" — **that limit is gone**: the
+  extended-asm assembler grew the kernel's full hardware vocabulary, every
+  encoding byte-verified against objdump, and D-007 was revised accordingly. The
+  template vocabulary is no longer `int $imm`.)* **File-scope asm
   followed:** a two-pass mini-assembler (src/asm/topasm.c) handles crt0's
   `_start` stub vocabulary — `.global`/`.globl`, labels (named + numeric-
   local), `and $imm,%reg`, `call sym` (PLT32), `jmp local-label`, `ret` —
   emitting a global `_start` symbol and a relocation to the C entry it
-  calls. Toward emlibc's rim: syscalls.c still needs `va_arg`, and crt0.c
-  needs more still (complex declarators like `void (*arr[])(void)`,
-  `__attribute__((weak))`, and a `&global` initializer) — named, not yet
-  built.
+  calls. **The rim closed:** `va_arg`, complex declarators like
+  `void (*arr[])(void)`, `__attribute__((weak))` and `&global` initializers all
+  landed, so the **whole emlibc rim — crt0 plus syscalls — compiles under EmbCC
+  and runs on the OS**, exiting 42. EmbCC compiles all of emlibc, fdlibm
+  floating point included.
 
 ## Advanced diagnostics
 

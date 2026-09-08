@@ -44,7 +44,9 @@ static void print_version(void)
 static void print_usage(FILE *out)
 {
     fprintf(out,
-            "usage: embcc [-E] -c FILE.c [-o FILE.o] [-I DIR]...\n"
+            "usage: embcc [-E] -c FILE.c|FILE.asm [-o FILE.o]\n"
+            "             [-I DIR]... [-isystem DIR]... [-g] [-O0|-O1|-O2]\n"
+            "             [-mno-sse] [-mno-red-zone] [-mcmodel=kernel] ...\n"
             "       embcc --version | --dump-predef"
             " | --emit-empty-object FILE\n");
 }

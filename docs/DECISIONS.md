@@ -9,7 +9,10 @@ may be revisited by evidence (each records what would reopen it).*
 
 ## D-001 — EmbCC is a separate, parallel project, not OS work
 
-**Decided:** 2026-07-19 (design). **Status:** firm.
+**Decided:** 2026-07-19 (design). **Status:** firm — the *separation* is
+unchanged, though the "EmbLinkOS depends on none of it" half is now a choice
+rather than a necessity: EmbCC can build the kernel (see D-007, revised), and
+the OS still ships TCC because D-006 governs adoption.
 
 EmbCC lives in its own repository, on its own clock. EmbLinkOS depends on none
 of it and continues to use TCC.
@@ -90,6 +93,13 @@ Note the ordering, which is the whole point: **the format is derived from a
 capability-declaration model that does not exist yet.** Design the model first;
 prototype it as an ELF `.note` or a sidecar file in `/data/apps/<name>/`; only
 then consider format work.
+
+*(That ordering is exactly what happened, and it is why this decision was
+revised rather than overturned: the capability model landed in EmbLinkOS first,
+and only then did the format follow — as **EMBX**, which EmbLD now emits with a
+declared capability table. The one piece still outstanding is the program
+declaring its own authority **in source**, so EmbCC records it and EmbLD
+collects it; today it comes from `--cap` on the link line.)*
 
 **Rejected:** designing an "EmbLink executable format" up front. Designing the
 container before deciding what it declares inverts the discipline the OS's own
@@ -179,25 +189,64 @@ be: it clears a wall TCC cannot (C++, TLS/`__thread`, codegen quality), it
 enables a language that fits the OS's typed model, or the total-loop property
 (the system reproducing its own toolchain) becomes a goal in itself.
 
-**Until then:** EmbCC is a study project aimed at production, and the docs say
-so plainly.
+**Where that stands (2026-09-08).** Two of the three legitimate reasons are now
+met by evidence rather than intent: EmbCC clears a wall TCC cannot — it builds
+and boots the **kernel**, with freestanding codegen, a full inline-asm
+assembler, and an optimizer (D-007, revised) — and the total-loop property is
+real, with the self-hosting fixed point holding on the OS over 16 sources.
+
+**This still is not adoption.** Being able to build the kernel is a capability;
+choosing EmbCC over TCC for the OS's official build is a separate decision, and
+this one governs it. The OS ships TCC until someone has a concrete reason to
+switch. What has changed is that the case would now be argued from what the
+compiler demonstrably does.
 
 ---
 
 ## D-007 — The kernel stays out of scope
 
-**Decided:** 2026-07-19 (design). **Status:** firm.
+**Decided:** 2026-07-19 (design). **REVISED 2026-09-08 — the reopen condition
+was met.**
 
-EmbCC targets **userland**. The EmbLinkOS kernel is built by the cross gcc.
+**The original decision.** EmbCC targets **userland**. The EmbLinkOS kernel is
+built by the cross gcc.
 
-**Why.** "Rebuild-self" in EmbLinkOS has always meant the userland, stated
-honestly. The kernel uses freestanding/`-mcmodel=kernel` codegen, custom linker
-scripts, and inline asm that a young compiler has no business attempting.
-Pretending otherwise would be the exact overclaim the project's docs exist to
-prevent.
+**Why (as written in 2026-07).** "Rebuild-self" in EmbLinkOS has always meant
+the userland, stated honestly. The kernel uses freestanding/`-mcmodel=kernel`
+codegen, custom linker scripts, and inline asm that a young compiler has no
+business attempting. Pretending otherwise would be the exact overclaim the
+project's docs exist to prevent.
 
 **Reopens if:** EmbCC ever becomes a serious optimizing compiler with proven
 freestanding support — a decision for a much later year.
+
+### The revision
+
+That reopen condition is satisfied, and it was satisfied by building each of the
+three named obstacles rather than by lowering the bar:
+
+- **Freestanding codegen** — `-mno-sse`, `-mno-red-zone`, `-mcmodel=kernel` and
+  the rest, with a float op in SSE-off mode refused loudly rather than emitted.
+- **Inline asm** — a real extended-asm assembler covering the kernel's full
+  hardware vocabulary, every encoding byte-verified against objdump.
+- **Linker scripts** — not needed: EmbLD auto-provides the end-of-image and
+  bracket symbols a script would define, plus higher-half LMA (`p_paddr`).
+- **The assembler** — EmbAS assembles the kernel's hand-written `.asm`
+  byte-identically to nasm.
+- **An optimizer worth the name** — SSA mem2reg, inlining, SCCP, global CSE and
+  Chaitin-Briggs register allocation, with `-O0`/`-O1`/`-O2` kernels all booting.
+
+**The result:** all 89 kernel C translation units compile under `embcc`, the 6
+`.asm` assemble under `embas`, `embld` links the image, and it boots to the home
+desktop behaviourally identical to the gcc build — 193 lines of boot output, 0
+faults. **No kernel C was changed to achieve this.**
+
+**What has NOT changed.** The kernel is still *EmbLinkOS's* code, and kernel
+design questions (the debugging contract, `CAP_DEBUG`, syscall numbering) remain
+out of EmbCC's scope — that half of D-007 stands. The OS's official kernel build
+also still uses the cross gcc; being *able* to build the kernel is not adoption,
+which D-006 governs. What died is the claim that EmbCC *cannot* and should not
+try.
 
 ---
 
@@ -294,16 +343,18 @@ absolute-addressed sidecar, because EmbCC's ET_REL objects carry only
 bridge; the `.embdbg` byte layout was still derived from what EmbDBG actually
 needs, not ahead of it.
 
-EmbCC's first debug output will be **minimal DWARF line info**, because it is
-debuggable by tools that already exist (gdb/lldb) on the host, the day it lands
-— no EmbDBG required. A **native `.embdbg`** sidecar is the eventual owned form,
-but its byte layout is derived **later**, from what EmbDBG (a debugger that does
-not exist yet) actually needs.
+EmbCC's first debug output was **minimal DWARF line info**, because it is
+debuggable by tools that already exist (gdb/lldb) on the host the day it lands —
+no EmbDBG required. *(2026-09-08: EmbDBG now exists too — `tools/embdbg/` reads
+the DWARF back with no gdb in the loop, and the native `.embdbg` was derived
+from its real needs, exactly in the order this decision set.)* A **native `.embdbg`** sidecar is the eventual owned form,
+but its byte layout is derived **later**, from what EmbDBG (which did not exist
+when this was decided) actually needs.
 
 **Why.** This is the DECISIONS D-003 fork again — own-the-stack vs
-meet-the-world — and it resolves the same way, for the same reason. A byte-exact
-`.embdbg` today would be designed against a producer that emits nothing (EmbCC
-puts no line/local/type info in its objects) and a consumer that does not exist.
+meet-the-world — and it resolves the same way, for the same reason. A byte-exact `.embdbg` *at the time of this decision* would have been designed
+against a producer that emitted nothing (EmbCC put no line/local/type info in its
+objects) and a consumer that did not exist.
 That is the exact inversion D-003 was reopened *with eyes open about*: derive the
 on-disk shape last, from invariants. DWARF line info sidesteps it entirely — its
 consumer (gdb) is real, so "prove it on the host first" (D-005) applies to
@@ -324,7 +375,7 @@ for its absence.
 there is a producer or a consumer is D-003's mistake at a smaller scale, and
 `EMBDBG_Requirements.md` §6 refuses it explicitly.
 
-**Order:** after M3 (ARCHITECTURE §8 lists DWARF among the deliberate early
+**Order:** after M3 — *and that is how it went* (ARCHITECTURE §8 lists DWARF among the deliberate early
 non-goals; VISION_LONGTERM gates debug info on a debugger existing to consume
 it). The one honest exception is DWARF line info, cheap enough and useful enough
 — it would help debug the self-hosting compiler *through* M3 — that it is the

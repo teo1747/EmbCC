@@ -3,8 +3,14 @@
 EmbCC's M3 acceptance stage 3 — `embcc-stage2` byte-identical to
 `embcc-stage1` — is closed **on EmbLinkOS itself**, because stage1 links
 against newlib for the OS syscall ABI and so runs on the OS, not the host
-(and EmbCC cannot yet digest glibc's headers). The OS is the final judge
+(EmbCC targets the OS's ABI, not glibc's headers). The OS is the final judge
 (DECISIONS D-005), exactly as M1 and M2 were.
+
+It has held through every change since: the source set has grown 12 → 16
+(the optimizer, the DWARF emitter and the assembler each joined), and `-O0`
+output stays byte-identical by construction so optimizer work never disturbs
+it. EmbLD relinks on the OS too, so the whole bootstrap — compile *and* link —
+runs on the metal with no cross toolchain.
 
 ## Why it can be byte-identical across host and OS
 
@@ -29,7 +35,7 @@ Host side (in the EmbCC tree):
    make
    ./tools/gen-selfhost-ref.sh      # writes ref/*.o and myos/build/embcc.elf
    ```
-   `ref/*.o` are the gcc-built embcc's output for the twelve sources,
+   `ref/*.o` are the gcc-built embcc's output for the sixteen sources,
    compiled with `-I include -I $NEWLIB_INC` (EmbCC headers first). stage1
    (`embcc.elf`) is EmbLD-linked from those same objects.
 
@@ -52,7 +58,7 @@ OS side (in the myos tree):
 4. Boot and run the kernel oracle: `test embcc self`. It recompiles each
    unit with
    `embcc -c <src> -I /data/apps/embcc/include -I /system/abi/include -o …`
-   and compares the object to its reference byte for byte. `12/12 objects
+   and compares the object to its reference byte for byte. `16/16 objects
    byte-identical` ⇒ the fixed point holds.
 
 `test embcc` (compile the M1 program on the OS, tcc-link it, run → exit 42)
