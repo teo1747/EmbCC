@@ -45,11 +45,26 @@ void x86_store_slot(struct code *c, int disp, int size);
 /* Loads/stores through a pointer: address in rax (load) or rcx (store,
  * value in eax/rax). */
 void x86_load_mem_rax(struct code *c, int size, int sign, int w);
+void x86_load_base_rax(struct code *c, int base, int size, int sign, int w); /* rax = *base */
+void x86_load_base_reg(struct code *c, int dst, int base, int size, int sign, int w); /* dst = *base */
+void x86_load_baseindex_rax(struct code *c, int base, int index, int scale,
+                            int size, int sign, int w); /* rax = *(base+index*scale) */
+void x86_load_basedisp_rax(struct code *c, int base, int disp,
+                           int size, int sign, int w); /* rax = *(base+disp) */
+void x86_load_reg_basedisp(struct code *c, int dst, int base, int disp,
+                           int size, int sign, int w); /* dst = *(base+disp) */
+void x86_store_basedisp_rax(struct code *c, int base, int disp, int size); /* *(base+disp)=rax */
+void x86_store_baseindex_rax(struct code *c, int base, int index, int scale,
+                             int size); /* *(base+index*scale)=rax */
 void x86_store_mem_rcx(struct code *c, int size);
 void x86_mov_rcx_slot(struct code *c, int disp);  /* mov rcx,[rbp+disp] */
 void x86_lea_rax_slot(struct code *c, int disp);  /* lea rax,[rbp+disp] */
 /* lea rax,[rip+0]; returns the rel32 patch offset (for a relocation). */
 int x86_lea_rax_rip(struct code *c);
+/* Same into an arbitrary register (for -O2 register-resident address temps). */
+int x86_lea_reg_rip(struct code *c, int reg);
+/* mov reg,imm — register-targeted x86_mov_eax_imm (same bytes when reg==rax). */
+void x86_mov_reg_imm(struct code *c, int reg, long imm, int w);
 void x86_zero_eax(struct code *c); /* xor eax,eax — al=0 for varargs calls */
 
 void x86_alu_eax_mem(struct code *c, int op, int disp, int w); /* + - * & | ^ */
@@ -59,6 +74,7 @@ void x86_div_mem(struct code *c, int disp, int sign, int w); /* idiv / div */
 void x86_mov_eax_edx(struct code *c, int w);      /* remainder to eax */
 void x86_mov_ecx_mem(struct code *c, int disp, int w);
 void x86_shift_eax_cl(struct code *c, int kind, int w); /* '<' shl, '>' sar, 'u' shr */
+void x86_shift_reg_imm(struct code *c, int reg, int kind, int count, int w); /* shift by const */
 void x86_neg_eax(struct code *c, int w);
 
 /* ---- SSE2 scalar floating point ----------------------------------
@@ -108,6 +124,8 @@ void x86_div_rr(struct code *c, int src, int sign, int w);    /* [rdx:rax]/src *
 /* argument registers by index, for aggregates arriving in pieces */
 int  x86_argreg(int index);
 void x86_not_eax(struct code *c, int w);
+void x86_neg_reg(struct code *c, int reg, int w);   /* neg reg, in place */
+void x86_not_reg(struct code *c, int reg, int w);   /* not reg, in place */
 void x86_bswap(struct code *c, int size);
 void x86_mfence(struct code *c);
 void x86_ud2(struct code *c);
@@ -119,6 +137,7 @@ void x86_lock_cmpxchg_rcx(struct code *c, int size);
  * cc is the setcc opcode byte (0x92..0x9f), chosen by codegen. */
 void x86_cmp_eax_mem(struct code *c, int disp, int w);
 void x86_setcc_eax(struct code *c, int cc);
+void x86_setcc_reg(struct code *c, int cc, int reg); /* setcc+movzx into any reg */
 
 /* Branches: test eax/rax; jz/jmp with a zero rel32 placeholder — both
  * return the patch offset, resolved per-function by codegen. */
@@ -126,6 +145,11 @@ void x86_test_eax(struct code *c, int w);
 int x86_jz_rel32(struct code *c);
 int x86_jnz_rel32(struct code *c);
 int x86_jmp_rel32(struct code *c);
+void x86_jmp_reg(struct code *c, int reg);        /* jmp *reg (computed goto) */
+int x86_jcc_rel32(struct code *c, int setcc); /* setcc cond byte (0x9x) -> Jcc rel32 */
+void x86_alu_reg_imm(struct code *c, int op, int reg, long imm, int w); /* reg OP= imm ('c'=cmp) */
+void x86_imul_reg_imm(struct code *c, int dst, int src, long imm, int w); /* dst = src*imm */
+void x86_test_reg(struct code *c, int reg, int w); /* test reg,reg (cmp reg,0) */
 
 /* call rel32 with a zero placeholder; returns the rel32 field offset. */
 int x86_call_rel32(struct code *c);

@@ -25,6 +25,10 @@ enum tok_kind {
     TOK_KW_BOOL,
     TOK_KW_STATIC_ASSERT,
     TOK_KW_GENERIC,
+    TOK_KW_ALIGNOF,
+    TOK_KW_ALIGNAS,
+    TOK_KW_TYPEOF,
+    TOK_KW_ATOMIC,
     TOK_KW_UNSIGNED,
     TOK_KW_SIGNED,
     TOK_KW_VOID,
@@ -104,7 +108,9 @@ enum tok_kind {
 struct token {
     enum tok_kind kind;
     int line;
-    long num;      /* TOK_NUM; TOK_STR: byte length INCLUDING the NUL */
+    int col;       /* 1-based column of the token's first character */
+    long num;      /* TOK_NUM; TOK_STR: element count INCLUDING the NUL */
+    int str_width; /* TOK_STR: bytes per element — 1 char, 2 char16, 4 wchar/32 */
     int num_long;  /* TOK_NUM: type is long (L suffix or magnitude) */
     int num_uns;   /* TOK_NUM: type is unsigned (U suffix or hex range) */
     double fnum;   /* TOK_FNUM */
@@ -116,6 +122,7 @@ struct lexer {
     const char *file;
     const char *src;
     const char *p;
+    const char *line_start;   /* start of the current line, for columns */
     int line;
     struct token tok; /* current token */
 };

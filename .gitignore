@@ -3,11 +3,15 @@
 *.o
 *.a
 *.elf
-embcc
-embread
-embld
-embcc-stage1
-embcc-stage2
+# root-built tool binaries (anchored, so the sources — e.g. tools/embld/embld.c —
+# stay tracked; a bare `embld` would ignore the whole tools/embld/ directory)
+/embcc
+/embread
+/embld
+/embdbg
+/embas
+/embcc-stage1
+/embcc-stage2
 
 # test scratch
 /tests/**/out/

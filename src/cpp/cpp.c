@@ -371,8 +371,10 @@ static void expand_text(struct src *s, const char *text, struct tbuf *out)
                 continue;
             }
             p = q;
+            diag_register_expansion(s->file, s->line, m->name);
             expand_funclike(s, m, &p, out);
         } else {
+            diag_register_expansion(s->file, s->line, m->name);
             struct tbuf tmp = { 0, 0, 0 };
             m->expanding = 1;
             expand_text(s, m->body, &tmp);
@@ -805,8 +807,11 @@ static void do_include(struct src *s, const char *arg, struct tbuf *out,
                         : "cannot find include file \"%s\"", fname);
 
     s->cpp->depth++;
-    process_file(s->cpp, xstrndup(path, strlen(path)), text, out,
-                 found_idx);
+    {
+        char *ipath = xstrndup(path, strlen(path));
+        diag_register_source(ipath, text);   /* header errors show their lines */
+        process_file(s->cpp, ipath, text, out, found_idx);
+    }
     s->cpp->depth--;
 }
 

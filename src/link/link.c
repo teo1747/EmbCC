@@ -119,6 +119,7 @@ struct linker {
     int narch, caparch;
     Elf64_Addr base;
     const char *entry;
+    Elf64_Addr lma_offset;     /* L2: p_paddr = p_vaddr - this (0 = paddr==vaddr) */
 };
 
 static void die(const char *fmt, ...)
@@ -602,6 +603,20 @@ static void define_brackets(struct linker *l, const struct osec_bound *b)
     define_linker_symbol(l, "__dtors_end", b[OSEC_DTORS].end);
 }
 
+/* L1: end-of-image symbols. A linker script's `kernel_end = .;` past .bss — the
+ * kernel's PMM/VMM place the frame bitmap there — plus the standard `_end`/`end`
+ * family. Auto-provided (define_linker_symbol only defines a referenced,
+ * otherwise-undefined name), so ordinary programs are untouched and a real
+ * definition still wins. `image_end` is the vaddr past the last (.bss) byte. */
+static void define_end_symbols(struct linker *l, Elf64_Addr image_end)
+{
+    define_linker_symbol(l, "kernel_end", image_end);
+    define_linker_symbol(l, "_end", image_end);
+    define_linker_symbol(l, "end", image_end);
+    define_linker_symbol(l, "__bss_end", image_end);
+    define_linker_symbol(l, "__kernel_end", image_end);
+}
+
 /* The absolute vaddr of a symbol referenced by a relocation. Undefined
  * weak binds to 0 (TARGET_ABI §4a). A strong undefined is a hard error:
  * the static link has no resolver to defer to. */
@@ -748,7 +763,7 @@ static void write_exec(struct linker *l, const char *out,
     ph[0].p_flags = PF_R | PF_X;
     ph[0].p_offset = text_off;
     ph[0].p_vaddr = text_start;
-    ph[0].p_paddr = text_start;
+    ph[0].p_paddr = text_start - l->lma_offset;   /* L2: LMA (higher-half kernel) */
     ph[0].p_filesz = text_size;
     ph[0].p_memsz = text_size;
     ph[0].p_align = PAGE;
@@ -756,7 +771,7 @@ static void write_exec(struct linker *l, const char *out,
     ph[1].p_flags = PF_R | PF_W;
     ph[1].p_offset = data_off;
     ph[1].p_vaddr = data_start;
-    ph[1].p_paddr = data_start;
+    ph[1].p_paddr = data_start - l->lma_offset;   /* L2: LMA */
     ph[1].p_filesz = data_filesz;
     ph[1].p_memsz = data_memsz;       /* memsz > filesz = the .bss tail */
     ph[1].p_align = PAGE;
@@ -958,6 +973,7 @@ int embld_link(const char **inputs, int ninputs, const char *out,
     memset(&l, 0, sizeof l);
     l.base = (opts && opts->base) ? opts->base : DEFAULT_BASE;
     l.entry = (opts && opts->entry) ? opts->entry : "_start";
+    l.lma_offset = (opts) ? opts->lma_offset : 0;
 
     /* Explicit objects are always linked; archives are stashed and their
      * members pulled on demand (left-to-right, as a linker does — so an
@@ -985,6 +1001,7 @@ int embld_link(const char **inputs, int ninputs, const char *out,
            &data_memsz);
     finalize_symbols(&l);
     define_brackets(&l, bounds);
+    define_end_symbols(&l, data_start + data_memsz);   /* L1: kernel_end/_end */
 
     struct symbol *e = sym_find(&l, l.entry);
     if (!e || !e->defined)

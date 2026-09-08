@@ -17,6 +17,15 @@ cd "$(dirname "$0")/.."
 EMBCC="$PWD/embcc"
 export EMBCC
 
+# Turn on the optimizer's IR verifier for the whole suite: every -O1/-O2 compile
+# (optimizer.sh, regalloc-O2.sh, the on-metal kernel build) then checks that no
+# pass dropped a live value or left var_scope indices stale, and aborts loudly if
+# so. -O0 skips the optimizer entirely, so this is free there. It exists because
+# the var_scope-after-DCE miscompile passed the whole suite once (see
+# tests/exec/scope-dce-shift.c) — this makes that class a hard failure, not a
+# boot-the-kernel-to-find-out.
+export EMBCC_VERIFY=1
+
 if [ ! -x "$EMBCC" ]; then
     echo "run.sh: $EMBCC not built (run make first)" >&2
     exit 1

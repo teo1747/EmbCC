@@ -112,7 +112,9 @@ source layout (ARCHITECTURE §7), not a future refactor:
 * Parser / AST (`src/parse`)
 * Semantic analyzer (`src/sema`)
 * Intermediate representation — EmbIR (`src/ir`)
-* Optimizer (future, over EmbIR)
+* Optimizer (`src/opt`, over EmbIR — landed: folding, strength reduction,
+  value numbering/CSE, copy propagation, DCE; register allocation and
+  stack-slot coalescing live in codegen)
 * Code generator (`src/codegen`, `src/asm`)
 * Linker (`src/link`)
 

@@ -19,6 +19,7 @@ SRCS := \
 	src/sema/sema.c \
 	src/sema/type.c \
 	src/ir/irgen.c \
+	src/as/as.c \
 	src/opt/opt.c \
 	src/codegen/codegen.c \
 	src/debug/dwarf.c \
@@ -30,10 +31,18 @@ SRCS := \
 
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
 
-all: embcc embread embld
+all: embcc embread embld embas
 
 embcc: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS)
+
+# embas — the standalone NASM/Intel-syntax assembler (A1, ARCHITECTURE §4). Reads
+# the kernel's hand-written .asm and emits ELF objects the same writer (src/elf)
+# the compiler uses produces, so the toolchain owns the whole build (drops nasm).
+embas: tools/embas/embas.c src/as/as.c src/as/as.h src/elf/write.c \
+       src/elf/elf.h src/driver/util.c
+	$(CC) $(CFLAGS) -o $@ tools/embas/embas.c src/as/as.c src/elf/write.c \
+	    src/driver/util.c
 
 # embld — the integrated linker (ARCHITECTURE §6, WORKPLAN stream B), as
 # a standalone tool for host development. The link library also gets
@@ -73,6 +82,6 @@ test: embcc embread embld embdbg
 	tests/run.sh
 
 clean:
-	rm -rf $(BUILD) embcc embread embld
+	rm -rf $(BUILD) embcc embread embld embdbg embas
 
 .PHONY: all test clean

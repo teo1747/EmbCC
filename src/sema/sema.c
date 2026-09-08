@@ -173,21 +173,21 @@ static struct type *arith_common(struct type *a, struct type *b)
 static void need_scalar(struct unit *u, struct expr *e, const char *what)
 {
     if (!ty_is_scalar(e->ty))
-        diag_fatal(u->file, e->line, "%s needs a scalar value, got %s",
+        diag_at(u->file, e->line, e->col, "%s needs a scalar value, got %s",
                    what, ty_name(e->ty));
 }
 
 static void need_integer(struct unit *u, struct expr *e, const char *what)
 {
     if (!ty_is_integer(e->ty))
-        diag_fatal(u->file, e->line, "%s needs an integer, got %s",
+        diag_at(u->file, e->line, e->col, "%s needs an integer, got %s",
                    what, ty_name(e->ty));
 }
 
 static void need_arith(struct unit *u, struct expr *e, const char *what)
 {
     if (!ty_is_arith(e->ty))
-        diag_fatal(u->file, e->line,
+        diag_at(u->file, e->line, e->col,
                    "%s needs an arithmetic value, got %s", what,
                    ty_name(e->ty));
 }
@@ -205,7 +205,7 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
 {
     if (to->kind == TY_STRUCT || rhs->ty->kind == TY_STRUCT) {
         if (!ty_equal(to, rhs->ty))
-            diag_fatal(u->file, rhs->line, "%s: cannot convert %s to %s",
+            diag_at(u->file, rhs->line, rhs->col, "%s: cannot convert %s to %s",
                        ctx, ty_name(rhs->ty), ty_name(to));
         return rhs; /* same struct type: passed/returned as its bytes */
     }
@@ -230,18 +230,18 @@ static struct expr *convert_assign(struct unit *u, struct expr *rhs,
             return mk_cast(rhs, to);
         if (is_null_const(rhs))
             return mk_cast(rhs, to);
-        diag_fatal(u->file, rhs->line,
+        diag_at(u->file, rhs->line, rhs->col,
                    "%s: cannot convert %s to %s without a cast",
                    ctx, ty_name(rhs->ty), ty_name(to));
     }
     if (ty_is_float(to) && rhs->ty->kind == TY_PTR)
-        diag_fatal(u->file, rhs->line,
+        diag_at(u->file, rhs->line, rhs->col,
                    "%s: a pointer cannot become %s", ctx, ty_name(to));
     if (ty_is_integer(to) && rhs->ty->kind == TY_PTR)
-        diag_fatal(u->file, rhs->line,
+        diag_at(u->file, rhs->line, rhs->col,
                    "%s: converting %s to %s needs an explicit cast",
                    ctx, ty_name(rhs->ty), ty_name(to));
-    diag_fatal(u->file, rhs->line, "%s: cannot convert %s to %s",
+    diag_at(u->file, rhs->line, rhs->col, "%s: cannot convert %s to %s",
                ctx, ty_name(rhs->ty), ty_name(to));
     return NULL;
 }
@@ -298,6 +298,53 @@ static int find_member_deep(struct type *base, const char *name,
     return 0;
 }
 
+/* Levenshtein distance, bounded — for "did you mean?" suggestions. Long names
+ * are not worth diffing (capped at 999 = "no match"). */
+static int edit_distance(const char *a, const char *b)
+{
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la > 63 || lb > 63)
+        return 999;
+    int prev[65], cur[65];
+    for (int j = 0; j <= lb; j++) prev[j] = j;
+    for (int i = 1; i <= la; i++) {
+        cur[0] = i;
+        for (int j = 1; j <= lb; j++) {
+            int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            int del = prev[j] + 1, ins = cur[j - 1] + 1, sub = prev[j - 1] + cost;
+            int m = del < ins ? del : ins;
+            cur[j] = m < sub ? m : sub;
+        }
+        for (int j = 0; j <= lb; j++) prev[j] = cur[j];
+    }
+    return prev[lb];
+}
+
+/* The in-scope local, function, or global whose name is closest to `name`, if
+ * one is close enough to be worth suggesting (a few edits, scaled to length),
+ * else NULL. Powers the "did you mean 'x'?" note on an undeclared name. */
+static const char *suggest_name(struct unit *u, struct scope *sc,
+                                const char *name)
+{
+    const char *best = NULL;
+    int bestd = 1000, nlen = (int)strlen(name);
+    for (int i = 0; i < sc->n; i++)
+        if (sc->vars[i].active) {
+            int d = edit_distance(name, sc->vars[i].name);
+            if (d > 0 && d < bestd) { bestd = d; best = sc->vars[i].name; }
+        }
+    for (struct func *fd = u->funcs; fd; fd = fd->next) {
+        int d = edit_distance(name, fd->name);
+        if (d > 0 && d < bestd) { bestd = d; best = fd->name; }
+    }
+    for (struct global *g = u->globals; g; g = g->next) {
+        int d = edit_distance(name, g->name);
+        if (d > 0 && d < bestd) { bestd = d; best = g->name; }
+    }
+    int thresh = nlen / 3 < 2 ? 2 : nlen / 3;
+    return (best && bestd <= thresh) ? best : NULL;
+}
+
 /* ---- expression checking ---- */
 
 static void check_expr(struct unit *u, struct func *f, struct scope *sc,
@@ -308,12 +355,17 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_FNUM:
         /* type assigned by the parser from the literal's shape */
         break;
-    case EXPR_STR:
-        /* char[N], decaying to char* like any array (sizeof sees the
-         * array through `undecayed`) */
-        e->undecayed = ty_array(ty_base(TY_CHAR, 0), (int)e->num);
-        e->ty = ty_ptr(ty_base(TY_CHAR, 0));
+    case EXPR_STR: {
+        /* char[N] (or wchar_t/char16_t/char32_t[N] for a wide literal),
+         * decaying to a pointer like any array (sizeof sees the array through
+         * `undecayed`). e->num is the element count including the NUL. */
+        struct type *elem = e->str_width == 4 ? ty_base(TY_INT, 0)
+                          : e->str_width == 2 ? ty_base(TY_SHORT, 1)
+                          : ty_base(TY_CHAR, 0);
+        e->undecayed = ty_array(elem, (int)e->num);
+        e->ty = ty_ptr(elem);
         break;
+    }
     case EXPR_VAR: {
         int i = scope_find(sc, e->name);
         if (i >= 0) {
@@ -339,7 +391,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 break;
             }
             if (ec)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "enumerator '%s' is used before its "
                            "declaration", e->name);
             struct global *g = find_global(u, e->name);
@@ -351,7 +403,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 g->used = 1;
                 e->ty = g->ty;
             } else if (g) {
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "'%s' is used before its declaration "
                            "(line %d)", e->name, g->line);
             } else if (find_func(u, e->name)) {
@@ -361,7 +413,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                  * lowered before that walk runs, but is still legal if the
                  * function was declared earlier in the source. */
                 if (fd->seq > cur_body_seq)
-                    diag_fatal(u->file, e->line,
+                    diag_at(u->file, e->line, e->col,
                                "'%s' is used before its declaration",
                                e->name);
                 e->fref = fd;
@@ -369,10 +421,15 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                 e->ty = ty_ptr(ty_func(fd->ret_ty, fd->param_tys,
                                        fd->nparams, fd->is_varargs));
             } else {
-                diag_fatal(u->file, e->line,
-                           "'%s' is not declared in '%s' — for a call, "
-                           "add a prototype or define it first",
-                           e->name, f->name);
+                const char *sug = suggest_name(u, sc, e->name);
+                diag_error_at(u->file, e->line, e->col,
+                              "'%s' is not declared in '%s' — for a call, "
+                              "add a prototype or define it first",
+                              e->name, f->name);
+                if (sug)
+                    diag_note_at(u->file, e->line, e->col,
+                                 "did you mean '%s'?", sug);
+                exit(1);
             }
         }
         if (e->ty->kind == TY_ARRAY) {
@@ -384,16 +441,16 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_ASSIGN:
         check_expr(u, f, sc, e->lhs);
         if (!is_lvalue(e->lhs))
-            diag_fatal(u->file, e->line, "assignment target is not an "
+            diag_at(u->file, e->line, e->col, "assignment target is not an "
                                          "lvalue");
         if (e->lhs->undecayed)
-            diag_fatal(u->file, e->line, "cannot assign to an array");
+            diag_at(u->file, e->line, e->col, "cannot assign to an array");
         if (e->lhs->fref)
-            diag_fatal(u->file, e->line, "cannot assign to a function");
+            diag_at(u->file, e->line, e->col, "cannot assign to a function");
         check_expr(u, f, sc, e->rhs);
         if (e->lhs->ty->kind == TY_STRUCT) {
             if (!ty_equal(e->lhs->ty, e->rhs->ty))
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "cannot assign %s to %s",
                            ty_name(e->rhs->ty), ty_name(e->lhs->ty));
         } else {
@@ -405,15 +462,15 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_INCDEC: {
         check_expr(u, f, sc, e->lhs);
         if (!is_lvalue(e->lhs) || e->lhs->undecayed || e->lhs->fref)
-            diag_fatal(u->file, e->line, "++/-- needs an lvalue");
+            diag_at(u->file, e->line, e->col, "++/-- needs an lvalue");
         e->ty = e->lhs->ty;
         if (e->ty->kind == TY_PTR) {
             if (e->ty->pointee->kind == TY_VOID ||
                 e->ty->pointee->kind == TY_FUNC)
-                diag_fatal(u->file, e->line, "++/-- on %s",
+                diag_at(u->file, e->line, e->col, "++/-- on %s",
                            ty_name(e->ty));
         } else if (!ty_is_arith(e->ty)) {
-            diag_fatal(u->file, e->line, "++/-- needs an integer or "
+            diag_at(u->file, e->line, e->col, "++/-- needs an integer or "
                                          "pointer, got %s",
                        ty_name(e->ty));
         }
@@ -439,14 +496,14 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_DEREF:
         check_expr(u, f, sc, e->rhs);
         if (e->rhs->ty->kind != TY_PTR)
-            diag_fatal(u->file, e->line, "cannot dereference %s",
+            diag_at(u->file, e->line, e->col, "cannot dereference %s",
                        ty_name(e->rhs->ty));
         if (e->rhs->ty->pointee->kind == TY_FUNC) {
             e->ty = e->rhs->ty; /* *fp is fp, as in C */
             break;
         }
         if (e->rhs->ty->pointee->kind == TY_VOID)
-            diag_fatal(u->file, e->line, "cannot dereference void *");
+            diag_at(u->file, e->line, e->col, "cannot dereference void *");
         e->ty = e->rhs->ty->pointee;
         if (e->ty->kind == TY_ARRAY) {
             /* m[i] of a 2-D array is itself an array: it decays, and
@@ -455,6 +512,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             e->ty = ty_ptr(e->ty->pointee);
         }
         break;
+    case EXPR_LABELADDR:
+        /* &&label: a void* to a code location (GNU computed goto). The label's
+         * existence is resolved in irgen (labels may be forward-referenced). */
+        e->ty = ty_ptr(ty_base(TY_VOID, 0));
+        break;
     case EXPR_ADDR:
         check_expr(u, f, sc, e->rhs);
         if (e->rhs->fref) {
@@ -462,7 +524,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             break;
         }
         if (!is_lvalue(e->rhs))
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "'&' needs a variable or *pointer");
         if (e->rhs->undecayed) {
             /* &arr yields a pointer to the whole ARRAY object, T(*)[N]; its
@@ -472,7 +534,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         }
         if (e->rhs->kind == EXPR_MEMBER && e->rhs->memb &&
             e->rhs->memb->is_bitfield)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "cannot take the address of bitfield '%s'",
                        e->rhs->memb->name);
         e->ty = ty_ptr(e->rhs->ty);
@@ -485,11 +547,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
          * carried by address, a scalar is loaded). */
         struct type *ty = e->cast_ty;
         if (ty->kind == TY_VOID || ty->kind == TY_FUNC)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "a compound literal cannot have type %s",
                        ty_name(ty));
         if (ty->kind == TY_STRUCT && !ty->complete)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "compound literal of incomplete type %s",
                        ty_name(ty));
         /* `(int[]){...}` takes its size from the initializer, as `int a[]`
@@ -578,7 +640,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         if (!chosen)
             chosen = deflt;
         if (!chosen)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "no _Generic association matches type %s",
                        ty_name(e->lhs->ty));
         check_expr(u, f, sc, chosen);
@@ -595,11 +657,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         }
         need_scalar(u, e->rhs, "a cast");
         if (!ty_is_scalar(e->cast_ty))
-            diag_fatal(u->file, e->line, "cannot cast to %s",
+            diag_at(u->file, e->line, e->col, "cannot cast to %s",
                        ty_name(e->cast_ty));
         if ((ty_is_float(e->cast_ty) && e->rhs->ty->kind == TY_PTR) ||
             (e->cast_ty->kind == TY_PTR && ty_is_float(e->rhs->ty)))
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "cannot convert between %s and %s",
                        ty_name(e->rhs->ty), ty_name(e->cast_ty));
         e->ty = e->cast_ty;
@@ -622,7 +684,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         } else if (a->kind == TY_PTR && b->kind == TY_PTR) {
             if (!ty_equal(a, b) && a->pointee->kind != TY_VOID &&
                 b->pointee->kind != TY_VOID)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "'?:' branches have incompatible pointer "
                            "types (%s vs %s)", ty_name(a), ty_name(b));
             e->ty = a->pointee->kind == TY_VOID ? b : a;
@@ -639,7 +701,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         } else if (a->kind == TY_STRUCT && ty_equal(a, b)) {
             e->ty = a; /* both arms are the same aggregate */
         } else {
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "'?:' branches have incompatible types "
                        "(%s vs %s)", ty_name(a), ty_name(b));
         }
@@ -648,7 +710,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
     case EXPR_INITLIST:
         /* Only ever reached through flatten_init(), which knows the
          * target type; a brace list has no type of its own. */
-        diag_fatal(u->file, e->line,
+        diag_at(u->file, e->line, e->col,
                    "a brace initializer cannot appear here");
         break;
     case EXPR_COMPOUND: {
@@ -658,11 +720,11 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         check_expr(u, f, sc, e->lhs);
         check_expr(u, f, sc, e->rhs);
         if (!is_lvalue(e->lhs) || e->lhs->undecayed || e->lhs->fref)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "compound assignment needs an lvalue");
         if (e->lhs->ty->kind == TY_PTR) {
             if (e->op != B_ADD && e->op != B_SUB)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "only += and -= apply to a pointer");
             need_integer(u, e->rhs, "pointer arithmetic");
             e->rhs = mk_cast(e->rhs, ty_base(TY_LONG, 0));
@@ -696,25 +758,31 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         struct type *base = e->lhs->ty;
         if (e->is_arrow) {
             if (base->kind != TY_PTR || base->pointee->kind != TY_STRUCT)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "'->' needs a pointer to a struct/union, "
                            "got %s", ty_name(base));
             base = base->pointee;
         } else if (base->kind != TY_STRUCT) {
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "'.' needs a struct/union, got %s (use '->' "
                        "through a pointer)", ty_name(base));
         }
         if (!base->complete)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "%s is incomplete here (its body comes later "
                        "or never)", ty_name(base));
         struct member *mm = xcalloc(1, sizeof *mm);
         if (!find_member_deep(base, e->name, mm, 0))
-            diag_fatal(u->file, e->line, "%s has no member '%s'",
+            diag_at(u->file, e->line, e->col, "%s has no member '%s'",
                        ty_name(base), e->name);
         e->memb = mm;
         e->ty = e->memb->ty;
+        /* C: a member of a `volatile`-qualified struct/union is itself
+         * volatile-qualified — propagate it so the load/store isn't optimized
+         * (the ehci/ohci MMIO register-struct pattern), and so a nested struct
+         * member stays volatile for its own members. */
+        if (base->is_volatile && !e->ty->is_volatile)
+            e->ty = ty_volatile(e->ty);
         if (e->ty->kind == TY_ARRAY) {
             e->undecayed = e->ty;
             e->ty = ty_ptr(e->ty->pointee);
@@ -725,15 +793,15 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         long size;
         if (e->cast_ty) {
             if (e->cast_ty->kind == TY_VOID)
-                diag_fatal(u->file, e->line, "sizeof(void)");
+                diag_at(u->file, e->line, e->col, "sizeof(void)");
             if (ty_size(e->cast_ty) == 0)
-                diag_fatal(u->file, e->line, "sizeof of incomplete %s",
+                diag_at(u->file, e->line, e->col, "sizeof of incomplete %s",
                            ty_name(e->cast_ty));
             size = ty_size(e->cast_ty);
         } else {
             check_expr(u, f, sc, e->rhs);
             if (e->rhs->ty->kind == TY_VOID)
-                diag_fatal(u->file, e->line, "sizeof a void expression");
+                diag_at(u->file, e->line, e->col, "sizeof a void expression");
             /* sizeof is the one context where an array does NOT decay */
             size = ty_size(e->rhs->undecayed ? e->rhs->undecayed
                                              : e->rhs->ty);
@@ -746,12 +814,27 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
         e->ty = ty_base(TY_LONG, 1);
         break;
     }
+    case EXPR_ALIGNOF: {
+        struct type *t = e->cast_ty;
+        if (!t) {
+            check_expr(u, f, sc, e->rhs);
+            t = e->rhs->undecayed ? e->rhs->undecayed : e->rhs->ty;
+        }
+        if (t->kind == TY_VOID || ty_size(t) == 0)
+            diag_at(u->file, e->line, e->col, "_Alignof of incomplete %s",
+                    ty_name(t));
+        e->kind = EXPR_NUM;                 /* folds to a size_t constant */
+        e->num = ty_align(t);
+        e->rhs = NULL;
+        e->ty = ty_base(TY_LONG, 1);
+        break;
+    }
     case EXPR_VA_ARG:
         check_expr(u, f, sc, e->lhs);   /* the va_list */
         if (e->cast_ty->kind == TY_VOID)
-            diag_fatal(u->file, e->line, "va_arg cannot read type 'void'");
+            diag_at(u->file, e->line, e->col, "va_arg cannot read type 'void'");
         if (e->cast_ty->kind == TY_STRUCT)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "va_arg of a struct passed by value is not "
                        "supported yet");
         e->ty = e->cast_ty;
@@ -773,27 +856,27 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             int lp = lt->kind == TY_PTR, rp = rt->kind == TY_PTR;
             if (lp && rp) {
                 if (e->op == B_ADD)
-                    diag_fatal(u->file, e->line,
+                    diag_at(u->file, e->line, e->col,
                                "cannot add two pointers");
                 if (!ty_equal(lt, rt))
-                    diag_fatal(u->file, e->line,
+                    diag_at(u->file, e->line, e->col,
                                "subtracting incompatible pointers "
                                "(%s vs %s)", ty_name(lt), ty_name(rt));
                 if (lt->pointee->kind == TY_VOID ||
                     lt->pointee->kind == TY_FUNC)
-                    diag_fatal(u->file, e->line, "arithmetic on %s",
+                    diag_at(u->file, e->line, e->col, "arithmetic on %s",
                                ty_name(lt));
                 e->ty = ty_base(TY_LONG, 0); /* ptrdiff_t */
             } else if (lp || rp) {
                 if (rp && e->op == B_SUB)
-                    diag_fatal(u->file, e->line,
+                    diag_at(u->file, e->line, e->col,
                                "cannot subtract a pointer from an "
                                "integer");
                 struct expr **ip = lp ? &e->rhs : &e->lhs;
                 struct type *pt = lp ? lt : rt;
                 if (pt->pointee->kind == TY_VOID ||
                     pt->pointee->kind == TY_FUNC)
-                    diag_fatal(u->file, e->line, "arithmetic on %s",
+                    diag_at(u->file, e->line, e->col, "arithmetic on %s",
                                ty_name(pt));
                 need_integer(u, *ip, "pointer arithmetic");
                 *ip = mk_cast(*ip, ty_base(TY_LONG, 0));
@@ -819,14 +902,14 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
                     if (!ty_equal(lt, rt) &&
                         lt->pointee->kind != TY_VOID &&
                         rt->pointee->kind != TY_VOID)
-                        diag_fatal(u->file, e->line,
+                        diag_at(u->file, e->line, e->col,
                                    "comparing incompatible pointers "
                                    "(%s vs %s)", ty_name(lt),
                                    ty_name(rt));
                 } else {
                     struct expr **ip = lp ? &e->rhs : &e->lhs;
                     if (!is_null_const(*ip))
-                        diag_fatal(u->file, e->line,
+                        diag_at(u->file, e->line, e->col,
                                    "comparing a pointer with an "
                                    "integer needs a cast");
                     *ip = mk_cast(*ip, lp ? lt : rt);
@@ -878,17 +961,17 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             int is_start = strcmp(e->lhs->name, "__builtin_va_start") == 0;
             int want = is_start ? 2 : 1;
             if (e->nargs != want)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "%s takes %d argument%s", e->lhs->name, want,
                            want == 1 ? "" : "s");
             for (int i = 0; i < e->nargs; i++)
                 check_expr(u, f, sc, e->args[i]);
             if (!is_lvalue(e->args[0]))
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "the first argument to %s must be a va_list "
                            "variable", e->lhs->name);
             if (is_start && !f->is_varargs)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "va_start in '%s', which is not variadic",
                            f->name);
             e->name = e->lhs->name;   /* irgen dispatches on it */
@@ -925,7 +1008,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             else if (strcmp(bn, "bswap16") == 0 || strcmp(bn, "bswap32") == 0 ||
                      strcmp(bn, "bswap64") == 0) {
                 if (e->nargs != 1)
-                    diag_fatal(u->file, e->line, "%s takes one argument",
+                    diag_at(u->file, e->line, e->col, "%s takes one argument",
                                e->lhs->name);
                 check_expr(u, f, sc, e->args[0]);
                 need_integer(u, e->args[0], "__builtin_bswap");
@@ -937,7 +1020,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             /* the value IS the first argument; the hint is discarded */
             else if (strcmp(bn, "expect") == 0) {
                 if (e->nargs < 1)
-                    diag_fatal(u->file, e->line,
+                    diag_at(u->file, e->line, e->col,
                                "__builtin_expect takes two arguments");
                 for (int i = 0; i < e->nargs; i++)
                     check_expr(u, f, sc, e->args[i]);
@@ -972,7 +1055,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             for (int i = 0; i < e->nargs; i++)
                 check_expr(u, f, sc, e->args[i]);
             if (e->nargs < 1 || e->args[0]->ty->kind != TY_PTR)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "%s needs a pointer first argument", e->lhs->name);
             e->name = e->lhs->name;
             if (strcmp(e->lhs->name, "__atomic_store_n") == 0)
@@ -995,7 +1078,7 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             find_func(u, e->lhs->name)) {
             struct func *callee = find_func(u, e->lhs->name);
             if (callee->seq > cur_body_seq)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "call to '%s' before its declaration — "
                            "declare or define functions before their "
                            "callers", e->lhs->name);
@@ -1007,14 +1090,14 @@ static void check_expr(struct unit *u, struct func *f, struct scope *sc,
             check_expr(u, f, sc, e->lhs);
             if (e->lhs->ty->kind != TY_PTR ||
                 e->lhs->ty->pointee->kind != TY_FUNC)
-                diag_fatal(u->file, e->line,
+                diag_at(u->file, e->line, e->col,
                            "called object is not a function (type %s)",
                            ty_name(e->lhs->ty));
             ft = e->lhs->ty->pointee;
         }
         if (ft->is_varargs ? e->nargs < ft->nptypes
                            : e->nargs != ft->nptypes)
-            diag_fatal(u->file, e->line,
+            diag_at(u->file, e->line, e->col,
                        "this call needs %s%d argument%s, got %d",
                        ft->is_varargs ? "at least " : "", ft->nptypes,
                        ft->nptypes == 1 ? "" : "s", e->nargs);
@@ -1186,12 +1269,15 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
     }
     if (init->kind != EXPR_INITLIST) {
         if (ty->kind == TY_ARRAY) {
-            /* char a[] = "..." — the literal's bytes ARE the object */
+            /* char a[] = "..." (or a wide array from L""/u""/U"") — the
+             * literal's elements ARE the object. The array element must be an
+             * integer whose size matches the literal's element width. */
             if (init->kind == EXPR_STR &&
-                ty->pointee->kind == TY_CHAR) {
-                int len = (int)init->num;
+                ty_is_integer(ty->pointee) &&
+                ty_size(ty->pointee) == (init->str_width ? init->str_width : 1)) {
+                int len = (int)init->num, esz = ty_size(ty->pointee);
                 if (ty->count && ty->count < len - 1)
-                    diag_fatal(u->file, init->line,
+                    diag_at(u->file, init->line, init->col,
                                "initializer is longer than the array");
                 for (int i = 0; i < len && (!ty->count || i < ty->count);
                      i++) {
@@ -1199,12 +1285,12 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                     ch->kind = EXPR_NUM;
                     ch->line = init->line;
                     ch->num = (unsigned char)init->name[i];
-                    ch->ty = ty_base(TY_CHAR, 0);
-                    init_push(out, off + i, ty->pointee, ch);
+                    ch->ty = ty->pointee;
+                    init_push(out, off + i * esz, ty->pointee, ch);
                 }
                 return;
             }
-            diag_fatal(u->file, init->line,
+            diag_at(u->file, init->line, init->col,
                        "an array needs a brace initializer or a string");
         }
         check_expr(u, f, sc, init);
@@ -1224,7 +1310,7 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
         for (int i = 0; i < init->nelems; i++) {
             struct expr *el = init->elems[i];
             if (el->desig_field)
-                diag_fatal(u->file, el->line,
+                diag_at(u->file, el->line, el->col,
                            "field designator '.%s' in an array initializer",
                            el->desig_field);
             if (el->desig_index >= 0)
@@ -1235,7 +1321,7 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
              * which also keeps a huge `[a ... b] = 0` cheap. */
             int hi = el->desig_index_hi >= 0 ? el->desig_index_hi : ai;
             if (ty->count && hi >= ty->count)
-                diag_fatal(u->file, el->line,
+                diag_at(u->file, el->line, el->col,
                            "initializer index %d is past the end of an "
                            "array of %d", hi, ty->count);
             int is_zero = el->kind == EXPR_NUM && el->num == 0;
@@ -1255,7 +1341,7 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
             if (el->desig_field) {
                 struct member *m = ty_find_member(ty, el->desig_field);
                 if (!m)
-                    diag_fatal(u->file, el->line,
+                    diag_at(u->file, el->line, el->col,
                                "%s has no member '%s'", ty_name(ty),
                                el->desig_field);
                 mi = (int)(m - ty->members);
@@ -1266,7 +1352,7 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
                    !ty->members[mi].name)
                 mi++;
             if (mi >= ty->nmembers)
-                diag_fatal(u->file, init->line,
+                diag_at(u->file, init->line, init->col,
                            "too many initializers for %s, which has %d "
                            "members", ty_name(ty), ty->nmembers);
             struct member *m = &ty->members[mi];
@@ -1290,7 +1376,7 @@ static void flatten_init(struct unit *u, struct func *f, struct scope *sc,
     }
     /* a braced scalar: { x } */
     if (init->nelems != 1)
-        diag_fatal(u->file, init->line,
+        diag_at(u->file, init->line, init->col,
                    "a scalar takes exactly one initializer");
     flatten_init(u, f, sc, init->elems[0], ty, off, out);
 }
@@ -1386,6 +1472,8 @@ static void lower_static_bytes(struct unit *u, int line, int size,
             rel[nrel].off = v[k].off;
             rel[nrel].str = (gt || ft) ? NULL : core->name;
             rel[nrel].str_len = (gt || ft) ? 0 : (int)core->num;
+            rel[nrel].str_width = (gt || ft) ? 1
+                                  : (core->str_width ? core->str_width : 1);
             rel[nrel].gtarget = gt;
             rel[nrel].ftarget = ft;
             rel[nrel].addend = addend;
@@ -1502,7 +1590,7 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
 {
     const char *c = op->constraint;
     if (is_out && *c != '=' && *c != '+')
-        diag_fatal(u->file, s->line,
+        diag_at(u->file, s->line, s->col,
                    "an asm output constraint must start with '=' or '+' "
                    "(got \"%s\")", op->constraint);
     while (*c == '=' || *c == '+' || *c == '&')
@@ -1528,7 +1616,7 @@ static int asm_resolve_reg(struct unit *u, struct stmt *s,
     for (const char *p = c; *p; p++)             /* an SSE/XMM ('x') operand */
         if (*p == 'x')
             return -3;                            /* irgen allocates an xmm */
-    diag_fatal(u->file, s->line,
+    diag_at(u->file, s->line, s->col,
                "asm constraint \"%s\" is not supported "
                "(EmbCC handles a/b/c/d/S/D, 'r'/'q'/'g'/'m', 'x', and a "
                "register-asm variable)", op->constraint);
@@ -1549,17 +1637,17 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             /* break leaves the nearest loop OR switch; continue only
              * ever belongs to a loop. */
             if (!in_loop && !in_switch)
-                diag_fatal(u->file, s->line,
+                diag_at(u->file, s->line, s->col,
                            "'break' outside of a loop or switch");
             break;
         case STMT_CONTINUE:
             if (!in_loop)
-                diag_fatal(u->file, s->line, "'continue' outside of a loop");
+                diag_at(u->file, s->line, s->col, "'continue' outside of a loop");
             break;
         case STMT_CASE:
         case STMT_DEFAULT:
             if (!at_sw_level)
-                diag_fatal(u->file, s->line,
+                diag_at(u->file, s->line, s->col,
                            "'%s' must appear directly in its switch body "
                            "(labels inside a nested block are not "
                            "supported)",
@@ -1568,7 +1656,7 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
                 check_expr(u, f, sc, s->expr);
                 need_integer(u, s->expr, "a case label");
                 if (!const_fold(s->expr, &s->cval))
-                    diag_fatal(u->file, s->line,
+                    diag_at(u->file, s->line, s->col,
                                "a case label must be an integer constant "
                                "expression");
             }
@@ -1639,11 +1727,15 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             }
             if (s->expr && s->dty->kind == TY_ARRAY &&
                 s->expr->kind == EXPR_STR) {
-                /* char a[] = "..." : an omitted size is the literal's */
-                if (s->dty->pointee->kind != TY_CHAR)
-                    diag_fatal(u->file, s->line,
-                               "only a char array can be initialized "
-                               "from a string");
+                /* char a[] = "..." (or a wide array from L""/u""/U"") : the
+                 * element must be an integer matching the literal's width; an
+                 * omitted size is the literal's element count. */
+                int w = s->expr->str_width ? s->expr->str_width : 1;
+                if (!ty_is_integer(s->dty->pointee) ||
+                    ty_size(s->dty->pointee) != w)
+                    diag_at(u->file, s->line, s->col,
+                               "a string literal can only initialize an integer "
+                               "array whose element width matches it");
                 if (s->dty->count == 0)
                     s->dty = ty_array(s->dty->pointee,
                                       (int)s->expr->num);
@@ -1659,7 +1751,7 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
              * it before checking the initializer; a static local's
              * global is wired onto this same entry below. */
             if (scope_find_here(sc, s->name) >= 0)
-                diag_fatal(u->file, s->line,
+                diag_at(u->file, s->line, s->col,
                            "'%s' is already declared in this block",
                            s->name);
             s->var_index = scope_add(sc, s->name, s->dty, NULL);
@@ -1739,12 +1831,12 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
         case STMT_RETURN:
             if (f->ret_ty->kind == TY_VOID) {
                 if (s->expr)
-                    diag_fatal(u->file, s->line,
+                    diag_at(u->file, s->line, s->col,
                                "returning a value from void '%s'",
                                f->name);
             } else {
                 if (!s->expr)
-                    diag_fatal(u->file, s->line,
+                    diag_at(u->file, s->line, s->col,
                                "'%s' returns %s; 'return' needs a value",
                                f->name, ty_name(f->ret_ty));
                 check_expr(u, f, sc, s->expr);
@@ -1761,7 +1853,7 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             for (int i = 0; i < a->nout; i++) {
                 check_expr(u, f, sc, a->out[i].expr);
                 if (!is_lvalue(a->out[i].expr))
-                    diag_fatal(u->file, s->line,
+                    diag_at(u->file, s->line, s->col,
                                "an asm output operand must be an lvalue");
                 a->out[i].reg = asm_resolve_reg(u, s, &a->out[i], 1);
             }
@@ -1821,6 +1913,12 @@ static void check_stmt(struct unit *u, struct func *f, struct scope *sc,
             break;
         case STMT_GOTO:
             /* target existence is validated function-wide at codegen */
+            if (s->expr) {   /* computed goto `goto *expr` (GNU) */
+                check_expr(u, f, sc, s->expr);
+                if (s->expr->ty->kind != TY_PTR)
+                    diag_at(u->file, s->line, s->col,
+                            "computed goto ('goto *') needs a pointer operand");
+            }
             break;
         }
     }
@@ -1990,18 +2088,25 @@ static void merge_decls(struct unit *u)
         for (int i = 0; match && i < f->nparams; i++)
             if (!ty_equal(canon->param_tys[i], f->param_tys[i]))
                 match = 0;
-        if (!match)
-            diag_fatal(u->file, f->line,
-                       "conflicting declaration of '%s' (earlier one at "
-                       "line %d)", f->name, canon->line);
+        if (!match) {
+            diag_error_at(f->file, f->line, 0,
+                          "conflicting declaration of '%s'", f->name);
+            diag_note_at(canon->file, canon->line, 0,
+                         "previous declaration of '%s' here", f->name);
+            exit(1);
+        }
         if (f->is_static && !canon->is_static)
             diag_fatal(u->file, f->line,
                        "static declaration of '%s' follows non-static "
                        "declaration (line %d)", f->name, canon->line);
         if (f->defined) {
-            if (canon->has_defn)
-                diag_fatal(u->file, f->line, "redefinition of '%s'",
-                           f->name);
+            if (canon->has_defn) {
+                diag_error_at(f->file, f->line, 0, "redefinition of '%s'",
+                              f->name);
+                diag_note_at(canon->file, canon->line, 0,
+                             "previous definition of '%s' here", f->name);
+                exit(1);
+            }
             canon->has_defn = 1;
             canon->body = f->body;
             for (int i = 0; i < f->nparams; i++)
@@ -2045,19 +2150,26 @@ static void merge_globals(struct unit *u)
             if (canon->ty->count == 0)
                 canon->ty = g->ty;
         }
-        if (!compat)
-            diag_fatal(u->file, g->line,
-                       "conflicting types for '%s': %s here, %s at "
-                       "line %d", g->name, ty_name(g->ty),
-                       ty_name(canon->ty), canon->line);
+        if (!compat) {
+            diag_error_at(g->file, g->line, 0,
+                          "conflicting types for '%s': %s here, %s before",
+                          g->name, ty_name(g->ty), ty_name(canon->ty));
+            diag_note_at(canon->file, canon->line, 0,
+                         "previous declaration of '%s' here", g->name);
+            exit(1);
+        }
         if (g->is_static && !canon->is_static)
             diag_fatal(u->file, g->line,
                        "static declaration of '%s' follows non-static "
                        "declaration (line %d)", g->name, canon->line);
         if (g->has_init) {
-            if (canon->has_init)
-                diag_fatal(u->file, g->line, "redefinition of '%s'",
-                           g->name);
+            if (canon->has_init) {
+                diag_error_at(g->file, g->line, 0, "redefinition of '%s'",
+                              g->name);
+                diag_note_at(canon->file, canon->line, 0,
+                             "previous definition of '%s' here", g->name);
+                exit(1);
+            }
             canon->has_init = 1;
             canon->init = g->init;
             canon->init_expr = g->init_expr;

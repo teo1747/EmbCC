@@ -168,6 +168,7 @@ static int emit_ldvar(struct ir_func *fn, int v, const struct type *t)
     i->size = ty_size(t);
     i->sign = ty_signed_int(t);
     i->w = ty_w(t);
+    i->vol = t->is_volatile;
     i->dst = new_temp(fn);
     return i->dst;
 }
@@ -180,6 +181,7 @@ static void emit_stvar(struct ir_func *fn, int v, int val,
     i->dst = v;
     i->a = val;
     i->size = ty_size(t);
+    i->vol = t->is_volatile;
 }
 
 static int emit_gaddr(struct ir_func *fn, struct global *g)
@@ -200,6 +202,7 @@ static int emit_load(struct ir_func *fn, int addr, const struct type *t)
     i->size = ty_size(t);
     i->sign = ty_signed_int(t);
     i->w = ty_w(t);
+    i->vol = t->is_volatile;
     i->dst = new_temp(fn);
     return i->dst;
 }
@@ -212,6 +215,7 @@ static void emit_store(struct ir_func *fn, int addr, int val,
     i->a = addr;
     i->b = val;
     i->size = ty_size(t);
+    i->vol = t->is_volatile;
 }
 
 static void emit_mov(struct ir_func *fn, int dst, int src)
@@ -705,8 +709,27 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return emit_const(fn, e->num, ty_w(e->ty));
     case EXPR_FNUM:
         return emit_fconst(fn, e->fnum, ty_size(e->ty));
+    case EXPR_LABELADDR: {   /* &&label -> a void* to the label's code location */
+        struct ir_ins *i = emit(fn);
+        i->op = IR_LABELADDR;
+        i->label = g_labels[label_idx(fn, e->name, e->line)].label;
+        i->dst = new_temp(fn);
+        return i->dst;
+    }
     case EXPR_STR: {
-        e->str_index = intern_str(e->name, (int)e->num);
+        int w = e->str_width ? e->str_width : 1;
+        if (w == 1) {
+            e->str_index = intern_str(e->name, (int)e->num);
+        } else {
+            /* Expand each source byte to a `w`-byte element, little-endian and
+             * zero-extended, so the .rodata holds a real wide string. */
+            int n = (int)e->num;
+            char *wide = xmalloc((size_t)n * (size_t)w);
+            memset(wide, 0, (size_t)n * (size_t)w);
+            for (int k = 0; k < n; k++)
+                wide[(size_t)k * w] = e->name[k];
+            e->str_index = intern_str(wide, n * w);
+        }
         struct ir_ins *i = emit(fn);
         i->op = IR_STRADDR;
         i->label = e->str_index;
@@ -854,6 +877,7 @@ static int gen_expr(struct ir_func *fn, struct expr *e)
         return gen_convert(fn, v, e->rhs->ty, e->ty);
     }
     case EXPR_SIZEOF:
+    case EXPR_ALIGNOF:
         break; /* folded to EXPR_NUM by sema; unreachable */
     case EXPR_STMTEXPR:
         return gen_stmtexpr(fn, e);
@@ -2112,7 +2136,14 @@ static void gen_stmt(struct ir_func *fn, struct stmt *s,
             break;
         }
         case STMT_GOTO:
-            emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
+            if (s->expr) {   /* computed goto: goto *expr (GNU) */
+                int v = gen_expr(fn, s->expr);
+                struct ir_ins *i = emit(fn);
+                i->op = IR_IGOTO;
+                i->a = v;
+            } else {
+                emit_jmp(fn, g_labels[label_idx(fn, s->name, s->line)].label);
+            }
             break;
         case STMT_DECL:
             if (s->is_extern)

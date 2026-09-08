@@ -66,8 +66,10 @@ enum ir_op {
     IR_CMPXCHG, /* CAS at *(a): compare against *(b), set to c on match;
                  * dst = matched?1:0, and *(b) updated to the seen value.
                  * (lock cmpxchg; size) */
-    IR_ASM    /* extended asm: load inputs to fixed registers, assemble the
+    IR_ASM,   /* extended asm: load inputs to fixed registers, assemble the
                * template, store outputs. Detail in ir_ins.asm_ir */
+    IR_LABELADDR, /* dst = &&label  (GNU label address; id in `label`) */
+    IR_IGOTO  /* goto *a  (GNU computed goto: jump to the address in temp a) */
 };
 
 /* One resolved asm operand: an input carries the temp holding its VALUE, an
@@ -99,7 +101,12 @@ struct ir_ins {
     int size;                /* 1/2/4/8: memory width for LD/ST/EXT */
     int sign;                /* signed variant of the op */
     int flt;                 /* operate in xmm at width w (SSE scalar) */
-    long imm;                /* IR_CONST */
+    int vol;                 /* LOAD/STORE/LDVAR/STVAR: a `volatile` access —
+                              * the optimizer must never CSE or remove it (MMIO) */
+    long imm;                /* IR_CONST; also the folded value when imm_b */
+    int imm_b;               /* ADD/SUB/AND/OR/XOR/CMP: operand b is the constant
+                              * in `imm` (an immediate), not vreg b — set by the
+                              * optimizer's immediate-fold pass, read by codegen */
     enum binop pred;         /* IR_CMP */
     int label;               /* IR_LABEL/IR_JMP/IR_BRZ */
     struct func *callee;     /* IR_CALL (direct), IR_FADDR */

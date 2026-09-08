@@ -13,6 +13,7 @@ void lex_init(struct lexer *lx, const char *file, const char *src)
     lx->file = file;
     lx->src = src;
     lx->p = src;
+    lx->line_start = src;
     lx->line = 1;
     lex_next(lx);
 }
@@ -22,8 +23,10 @@ static void skip_space_and_comments(struct lexer *lx)
     for (;;) {
         while (*lx->p == ' ' || *lx->p == '\t' || *lx->p == '\r' ||
                *lx->p == '\n') {
-            if (*lx->p == '\n')
+            if (*lx->p == '\n') {
                 lx->line++;
+                lx->line_start = lx->p + 1;
+            }
             lx->p++;
         }
         if (lx->p[0] == '/' && lx->p[1] == '/') {
@@ -37,8 +40,10 @@ static void skip_space_and_comments(struct lexer *lx)
             while (!(lx->p[0] == '*' && lx->p[1] == '/')) {
                 if (!*lx->p)
                     diag_fatal(lx->file, start, "unterminated comment");
-                if (*lx->p == '\n')
+                if (*lx->p == '\n') {
                     lx->line++;
+                    lx->line_start = lx->p + 1;
+                }
                 lx->p++;
             }
             lx->p += 2;
@@ -61,6 +66,14 @@ static const struct {
     { "_Bool", TOK_KW_BOOL },
     { "_Static_assert", TOK_KW_STATIC_ASSERT },
     { "_Generic", TOK_KW_GENERIC },
+    { "_Alignof", TOK_KW_ALIGNOF },
+    { "__alignof__", TOK_KW_ALIGNOF },
+    { "__alignof", TOK_KW_ALIGNOF },
+    { "_Alignas", TOK_KW_ALIGNAS },
+    { "typeof", TOK_KW_TYPEOF },
+    { "__typeof__", TOK_KW_TYPEOF },
+    { "__typeof", TOK_KW_TYPEOF },
+    { "_Atomic", TOK_KW_ATOMIC },
     { "unsigned", TOK_KW_UNSIGNED },
     { "signed", TOK_KW_SIGNED },
     { "void", TOK_KW_VOID },
@@ -157,12 +170,36 @@ void lex_next(struct lexer *lx)
 
     skip_space_and_comments(lx);
     t->line = lx->line;
+    t->col = (int)(lx->p - lx->line_start) + 1;
     t->text = NULL;
     t->num = 0;
+    t->str_width = 1;
 
     if (!*lx->p) {
         t->kind = TOK_EOF;
         return;
+    }
+
+    /* An encoding prefix on a string or char literal: L"" u8"" u"" U"" and
+     * L'' u'' U''. Consume it and remember the element width; the '"' / '\''
+     * lexing below then runs at lx->p. A wide CHAR constant stays a plain int
+     * (its value is the code point); only a wide STRING carries its width so
+     * its .rodata is emitted at 2 or 4 bytes per element. */
+    {
+        const char *q = lx->p;
+        int w = 0, adv = 0;
+        if ((q[0] == 'L' || q[0] == 'U') && (q[1] == '"' || q[1] == '\'')) {
+            w = 4; adv = 1;
+        } else if (q[0] == 'u' && q[1] == '8' && q[2] == '"') {
+            w = 1; adv = 2;
+        } else if (q[0] == 'u' && (q[1] == '"' || q[1] == '\'')) {
+            w = 2; adv = 1;
+        }
+        if (adv) {
+            lx->p += adv;
+            if (*lx->p == '"')
+                t->str_width = w;   /* a char constant ignores width (int value) */
+        }
     }
 
     /* A floating constant: digits with a '.', or an exponent, or the
@@ -384,6 +421,7 @@ void lex_next(struct lexer *lx)
         if (*p == '\n')
             p++;
         lx->p = p;
+        lx->line_start = p;
         lx->line = (int)ln;
         lex_next(lx); /* the marker produced no token; go again */
         return;
@@ -479,6 +517,10 @@ const char *tok_describe(const struct token *t)
     case TOK_KW_BOOL: return "'_Bool'";
     case TOK_KW_STATIC_ASSERT: return "'_Static_assert'";
     case TOK_KW_GENERIC: return "'_Generic'";
+    case TOK_KW_ALIGNOF: return "'_Alignof'";
+    case TOK_KW_ALIGNAS: return "'_Alignas'";
+    case TOK_KW_TYPEOF: return "'typeof'";
+    case TOK_KW_ATOMIC: return "'_Atomic'";
     case TOK_KW_UNSIGNED: return "'unsigned'";
     case TOK_KW_SIGNED: return "'signed'";
     case TOK_KW_SIZEOF: return "'sizeof'";

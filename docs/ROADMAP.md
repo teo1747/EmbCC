@@ -41,6 +41,30 @@ sources on itself (`test embcc selfhost`, the kernel oracle) — but doing it
 *through EmbBuild from a manifest*, the total-loop framing below, is still the
 open step.
 
+**M4 host half landed (2026-07): the manifest exists and builds EmbCC.** The
+missing artifact was `/data/src/embcc/build.ebm` — the EmbBuild manifest for
+EmbCC. `tools/gen-embbuild-manifest.sh` generates it (16 compile targets + the
+link, in the on-OS layout of SELFHOST_ONOS.md, with every unit's header closure
+**derived** via `cc -MM` — BUILD.md §6's staleness trap avoided by construction,
+not discipline). `tools/embbuild-run.sh` is a host reference EmbBuild — the same
+typed-manifest walk the OS's EmbBuild does, path-mapped onto the host tree — and
+it drives `embcc` + `embld` from that manifest to a resolved ET_EXEC `embcc.elf`
+(`tests/golden/embbuild.sh`, the two-implementation-oracle host half of BUILD.md
+§10). What remains for M4 proper is OS-side: ship the source + `build.ebm` to
+`/data/src/embcc/`, run the OS's `embbuild` on it, and confirm the on-OS-built
+EmbCC compiles the M1 program → exit 42.
+
+**And the kernel too (myos BUILD.md §12, KM1 host half).** The bigger EmbBuild
+prize — the OS rebuilding its own **kernel** — was blocked on G1 (an on-OS
+assembler) and G2 (`kernel_end`), which are EmbAS and EmbLD's L1, both done. So
+it is now pure orchestration: `tools/gen-kernel-manifest.sh` generates a 96-target
+manifest (89 embcc C compiles + 6 embcc `.asm` assembles + one embld link, no
+gcc/nasm/ld), and `tests/golden/embbuild-kernel.sh` (opt-in, `EMBCC_KM1=1`) walks
+it to a higher-half `kernel.elf` that **boots** in qemu — 193 lines of serial,
+zero faults, userspace reached. KM2/KM3 (the bootable image, and the derived
+`KERNEL_LOAD_SECTORS` — BUILD.md §12.3 G3, EmbBuild's first computed-value step)
+stay OS-side.
+
 ---
 
 **M3 — how it closed (2026-07-24; twelve sources at the time, fifteen now):**

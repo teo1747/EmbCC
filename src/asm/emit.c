@@ -225,6 +225,61 @@ void x86_alu_rr(struct code *c, int op, int dst, int src, int w)
     code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
 }
 
+/* group-1 ALU `reg OP= imm` (add/sub/and/or/xor, and cmp via op 'c'): the imm8
+ * form (83 /ext ib, sign-extended) when the value fits, else imm32 (81 /ext id).
+ * Works for any register including rax — shorter than materialising the constant
+ * in a scratch register first. */
+void x86_alu_reg_imm(struct code *c, int op, int reg, long imm, int w)
+{
+    int ext;
+    switch (op) {
+    case '+': ext = 0; break;
+    case '|': ext = 1; break;
+    case '&': ext = 4; break;
+    case '-': ext = 5; break;
+    case '^': ext = 6; break;
+    case 'c': ext = 7; break;   /* cmp */
+    default:
+        fprintf(stderr, "embcc: internal: no reg-imm encoding for '%c'\n", op);
+        exit(1);
+    }
+    rex_rb(c, w == 8, 0, reg);   /* reg is the r/m operand -> REX.B */
+    if (imm >= -128 && imm <= 127) {
+        code_byte(c, 0x83);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+        code_byte(c, (int)(imm & 0xff));
+    } else {
+        code_byte(c, 0x81);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+        code_u32(c, (unsigned long)imm);
+    }
+}
+
+/* imul dst, src, imm — the three-operand form: dst = src * imm, so dst need not
+ * equal src and nothing routes through rax. imm8 (6b) when it fits, else imm32
+ * (69). */
+void x86_imul_reg_imm(struct code *c, int dst, int src, long imm, int w)
+{
+    rex_rb(c, w == 8, dst, src);   /* dst -> REX.R, src -> REX.B */
+    if (imm >= -128 && imm <= 127) {
+        code_byte(c, 0x6b);
+        code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+        code_byte(c, (int)(imm & 0xff));
+    } else {
+        code_byte(c, 0x69);
+        code_byte(c, 0xc0 | ((dst & 7) << 3) | (src & 7));
+        code_u32(c, (unsigned long)imm);
+    }
+}
+
+/* test reg, reg — ZF/SF from the value itself, the compact `cmp reg, 0`. */
+void x86_test_reg(struct code *c, int reg, int w)
+{
+    rex_rb(c, w == 8, reg, reg);
+    code_byte(c, 0x85);
+    code_byte(c, 0xc0 | ((reg & 7) << 3) | (reg & 7));
+}
+
 /* cmp a, b (computes a - b, sets flags) — reg-reg twin of x86_cmp_eax_mem. */
 void x86_cmp_rr(struct code *c, int a, int b, int w)
 {
@@ -406,6 +461,232 @@ void x86_load_mem_rax(struct code *c, int size, int sign, int w)
     }
 }
 
+/* ModRM for [base] (disp 0) with register field `reg`, in the shortest correct
+ * form. The r/m encoding has two traps: base whose low 3 bits are 100 (rsp/r12)
+ * needs a SIB byte, and 101 (rbp/r13) collides with RIP-relative at mod=00 so it
+ * takes a mod=01 disp8 of zero. */
+static void modrm_base0(struct code *c, int reg, int base)
+{
+    int lo = base & 7;
+    if (lo == 5) {          /* rbp / r13 */
+        code_byte(c, (1 << 6) | ((reg & 7) << 3) | 5);
+        code_byte(c, 0x00);
+    } else if (lo == 4) {   /* rsp / r12 */
+        code_byte(c, ((reg & 7) << 3) | 4);
+        code_byte(c, 0x24); /* SIB: base=r/sp/r12, no index */
+    } else {
+        code_byte(c, ((reg & 7) << 3) | lo);
+    }
+}
+
+/* ModRM+SIB for [base + index*scale], disp 0, register field `reg`. Always uses
+ * a SIB byte (rm=100). A base whose low 3 bits are 101 (rbp/r13) still needs a
+ * mod=01 disp8=0. The index is an allocated register, never rsp, so rm-index 100
+ * (= "no index") never collides. */
+static void modrm_baseindex0(struct code *c, int reg, int base, int index,
+                             int scale)
+{
+    int ss = scale == 8 ? 3 : scale == 4 ? 2 : scale == 2 ? 1 : 0;
+    int mod = (base & 7) == 5 ? 1 : 0;
+    code_byte(c, (mod << 6) | ((reg & 7) << 3) | 4);          /* rm=100 -> SIB */
+    code_byte(c, (ss << 6) | ((index & 7) << 3) | (base & 7));
+    if (mod == 1)
+        code_byte(c, 0x00);
+}
+
+/* Load into rax from [base + index*scale] (scale 1/2/4/8), same extension matrix
+ * as x86_load_mem_rax — folds an address computation into the load. REX.X/REX.B
+ * carry high index/base registers. */
+void x86_load_baseindex_rax(struct code *c, int base, int index, int scale,
+                            int size, int sign, int w)
+{
+    int rexXB = ((index & 8) ? 2 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexXB;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_baseindex0(c, 0, base, index, scale);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexXB);
+            code_byte(c, 0x63);
+        } else {
+            int rex = 0x40 | rexXB;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_baseindex0(c, 0, base, index, scale);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexXB);
+        code_byte(c, 0x8b);
+        modrm_baseindex0(c, 0, base, index, scale);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
+/* Load into rax from [base + disp], same extension matrix as x86_load_mem_rax —
+ * folds a constant-offset address (a struct field, `p->m`) into the load.
+ * modrm_base carries the disp and the rsp/r12 SIB case; REX.B a high base. */
+/* rax = *base into an ARBITRARY register: the register-targeted form of
+ * x86_load_base_rax (identical bytes when dst == rax). Zero/sign-extends narrow
+ * loads to `w` exactly as that routine does. */
+void x86_load_base_reg(struct code *c, int dst, int base,
+                       int size, int sign, int w)
+{
+    int rexRB = ((dst & 8) ? 4 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexRB;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base0(c, dst, base);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexRB);
+            code_byte(c, 0x63);      /* movsxd dst, [base] */
+        } else {
+            int rex = 0x40 | rexRB;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_base0(c, dst, base);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexRB);
+        code_byte(c, 0x8b);
+        modrm_base0(c, dst, base);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
+/* dst = *(base+disp) with size/sign extension into an ARBITRARY register — the
+ * register-targeted form of x86_load_basedisp_rax (identical bytes when
+ * dst == rax). Used to extend a memory local/temp straight into its home reg. */
+void x86_load_reg_basedisp(struct code *c, int dst, int base, int disp,
+                           int size, int sign, int w)
+{
+    int rexRB = ((dst & 8) ? 4 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexRB;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base(c, dst, base, disp);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexRB);
+            code_byte(c, 0x63);      /* movsxd dst, [base+disp] */
+        } else {
+            int rex = 0x40 | rexRB;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_base(c, dst, base, disp);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexRB);
+        code_byte(c, 0x8b);
+        modrm_base(c, dst, base, disp);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
+void x86_load_basedisp_rax(struct code *c, int base, int disp,
+                           int size, int sign, int w)
+{
+    int rexb = (base & 8) ? 1 : 0;
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexb;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base(c, 0, base, disp);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexb);
+            code_byte(c, 0x63);
+        } else {
+            int rex = 0x40 | rexb;
+            if (rex != 0x40) code_byte(c, rex);
+            code_byte(c, 0x8b);
+        }
+        modrm_base(c, 0, base, disp);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexb);
+        code_byte(c, 0x8b);
+        modrm_base(c, 0, base, disp);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
+/* Load into rax straight from [base], with the same extension matrix as
+ * x86_load_mem_rax — no `mov base,rax` first. REX.B carries a high base
+ * (r8..r15); modrm_base0 handles the rsp/rbp/r12/r13 addressing traps. */
+void x86_load_base_rax(struct code *c, int base, int size, int sign, int w)
+{
+    int rexb = (base & 8) ? 1 : 0;
+    switch (size) {
+    case 1:
+    case 2: {
+        int rex = 0x40 | (w == 8 ? 8 : 0) | rexb;
+        if (rex != 0x40) code_byte(c, rex);
+        code_byte(c, 0x0f);
+        code_byte(c, size == 1 ? (sign ? 0xbe : 0xb6) : (sign ? 0xbf : 0xb7));
+        modrm_base0(c, 0, base);
+        break;
+    }
+    case 4:
+        if (w == 8 && sign) {
+            code_byte(c, 0x48 | rexb);
+            code_byte(c, 0x63);      /* movsxd rax, [base] */
+        } else {
+            if (rexb) code_byte(c, 0x41);
+            code_byte(c, 0x8b);
+        }
+        modrm_base0(c, 0, base);
+        break;
+    case 8:
+        code_byte(c, 0x48 | rexb);
+        code_byte(c, 0x8b);
+        modrm_base0(c, 0, base);
+        break;
+    default:
+        fprintf(stderr, "embcc: internal: bad load size %d\n", size);
+        exit(1);
+    }
+}
+
 void x86_store_mem_rcx(struct code *c, int size)
 {
     switch (size) {
@@ -430,6 +711,36 @@ void x86_store_mem_rcx(struct code *c, int size)
     code_byte(c, 0x01); /* ModRM: [rcx], eax/rax */
 }
 
+/* Store rax to [base + disp] (a struct-field store, `p->m = x`), sized. reg
+ * field is rax(0); modrm_base carries disp and the rsp/r12 SIB case. */
+void x86_store_basedisp_rax(struct code *c, int base, int disp, int size)
+{
+    int rexb = (base & 8) ? 1 : 0;
+    switch (size) {
+    case 1: if (rexb) code_byte(c, 0x41);        code_byte(c, 0x88); break;
+    case 2: code_byte(c, 0x66); if (rexb) code_byte(c, 0x41); code_byte(c, 0x89); break;
+    case 4: if (rexb) code_byte(c, 0x41);        code_byte(c, 0x89); break;
+    case 8: code_byte(c, 0x48 | rexb);           code_byte(c, 0x89); break;
+    default: fprintf(stderr, "embcc: internal: bad store size %d\n", size); exit(1);
+    }
+    modrm_base(c, 0, base, disp);
+}
+
+/* Store rax to [base + index*scale] (an array-element store, `p[i] = x`). */
+void x86_store_baseindex_rax(struct code *c, int base, int index, int scale,
+                             int size)
+{
+    int rexXB = ((index & 8) ? 2 : 0) | ((base & 8) ? 1 : 0);
+    switch (size) {
+    case 1: if (rexXB) code_byte(c, 0x40 | rexXB);        code_byte(c, 0x88); break;
+    case 2: code_byte(c, 0x66); if (rexXB) code_byte(c, 0x40 | rexXB); code_byte(c, 0x89); break;
+    case 4: if (rexXB) code_byte(c, 0x40 | rexXB);        code_byte(c, 0x89); break;
+    case 8: code_byte(c, 0x48 | rexXB);                   code_byte(c, 0x89); break;
+    default: fprintf(stderr, "embcc: internal: bad store size %d\n", size); exit(1);
+    }
+    modrm_baseindex0(c, 0, base, index, scale);
+}
+
 void x86_mov_rcx_slot(struct code *c, int disp)
 {
     code_byte(c, 0x48);
@@ -452,6 +763,42 @@ int x86_lea_rax_rip(struct code *c)
     int off = c->len;
     code_u32(c, 0);
     return off;
+}
+
+/* lea reg, [rip+rel32] into an arbitrary register (byte-identical to the rax
+ * form when reg == rax). Returns the rel32 patch offset, as x86_lea_rax_rip. */
+int x86_lea_reg_rip(struct code *c, int reg)
+{
+    code_byte(c, 0x48 | ((reg & 8) ? 4 : 0));    /* REX.W (+REX.R) */
+    code_byte(c, 0x8d);
+    code_byte(c, 0x05 | ((reg & 7) << 3));        /* mod=00 reg rm=101 = RIP */
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
+/* mov reg, imm into an arbitrary register — the register-targeted form of
+ * x86_mov_eax_imm (identical bytes when reg == rax): 32-bit immediate,
+ * sign-extended 32-bit into a 64-bit register, or a full movabs imm64. */
+void x86_mov_reg_imm(struct code *c, int reg, long imm, int w)
+{
+    if (w == 4) {
+        if (reg & 8) code_byte(c, 0x41);          /* REX.B */
+        code_byte(c, 0xb8 | (reg & 7));           /* mov r32, imm32 */
+        code_u32(c, (unsigned long)imm);
+        return;
+    }
+    if (imm >= -2147483647L - 1 && imm <= 2147483647L) {
+        code_byte(c, 0x48 | ((reg & 8) ? 1 : 0)); /* REX.W (+REX.B) */
+        code_byte(c, 0xc7);
+        code_byte(c, 0xc0 | (reg & 7));           /* mov r/m64, imm32 (sext) */
+        code_u32(c, (unsigned long)imm);
+        return;
+    }
+    code_byte(c, 0x48 | ((reg & 8) ? 1 : 0));     /* REX.W (+REX.B) movabs */
+    code_byte(c, 0xb8 | (reg & 7));
+    code_u32(c, (unsigned long)imm & 0xffffffffUL);
+    code_u32(c, ((unsigned long)imm >> 32) & 0xffffffffUL);
 }
 
 void x86_zero_eax(struct code *c)
@@ -543,6 +890,22 @@ void x86_shift_eax_cl(struct code *c, int kind, int w)
     }
 }
 
+/* shift `reg` by a constant: the 1-count short form (D1 /ext) or the imm8 form
+ * (C1 /ext ib). kind: '<' shl, '>' sar, 'u' shr — the twin of x86_shift_eax_cl. */
+void x86_shift_reg_imm(struct code *c, int reg, int kind, int count, int w)
+{
+    int ext = kind == '<' ? 4 : kind == 'u' ? 5 : 7;   /* shl:/4 shr:/5 sar:/7 */
+    rex_rb(c, w == 8, 0, reg);
+    if (count == 1) {
+        code_byte(c, 0xd1);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+    } else {
+        code_byte(c, 0xc1);
+        code_byte(c, 0xc0 | (ext << 3) | (reg & 7));
+        code_byte(c, count & 0xff);
+    }
+}
+
 void x86_neg_eax(struct code *c, int w)
 {
     rexw(c, w);
@@ -627,6 +990,20 @@ void x86_not_eax(struct code *c, int w)
     code_byte(c, 0xf7); /* not: /2 */
     code_byte(c, 0xd0);
 }
+/* neg/not on an arbitrary register (reg in the r/m field, /3 and /2). Lets a
+ * register-resident unary op stay in place, no RAX round-trip. */
+void x86_neg_reg(struct code *c, int reg, int w)
+{
+    rex_rb(c, w == 8 ? 1 : 0, 0, reg);
+    code_byte(c, 0xf7);
+    code_byte(c, 0xd8 + (reg & 7)); /* mod=11 /3 rm=reg */
+}
+void x86_not_reg(struct code *c, int reg, int w)
+{
+    rex_rb(c, w == 8 ? 1 : 0, 0, reg);
+    code_byte(c, 0xf7);
+    code_byte(c, 0xd0 + (reg & 7)); /* mod=11 /2 rm=reg */
+}
 
 /* The SSE2 prefix that selects scalar single vs scalar double. */
 static void sse_prefix(struct code *c, int w)
@@ -673,6 +1050,24 @@ void x86_ucomis_mem(struct code *c, int disp, int w)
     code_byte(c, 0x0f);
     code_byte(c, 0x2e);
     modrm_rbp(c, 0, disp);
+}
+
+/* setcc + zero-extend into an ARBITRARY register (register-targeted
+ * x86_setcc_eax; identical bytes when reg == rax). Writes reg's low byte then
+ * movzx-widens it in place -- RAX is never touched. Valid for the -O2 register
+ * pool {r8..r15, rbx}: rbx maps to the directly-addressable bl and r8..r15 use
+ * REX.B, so the ah/ch/dh/bh aliasing trap (rm 4..7 with no REX) never arises. */
+void x86_setcc_reg(struct code *c, int cc, int reg)
+{
+    if (reg & 8) code_byte(c, 0x41);          /* REX.B: setcc r8b..r15b */
+    code_byte(c, 0x0f);
+    code_byte(c, cc);                          /* setcc r/m8 */
+    code_byte(c, 0xc0 | (reg & 7));
+    { int rex = 0x40 | ((reg & 8) ? 5 : 0);   /* REX.R|REX.B when extended */
+      if (rex != 0x40) code_byte(c, rex); }
+    code_byte(c, 0x0f);                        /* movzx reg32, reg8 */
+    code_byte(c, 0xb6);
+    code_byte(c, 0xc0 | ((reg & 7) << 3) | (reg & 7));
 }
 
 void x86_set_float_eq(struct code *c, int ne)
@@ -771,6 +1166,25 @@ int x86_jnz_rel32(struct code *c)
 int x86_jmp_rel32(struct code *c)
 {
     code_byte(c, 0xe9);
+    int off = c->len;
+    code_u32(c, 0);
+    return off;
+}
+
+/* jmp *reg  (FF /4) — the indirect jump a GNU computed goto lowers to. */
+void x86_jmp_reg(struct code *c, int reg)
+{
+    if (reg >= 8) code_byte(c, 0x41);     /* REX.B for r8..r15 */
+    code_byte(c, 0xff);
+    code_byte(c, 0xe0 + (reg & 7));       /* ModRM mod=11 /4 rm=reg */
+}
+
+/* Conditional jump rel32 for a setcc condition byte (0x9x, as cc_for returns):
+ * the Jcc opcode shares the condition's low nibble (0f 8x). Patch offset back. */
+int x86_jcc_rel32(struct code *c, int setcc)
+{
+    code_byte(c, 0x0f);
+    code_byte(c, 0x80 | (setcc & 0x0f));
     int off = c->len;
     code_u32(c, 0);
     return off;

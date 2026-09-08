@@ -18,10 +18,10 @@
 
 enum expr_kind { EXPR_NUM, EXPR_FNUM, EXPR_STR, EXPR_VAR, EXPR_BINOP, EXPR_CALL,
                  EXPR_ASSIGN, EXPR_NOT, EXPR_NEG, EXPR_BNOT, EXPR_INCDEC,
-                 EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF,
+                 EXPR_DEREF, EXPR_ADDR, EXPR_CAST, EXPR_SIZEOF, EXPR_ALIGNOF,
                  EXPR_MEMBER, EXPR_COND, EXPR_COMMA,
                  EXPR_COMPOUND, EXPR_INITLIST, EXPR_VA_ARG, EXPR_COMPLIT,
-                 EXPR_GENERIC, EXPR_STMTEXPR };
+                 EXPR_GENERIC, EXPR_STMTEXPR, EXPR_LABELADDR };
 
 struct stmt;   /* a statement expression `({ ... })` carries a block */
 
@@ -39,6 +39,7 @@ enum binop {
 struct expr {
     enum expr_kind kind;
     int line;
+    int col;              /* 1-based column, for caret diagnostics (0 = unknown) */
     struct type *ty;      /* set by sema on every node */
     struct type *undecayed; /* sema: original array type when ty is the
                              * decayed pointer (sizeof needs it) */
@@ -52,6 +53,7 @@ struct expr {
     struct func *fref;    /* EXPR_VAR: a function used as a value —
                            * decays to pointer-to-function (sema) */
     int str_index;        /* EXPR_STR: unit string table slot (irgen) */
+    int str_width;        /* EXPR_STR: bytes/element (1 char, 2 char16, 4 wide) */
     enum binop op;        /* EXPR_BINOP */
     struct expr *lhs, *rhs; /* BINOP + ASSIGN(lhs=target);
                              * NOT/NEG/BNOT/DEREF/ADDR/CAST use rhs only */
@@ -110,7 +112,8 @@ struct initelem {
 struct greloc {
     int off;              /* byte offset within the object */
     const char *str;      /* a string-literal target (NULL if a global/func) */
-    int str_len;          /* including its NUL */
+    int str_len;          /* element count including its NUL */
+    int str_width;        /* bytes per element (1 char, 2/4 wide) */
     int str_off;          /* driver: the target's offset inside .rodata */
     struct global *gtarget; /* an &global target, else NULL */
     struct func *ftarget; /* a function-address target, else NULL */
@@ -157,6 +160,7 @@ struct asm_stmt {
 struct stmt {
     enum stmt_kind kind;
     int line;
+    int col;              /* 1-based column, for caret diagnostics (0 = unknown) */
     const char *name;     /* STMT_DECL */
     struct type *dty;     /* STMT_DECL: declared type */
     int is_static;        /* STMT_DECL: a static local -> its own global */

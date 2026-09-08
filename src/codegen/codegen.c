@@ -38,6 +38,12 @@ static int g_want_debug;
  * range only shrinks reuse, never makes it unsound, so a blind field scan (no
  * per-op operand table to get wrong) is deliberately used. Deterministic, which
  * the self-host fixed point requires. */
+static int g_regalloc;          /* defined below; -O2 register allocation is on */
+static const int *g_loc;        /* per-vreg physical register at -O2, or -1 */
+static int g_opt_frames;        /* -O1+: dead temps take no stack slot (frame shrink) */
+static int g_has_cgoto;         /* function has a computed goto: liveness is
+                                 * imprecise -> no regalloc / no slot coalescing */
+
 static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
 {
     int nins = fn->nins, nvr = fn->nvregs;
@@ -126,11 +132,28 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
     int nfree = 0, nact = 0, pool = 0;
     for (int i = 0; i <= nins; i++) {
         for (int k = head[i]; k >= 0; k = nxt[k]) {
-            if (first[k] < 0) {          /* never referenced: throwaway slot */
-                slot[k] = pool++;
+            /* A register-resident temp (-O2 regalloc) never touches memory, so
+             * it needs no stack slot — skip it, keeping the frame to the temps
+             * that actually spill. (This also caps mem2reg's SSA-temp inflation:
+             * the extra versions live in registers, not the frame.) */
+            if (g_regalloc && g_loc && g_loc[k + nvars] >= 0) {
+                slot[k] = -1;
                 continue;
             }
-            int coalescable = (blk[first[k]] == blk[last[k]]);
+            if (first[k] < 0) {          /* never referenced: no slot needed */
+                /* A temp that appears in no instruction is dead — nothing ever
+                 * loads or stores it, so it needs no frame slot. This is common
+                 * once the optimizer's immediate-fold detaches a CONST and DCE
+                 * drops its defining instruction, leaving the temp unreferenced;
+                 * giving each one an 8-byte throwaway slot inflates the frame for
+                 * nothing, and a recursive kernel function (path walk, tree
+                 * sweep) then overflows the kernel stack. Gated to optimizing
+                 * builds so -O0 stays byte-identical (its throwaway layout is
+                 * unchanged, which the self-host fixed point relies on). */
+                slot[k] = g_opt_frames ? -1 : pool++;
+                continue;
+            }
+            int coalescable = (blk[first[k]] == blk[last[k]]) && !g_has_cgoto;
             /* expire actives dead before this temp is defined */
             for (int a = 0; a < nact; ) {
                 if (act_last[a] < first[k]) {
@@ -174,10 +197,35 @@ static int *coalesce_temps(struct ir_func *fn, int nvars, int *npool_out)
  * toward memory and the gcc-differential tests police the rest. */
 
 /* The callee-saved GPRs the allocator may hand out (rbp/rsp excluded; none is
- * used as codegen scratch, so all five are free). NCALLEE is a literal so it can
- * size arrays under EmbCC's own subset (which won't fold sizeof/sizeof there). */
+ * used as codegen scratch). NCALLEE is a literal so it can size arrays under
+ * EmbCC's own subset (which won't fold sizeof/sizeof there). It bounds the
+ * prologue-save set — a function saves at most these five. */
 #define NCALLEE 5
-static const int CALLEE_POOL[NCALLEE] = { 3 /*rbx*/, 12, 13, 14, 15 };
+
+/* A VARIADIC function's pool: the callee-saved five plus the two caller-saved
+ * GPRs that are not part of the argument register file — r10, r11. r8/r9 are
+ * held out because a variadic prologue saves the six integer arg registers
+ * (rdi..r9) to the register-save area. The caller-saved pair come first so a
+ * short-lived value prefers them and skips the prologue save. */
+#define NVARIADIC 7
+static const int VARIADIC_POOL[NVARIADIC] = { 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
+
+/* Every non-variadic function's pool: the four caller-saved GPRs r8..r11 first
+ * (preferred, no prologue save), then the callee-saved five. A caller-saved
+ * register is only sound for a value that does NOT cross a call (a call clobbers
+ * them) and, for r8/r9, is not itself a call argument (the sequential arg-setup
+ * move would clobber a source still held there) — enforced by the `crosses` /
+ * `is_arg` masks in colouring. A leaf function has neither constraint, so it
+ * gets all nine freely. NLEAF sizes the allocator's per-colour arrays. */
+#define NLEAF 9
+static const int LEAF_POOL[NLEAF] = { 8, 9, 10, 11, 3 /*rbx*/, 12, 13, 14, 15 };
+
+/* Does a register need callee-save preservation (rbx, r12..r15)? r8..r11 are
+ * caller-saved — free to clobber, so no prologue slot. */
+static int is_callee_saved(int reg)
+{
+    return reg == 3 || (reg >= 12 && reg <= 15);
+}
 
 /* The vreg WRITTEN by an instruction (its def), or -1. Kept in lockstep with
  * what codegen actually stores (cg_store / the STVAR store). Each temp is a
@@ -193,6 +241,7 @@ static int ins_def(const struct ir_ins *in)
     case IR_SHR: case IR_XCHG: case IR_XADD: case IR_CMPXCHG:
     case IR_STVAR:            /* the local written */
     case IR_CALL:             /* always stores a (possibly-unused) result temp */
+    case IR_LABELADDR:        /* dst = &&label */
         return in->dst;
     default:
         return -1;            /* STORE, RET, LABEL, JMP, branches, MEMCPY, ... */
@@ -349,6 +398,14 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     *nused_out = 0;
     if (nvr == 0) return loc;
 
+    /* Non-variadic functions get the full nine-register pool; caller-saved
+     * registers in it are then masked per value by `crosses`/`is_arg` below (a
+     * leaf, having no calls, is never masked). A variadic function reserves the
+     * argument register file, so it drops r8/r9. */
+    int variadic = fn->src->is_varargs;
+    const int *POOL = variadic ? VARIADIC_POOL : LEAF_POOL;
+    int NP = variadic ? NVARIADIC : NLEAF;
+
     int *first = xmalloc((size_t)nvr * sizeof *first);
     int *last  = xmalloc((size_t)nvr * sizeof *last);
     char *elig = xmalloc((size_t)nvr);
@@ -359,6 +416,29 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
     unsigned long *livein = NULL;
     unsigned long *liveout = compute_live_intervals(fn, first, last,
                                                     &livein, &defv, &lwords);
+
+    /* A value LIVE-OUT of a call survives it, so it cannot sit in a caller-saved
+     * register (the call clobbers all of them) — it takes a callee-saved reg or
+     * memory. The call's own result (defv[i]) is born at the call, so it does
+     * not cross THIS one. A value that is merely a call ARGUMENT may still use
+     * r8/r9: the parallel move in case IR_CALL shuffles arguments already held
+     * in r8/r9 without clobbering. A leaf has no calls, so `crosses` stays 0. */
+    char *crosses = xcalloc((size_t)(nvr ? nvr : 1), 1);
+    for (int i = 0; i < nins; i++) {
+        if (fn->ins[i].op != IR_CALL)
+            continue;
+        unsigned long *lo = liveout + (size_t)i * lwords;
+        for (int w = 0; w < lwords; w++) {
+            unsigned long bits = lo[w];
+            while (bits) {
+                int b = 0; unsigned long t = bits;
+                while (!(t & 1)) { t >>= 1; b++; }
+                int v = w * 64 + b;
+                if (v < nvr && v != defv[i]) crosses[v] = 1;
+                bits &= bits - 1;
+            }
+        }
+    }
     for (int v = 0; v < nvr; v++) {
         if (v >= nvars) {
             elig[v] = 1;                          /* a temp */
@@ -379,14 +459,17 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         if (is_float) { OPAQUE(in->dst); OPAQUE(in->a); OPAQUE(in->b); }
         switch (in->op) {
         case IR_ADDR:      OPAQUE(in->a); break;          /* address-taken */
-        case IR_STORE:     OPAQUE(in->a); break;          /* raw address slot */
+        /* IR_STORE's address is register-aware now (codegen stores to [reg]),
+         * so it is NOT opaque — only its raw value path was. */
         case IR_VA_START:  OPAQUE(in->a); break;
         case IR_XCHG: case IR_XADD:
             OPAQUE(in->a); OPAQUE(in->b); break;          /* raw addr/val slots */
         case IR_CMPXCHG:
             OPAQUE(in->a); OPAQUE(in->b); OPAQUE(in->c); break;
         case IR_MEMCPY: case IR_MEMZERO:
-            OPAQUE(in->a); OPAQUE(in->b); break;
+            /* addresses are register-aware (used directly as the copy/zero base);
+             * only the operands are addresses, so nothing here is opaque now. */
+            break;
         case IR_RET:
             /* a scalar return is register-aware; a struct/float one reads its
              * slot raw, so its operand must stay in memory. */
@@ -478,49 +561,96 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
         }
     }
 
-    /* Move-preference (coalescing) graph: a plain copy `dst = a` costs nothing
-     * if dst and a share a register, so record a preference edge between them
-     * when they do NOT interfere. Colouring then biases each vreg toward a
-     * move-partner's colour and codegen drops the now-identical self-move. Only
-     * IR_MOV and IR_STVAR are always plain copies; an IR_LDVAR only when it
-     * emits no extension (ldvar_plain) — a narrow or signed-widening load must
-     * keep its movsx/movzx. */
+    /* Move-preference (coalescing) graph: two vregs that share a register let
+     * codegen drop a move, so record a preference edge between them when they do
+     * NOT interfere; colouring then biases each toward a move-partner's colour.
+     * Two sources of a preferred pair:
+     *  - a plain copy `dst = a` (IR_MOV / IR_STVAR / non-extending IR_LDVAR):
+     *    same register makes the copy a self-move that vanishes.
+     *  - a two-address binop `dst = a OP b`: codegen emits `OP b,dst` with no
+     *    setup move when dst holds operand a (`dst == a`), or the commuted
+     *    `OP a,dst` when dst holds b and OP commutes. So dst prefers a, and for a
+     *    commutative op with a register b, dst prefers b too. SUB/SHL/SHR do not
+     *    commute (dst == b would force the RAX fallback), so only a is preferred.
+     * Each edge is a BIAS, not a constraint, and is dropped when the pair
+     * interferes — which is exactly when operand a is still live after the op, so
+     * a genuinely reusable (dying) operand is the only one ever coalesced. */
     unsigned long *pref = E ? xcalloc((size_t)E * ew, sizeof *pref) : NULL;
     for (int i = 0; pref && i < nins; i++) {
         struct ir_ins *in = &fn->ins[i];
         enum ir_op op = in->op;
-        if (op != IR_MOV && op != IR_STVAR &&
-            !(op == IR_LDVAR && ldvar_plain(in->size, in->sign, in->w)))
-            continue;
-        int d = fn->ins[i].dst, a = fn->ins[i].a;
-        if (d < 0 || d >= nvr || a < 0 || a >= nvr) continue;
-        int ed = eof[d], ea = eof[a];
-        if (ed < 0 || ea < 0 || ed == ea) continue;
-        if (adj[(size_t)ed * ew + (ea >> 6)] & (1UL << (ea & 63))) continue;
-        pref[(size_t)ed * ew + (ea >> 6)] |= 1UL << (ea & 63);
-        pref[(size_t)ea * ew + (ed >> 6)] |= 1UL << (ed & 63);
-    }
-
-    /* Greedy colouring in first-appearance order (deterministic): give each vreg
-     * a register no interfering neighbour uses, preferring one a move-partner
-     * already has (coalescing); spill (stay in memory) if all NCALLEE are taken. */
-    int *order = xmalloc((size_t)(E ? E : 1) * sizeof *order);
-    {   /* bucket by first[] so the order is first-asc, ties by vreg index */
-        int *head = xmalloc((size_t)(nins + 1) * sizeof *head);
-        for (int i = 0; i <= nins; i++) head[i] = -1;
-        int *nxt = xmalloc((size_t)(E ? E : 1) * sizeof *nxt);
-        for (int e = E - 1; e >= 0; e--) {
-            int fi = first[eidx[e]];
-            nxt[e] = head[fi]; head[fi] = e;
+        int d = in->dst, partner[2], np = 0;
+        if (op == IR_MOV || op == IR_STVAR ||
+            (op == IR_LDVAR && ldvar_plain(in->size, in->sign, in->w))) {
+            partner[np++] = in->a;
+        } else if (op == IR_ADD || op == IR_SUB || op == IR_MUL ||
+                   op == IR_AND || op == IR_OR || op == IR_XOR ||
+                   op == IR_SHL || op == IR_SHR) {
+            partner[np++] = in->a;                       /* dst prefers a */
+            int commut = op == IR_ADD || op == IR_MUL || op == IR_AND ||
+                         op == IR_OR || op == IR_XOR;
+            if (commut && !in->imm_b) partner[np++] = in->b;
         }
-        int oc = 0;
-        for (int i = 0; i <= nins; i++)
-            for (int e = head[i]; e >= 0; e = nxt[e]) order[oc++] = e;
-        free(head); free(nxt);
+        for (int k = 0; k < np; k++) {
+            int a = partner[k];
+            if (d < 0 || d >= nvr || a < 0 || a >= nvr) continue;
+            int ed = eof[d], ea = eof[a];
+            if (ed < 0 || ea < 0 || ed == ea) continue;
+            if (adj[(size_t)ed * ew + (ea >> 6)] & (1UL << (ea & 63))) continue;
+            pref[(size_t)ed * ew + (ea >> 6)] |= 1UL << (ea & 63);
+            pref[(size_t)ea * ew + (ed >> 6)] |= 1UL << (ed & 63);
+        }
     }
 
-    int reg_used[NCALLEE];
-    for (int k = 0; k < NCALLEE; k++) reg_used[k] = 0;
+    /* Chaitin-Briggs simplify order. Repeatedly remove a node of degree < NCALLEE
+     * (trivially colourable) onto a stack; when none remains, remove the highest-
+     * degree node as an OPTIMISTIC spill candidate. Colouring then pops the stack
+     * (below) — a spill candidate popped early may still find a free colour, so
+     * fewer values actually spill than a fixed first-appearance order gives.
+     * Deterministic: ties broken by the lowest eligible index. */
+    int *order = xmalloc((size_t)(E ? E : 1) * sizeof *order);
+    {
+        int *deg = xmalloc((size_t)(E ? E : 1) * sizeof *deg);
+        for (int e = 0; e < E; e++) {
+            int d = 0;
+            unsigned long *row = adj + (size_t)e * ew;
+            for (int w = 0; w < ew; w++) {
+                unsigned long b = row[w];
+                while (b) { d++; b &= b - 1; }
+            }
+            deg[e] = d;
+        }
+        char *gone = xcalloc((size_t)(E ? E : 1), 1);
+        int sp = 0;
+        for (int cnt = 0; cnt < E; cnt++) {
+            int pick = -1;
+            for (int e = 0; e < E; e++)          /* a trivially-colourable node */
+                if (!gone[e] && deg[e] < NP) { pick = e; break; }
+            if (pick < 0)                        /* else the most-constrained one */
+                for (int e = 0; e < E; e++)
+                    if (!gone[e] && (pick < 0 || deg[e] > deg[pick])) pick = e;
+            gone[pick] = 1;
+            order[sp++] = pick;                  /* push */
+            unsigned long *row = adj + (size_t)pick * ew;
+            for (int w = 0; w < ew; w++) {
+                unsigned long b = row[w];
+                while (b) {
+                    int bit = 0; unsigned long t = b;
+                    while (!(t & 1)) { t >>= 1; bit++; }
+                    int ne = w * 64 + bit;
+                    if (!gone[ne]) deg[ne]--;
+                    b &= b - 1;
+                }
+            }
+        }
+        for (int i = 0; i < E / 2; i++) {        /* pop order = reverse of push */
+            int t = order[i]; order[i] = order[E - 1 - i]; order[E - 1 - i] = t;
+        }
+        free(deg); free(gone);
+    }
+
+    int reg_used[NLEAF];
+    for (int k = 0; k < NP; k++) reg_used[k] = 0;
     for (int oi = 0; oi < E; oi++) {
         int e = order[oi];
         int taken = 0;                        /* bitmask of neighbour registers */
@@ -533,11 +663,16 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 int ne = w * 64 + b;
                 int nl = loc[eidx[ne]];
                 if (nl >= 0)
-                    for (int k = 0; k < NCALLEE; k++)
-                        if (CALLEE_POOL[k] == nl) taken |= 1 << k;
+                    for (int k = 0; k < NP; k++)
+                        if (POOL[k] == nl) taken |= 1 << k;
                 bits &= bits - 1;
             }
         }
+        /* A value that crosses a call may not take a caller-saved register: the
+         * call clobbers them, so forbid them here (leaving callee-saved/spill). */
+        if (crosses[eidx[e]])
+            for (int k = 0; k < NP; k++)
+                if (!is_callee_saved(POOL[k])) taken |= 1 << k;
         /* preferred colours: registers a colored, non-interfering move-partner
          * already holds (and that are still free) */
         int want = 0;
@@ -550,27 +685,46 @@ static int *regalloc(struct ir_func *fn, int used_out[NCALLEE], int *nused_out)
                 int pe = w * 64 + b;
                 int pl = loc[eidx[pe]];
                 if (pl >= 0)
-                    for (int k = 0; k < NCALLEE; k++)
-                        if (CALLEE_POOL[k] == pl && !(taken & (1 << k)))
+                    for (int k = 0; k < NP; k++)
+                        if (POOL[k] == pl && !(taken & (1 << k)))
                             want |= 1 << k;
                 bits &= bits - 1;
             }
         }
         int pick = -1;
-        for (int k = 0; k < NCALLEE; k++)             /* a free preferred reg */
+        for (int k = 0; k < NP; k++)                  /* a free preferred reg */
             if ((want & (1 << k)) && !(taken & (1 << k))) { pick = k; break; }
         if (pick < 0)
-            for (int k = 0; k < NCALLEE; k++)          /* else lowest free */
+            for (int k = 0; k < NP; k++)               /* else lowest free */
                 if (!(taken & (1 << k))) { pick = k; break; }
-        if (pick >= 0) { loc[eidx[e]] = CALLEE_POOL[pick]; reg_used[pick] = 1; }
+        if (pick >= 0) { loc[eidx[e]] = POOL[pick]; reg_used[pick] = 1; }
     }
 
+    /* Inline asm can hard-code a callee-saved register the allocator never sees
+     * — cpuid writes RBX (its "=b" output), and any operand fixed to rbx/r12..r15
+     * loads or overwrites that register. Such a register is clobbered by this
+     * function all the same, so the prologue must preserve it: mark it used.
+     * (Without this a caller that keeps a live value in rbx across the call gets
+     * it silently corrupted — invisible until an optimization puts one there.) */
+    for (int n = 0; n < fn->nins; n++) {
+        if (fn->ins[n].op != IR_ASM || !fn->ins[n].asm_ir)
+            continue;
+        struct ir_asm *a = fn->ins[n].asm_ir;
+        for (int j = 0; j < a->nout; j++)
+            for (int k = 0; k < NP; k++)
+                if (POOL[k] == a->out[j].reg) reg_used[k] = 1;
+        for (int j = 0; j < a->nin; j++)
+            for (int k = 0; k < NP; k++)
+                if (POOL[k] == a->in[j].reg) reg_used[k] = 1;
+    }
+
+    /* Only the callee-saved registers actually used need a prologue save. */
     int nu = 0;
-    for (int k = 0; k < NCALLEE; k++)
-        if (reg_used[k]) used_out[nu++] = CALLEE_POOL[k];
+    for (int k = 0; k < NP; k++)
+        if (reg_used[k] && is_callee_saved(POOL[k])) used_out[nu++] = POOL[k];
     *nused_out = nu;
 
-    free(first); free(last); free(elig);
+    free(first); free(last); free(elig); free(crosses);
     free(eof); free(eidx); free(adj); free(pref);
     free(members); free(order);
     free(liveout); free(livein); free(defv);
@@ -590,37 +744,65 @@ static int *coalesce_locals(struct ir_func *fn, int *nslots_out)
 {
     int n = fn->src->nvars;
     int *slot = xmalloc((size_t)(n ? n : 1) * sizeof *slot);
-    if (n == 0 || g_want_debug || !fn->var_scope_lo) {
+    if (n == 0 || g_want_debug || g_has_cgoto || !fn->var_scope_lo) {
         for (int i = 0; i < n; i++) slot[i] = i;   /* one slot each */
         *nslots_out = n;
         return slot;
     }
-    int *lo = fn->var_scope_lo, *hi = fn->var_scope_hi;
-
-    /* order locals by scope start (ties by index), via buckets over the [0,nins]
-     * instruction range — deterministic. */
     int nins = fn->nins;
+
+    /* Per-local lifetime range [rlo, rhi): an ADDRESS-TAKEN local (its address
+     * could reach a pointer we don't track) is bounded by its lexical SCOPE
+     * (sound — a stack pointer past its scope is UB); a non-address-taken local,
+     * accessed only by direct LDVAR/STVAR, uses its precise LIVENESS range,
+     * which is tighter and lets two same-scope locals with disjoint lifetimes
+     * share a slot (gcc does the same). */
+    char *at = xcalloc((size_t)n, 1);
+    for (int i = 0; i < nins; i++)
+        if (fn->ins[i].op == IR_ADDR) {
+            int v = fn->ins[i].a;
+            if (v >= 0 && v < n) at[v] = 1;
+        }
+    int *lf = xmalloc((size_t)fn->nvregs * sizeof *lf);
+    int *ll = xmalloc((size_t)fn->nvregs * sizeof *ll);
+    unsigned long *lin = NULL, *lout = NULL; int *dv = NULL, lw = 0;
+    lout = compute_live_intervals(fn, lf, ll, &lin, &dv, &lw);
+
+    int *rlo = xmalloc((size_t)n * sizeof *rlo);
+    int *rhi = xmalloc((size_t)n * sizeof *rhi);
+    for (int i = 0; i < n; i++) {
+        if (at[i] || lf[i] < 0) {           /* scope-bounded (or never referenced) */
+            rlo[i] = fn->var_scope_lo[i];
+            rhi[i] = fn->var_scope_hi[i];
+        } else {                             /* tighter: precise liveness */
+            rlo[i] = lf[i];
+            rhi[i] = ll[i] + 1;              /* half-open */
+        }
+    }
+    free(at); free(lf); free(ll); free(lout); free(lin); free(dv);
+
+    /* interval-graph colouring in range-start order (optimal for intervals):
+     * reuse a slot once its occupant's range ends at or before this one starts. */
     int *head = xmalloc((size_t)(nins + 2) * sizeof *head);
     for (int i = 0; i <= nins + 1; i++) head[i] = -1;
     int *nxt = xmalloc((size_t)n * sizeof *nxt);
     for (int i = n - 1; i >= 0; i--) {
-        int b = lo[i]; if (b < 0) b = 0; if (b > nins + 1) b = nins + 1;
+        int b = rlo[i]; if (b < 0) b = 0; if (b > nins + 1) b = nins + 1;
         nxt[i] = head[b]; head[b] = i;
     }
-
-    int *slot_free = xmalloc((size_t)n * sizeof *slot_free); /* free-after per slot */
+    int *slot_free = xmalloc((size_t)n * sizeof *slot_free);
     int ns = 0;
     for (int b = 0; b <= nins + 1; b++)
         for (int i = head[b]; i >= 0; i = nxt[i]) {
             int pick = -1;
             for (int s = 0; s < ns; s++)
-                if (slot_free[s] <= lo[i]) { pick = s; break; }
+                if (slot_free[s] <= rlo[i]) { pick = s; break; }
             if (pick < 0) { pick = ns++; }
             slot[i] = pick;
-            slot_free[pick] = hi[i];   /* busy until this local's scope ends */
+            slot_free[pick] = rhi[i];
         }
     *nslots_out = ns;
-    free(head); free(nxt); free(slot_free);
+    free(head); free(nxt); free(slot_free); free(rlo); free(rhi);
     return slot;
 }
 
@@ -757,6 +939,57 @@ struct sites {
 
 /* setcc opcode byte per predicate; pointers and unsigned integers use
  * the unsigned condition set (b/be/a/ae). */
+/* The negated predicate — for fusing a comparison into the branch that consumes
+ * it: `brz (a EQ b)` jumps exactly when `a NE b`. */
+static enum binop negate_pred(enum binop p)
+{
+    switch (p) {
+    case B_EQ: return B_NE; case B_NE: return B_EQ;
+    case B_LT: return B_GE; case B_GE: return B_LT;
+    case B_GT: return B_LE; case B_LE: return B_GT;
+    default:   return p;
+    }
+}
+
+/* Per-vreg use count over the whole function (a source operand appearing once
+ * per instruction it is read in), mirroring the liveness USE enumeration. Used
+ * to prove a comparison result feeds nothing but the branch that follows it, so
+ * the two can fuse into a single `cmp; jcc`. cnt has fn->nvregs entries. */
+static void count_vreg_uses(struct ir_func *fn, int *cnt)
+{
+    for (int v = 0; v < fn->nvregs; v++) cnt[v] = 0;
+#define UZ(x) do { int _v=(x); if (_v>=0 && _v<fn->nvregs) cnt[_v]++; } while (0)
+    for (int i = 0; i < fn->nins; i++) {
+        struct ir_ins *s = &fn->ins[i];
+        switch (s->op) {
+        case IR_MOV: case IR_NEG: case IR_BNOT: case IR_EXT: case IR_BSWAP:
+        case IR_I2F: case IR_F2I: case IR_F2F: case IR_LOAD: case IR_LDVAR:
+        case IR_ADDR: case IR_STVAR: case IR_VA_START:
+        case IR_RET: case IR_BRZ: case IR_BRNZ:
+            UZ(s->a); break;
+        case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
+        case IR_AND: case IR_OR: case IR_XOR: case IR_SHL: case IR_SHR:
+        case IR_CMP: case IR_STORE: case IR_MEMCPY: case IR_MEMZERO:
+        case IR_XCHG: case IR_XADD:
+            UZ(s->a); UZ(s->b); break;
+        case IR_CMPXCHG:
+            UZ(s->a); UZ(s->b); UZ(s->c); break;
+        case IR_CALL:
+            if (s->indirect) UZ(s->a);
+            for (int k = 0; k < s->nargs; k++) UZ(s->argv[k].vreg);
+            break;
+        case IR_ASM:
+            if (s->asm_ir) {
+                for (int k = 0; k < s->asm_ir->nin; k++) UZ(s->asm_ir->in[k].temp);
+                for (int k = 0; k < s->asm_ir->nout; k++) UZ(s->asm_ir->out[k].temp);
+            }
+            break;
+        default: break;
+        }
+    }
+#undef UZ
+}
+
 static int cc_for(enum binop pred, int sign)
 {
     switch (pred) {
@@ -829,7 +1062,7 @@ static const int *g_loc;      /* per-vreg physical register, or -1; NULL when of
 
 static void cg_reset(void) { rc_vreg = -1; rc_zx = 0; }
 
-static int in_reg(int vreg) { return g_regalloc && g_loc[vreg] >= 0; }
+static int in_reg(int vreg) { return g_regalloc && g_loc && g_loc[vreg] >= 0; }
 
 /* Is vreg cacheable in RAX? Register-resident vregs and memory TEMPS are (their
  * value is never aliased through memory); a memory LOCAL is not (a store through
@@ -895,6 +1128,113 @@ static void cg_load_rcx(struct code *text, const int *sd, int vreg, int w)
         x86_mov_ecx_mem(text, sd[vreg], w);
 }
 
+/* Produce the size/sign/w-extended value of vreg `a` straight in register `dst`
+ * (never RAX): the "extend into the home register" analogue of cg_load, used for
+ * a register-resident LDVAR/EXT result whose load actually extends (movsx/movzx/
+ * movsxd). Mirrors cg_load's extension choices exactly. Leaves RAX and its
+ * residency cache untouched. */
+static void cg_ext_into(struct code *text, const int *sd, int dst, int a,
+                        int size, int sign, int w)
+{
+    if (in_reg(a)) {
+        int R = g_loc[a];
+        if (size == 1 || size == 2)
+            x86_movx_rr(text, dst, R, size, sign, w);
+        else if (size == 4 && sign && w == 8)
+            x86_movsxd_rr(text, dst, R);
+        else
+            x86_mov_rr_w(text, dst, R, size == 8 ? 8 : w);
+    } else {
+        x86_load_reg_basedisp(text, dst, REG_RBP, sd[a], size, sign, w);
+    }
+}
+
+/* A plain reg-to-reg copy dst<-a of `w` bytes when BOTH vregs are register-
+ * resident: emit a single move (or nothing when they already share a register)
+ * instead of routing the value through RAX (mov a,%rax; mov %rax,dst). RAX and
+ * its residency cache are left untouched — the move never reads or writes RAX,
+ * so a value cached there stays valid. Returns 1 if it handled the copy, 0 to
+ * fall back to the cg_load/cg_store path. Inert unless -O2 (in_reg needs
+ * regalloc), so -O0/-O1 output is byte-identical. */
+static int cg_reg_move(struct code *text, int dst, int a, int w)
+{
+    if (!in_reg(a) || !in_reg(dst))
+        return 0;
+    if (g_loc[a] != g_loc[dst])
+        x86_mov_rr_w(text, g_loc[dst], g_loc[a], w);
+    return 1;
+}
+
+/* Emit the flag-setting form of an integer IR_CMP `i` (`cmp b,a` / `test a`),
+ * leaving the 0/1 result UNMATERIALISED — the caller then either branches (jcc)
+ * or setcc's it. The point is operand `a`: a comparison only reads its operands,
+ * so when `a` is register-resident we compare straight from its register instead
+ * of the old `mov a,%rax; cmp ...` staging move. `a` is staged through RAX only
+ * when it isn't in a register, or when `b` sits in memory (there is no
+ * register-vs-memory compare encoder, so the register operand must be RAX for
+ * `cmp mem,%rax`). When regalloc is off in_reg() is always false, so this always
+ * falls to the cg_load path and stays byte-identical to the pre-existing code.
+ *
+ * Cache: on the register-direct paths RAX is untouched, but the caller's
+ * following setcc/jcc clobbers or resets it, so this leaves the residency cache
+ * alone and relies on the caller (cg_store after setcc, cg_reset after jcc). */
+static void cg_icmp_flags(struct code *text, const int *sd, struct ir_ins *i)
+{
+    int b_mem = !i->imm_b && !in_reg(i->b);
+    int areg;
+    if (in_reg(i->a) && !b_mem) {
+        areg = g_loc[i->a];                       /* read a from its register */
+    } else {
+        cg_load(text, sd, i->a, i->w, 0, i->w);   /* stage a in RAX */
+        areg = REG_RAX;
+    }
+    if (i->imm_b) {
+        if (i->imm == 0) x86_test_reg(text, areg, i->w);
+        else             x86_alu_reg_imm(text, 'c', areg, i->imm, i->w);
+    } else if (in_reg(i->b)) {
+        x86_cmp_rr(text, areg, g_loc[i->b], i->w);
+    } else {
+        x86_cmp_eax_mem(text, sd[i->b], i->w);    /* areg == RAX here */
+    }
+}
+
+/* Emit a set of register-to-register moves that must take effect "in parallel":
+ * every dest receives its src's ORIGINAL value even when a dest is another
+ * move's src (a chain) or two moves swap (a cycle). All dests are distinct.
+ * Emit any move whose dest no pending move still needs as a source; when only
+ * cycles remain, break one by parking its dest in `scratch` (a register outside
+ * every src and dest — rax at a call site) and pointing its readers there. Used
+ * to shuffle call arguments among rdi..r9 when some already sit in r8/r9. */
+static void emit_reg_parallel_move(struct code *text, int *dest, int *src,
+                                   int n, int scratch)
+{
+    char done[16];
+    int remaining = 0;
+    for (int i = 0; i < n; i++) {
+        done[i] = (dest[i] == src[i]);       /* an identity move is a no-op */
+        if (!done[i]) remaining++;
+    }
+    while (remaining > 0) {
+        int progressed = 0;
+        for (int i = 0; i < n; i++) {
+            if (done[i]) continue;
+            int blocked = 0;
+            for (int j = 0; j < n; j++)
+                if (!done[j] && j != i && src[j] == dest[i]) { blocked = 1; break; }
+            if (blocked) continue;
+            x86_mov_reg_reg(text, dest[i], src[i]);
+            done[i] = 1; remaining--; progressed = 1;
+        }
+        if (progressed)
+            continue;
+        int c = -1;                          /* only cycles left: break one */
+        for (int i = 0; i < n; i++) if (!done[i]) { c = i; break; }
+        x86_mov_reg_reg(text, scratch, dest[c]);
+        for (int j = 0; j < n; j++)
+            if (!done[j] && src[j] == dest[c]) src[j] = scratch;
+    }
+}
+
 static void gen_func(struct ir_func *fn, struct code *text,
                      struct sites *st)
 {
@@ -904,6 +1244,22 @@ static void gen_func(struct ir_func *fn, struct code *text,
     int sret_slot;
     int va_save, va_tag;
 
+    /* A computed goto's indirect jump makes the CFG imprecise (it can reach any
+     * address-taken label), so the liveness the allocator and slot-coalescing
+     * rely on is unsound here. Keep such functions in the plain memory model:
+     * no register allocation, and every temp/local gets its own slot. */
+    g_has_cgoto = 0;
+    for (int n = 0; n < fn->nins; n++)
+        if (fn->ins[n].op == IR_IGOTO || fn->ins[n].op == IR_LABELADDR)
+            { g_has_cgoto = 1; break; }
+    /* Give such a function the plain memory model for its whole codegen: no
+     * register allocation and no RAX residency cache. Both reason about values
+     * across straight-line control flow, which an indirect jump violates (the
+     * cache would elide the reload before `jmp *rax`, jumping through a stale
+     * register). Restored at the single exit so other functions are unaffected. */
+    int saved_regalloc = g_regalloc, saved_regcache = g_regcache;
+    if (g_has_cgoto) { g_regalloc = 0; g_regcache = 0; }
+
     /* -O2: allocate eligible vregs to callee-saved registers first, so the
      * frame can reserve a save slot for each register the allocator uses.
      * When regalloc is off, loc is all -1 and nsave 0 — every path below is a
@@ -911,7 +1267,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
      * cg_load_rcx via in_reg(). */
     int used_callee[NCALLEE], nsave = 0;
     int *loc = NULL;
-    if (g_regalloc) {
+    if (g_regalloc && !g_has_cgoto) {
         loc = regalloc(fn, used_callee, &nsave);
         g_loc = loc;
     } else {
@@ -971,6 +1327,15 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_movs_store_base(text, REG_RBP, va_save + 48 + r * 16,
                                     r, 8);
     }
+    /* -O2 (non-variadic, non-debug): a register-allocated scalar-integer param
+     * that arrives in an arg register moves STRAIGHT into its allocated register
+     * via one parallel move — no home-slot store + reload. Debug builds keep the
+     * slots (DWARF fbreg reads them); variadic keeps the current handling (the
+     * arg registers are already spilled to the save area). */
+    int pmove = g_regalloc && g_loc && !g_want_debug && !f->is_varargs;
+    int pmv_src[MAX_PARAMS], pmv_dst[MAX_PARAMS], npmv = 0;
+    char pmoved[MAX_PARAMS];
+    for (int p = 0; p < MAX_PARAMS; p++) pmoved[p] = 0;
     {   /* The same two-file split, in reverse. A hidden return pointer
          * (sret) consumes rdi BEFORE any real parameter, and MEMORY
          * parameters arrive on the caller's stack at [rbp+16...]. */
@@ -999,36 +1364,53 @@ static void gen_func(struct ir_func *fn, struct code *text,
                     incoming += 8;
                 } else if (ty_is_float(pt)) {
                     x86_movs_store(text, freg++, sd[i], ty_size(pt));
+                } else if (pmove && g_loc[i] >= 0) {
+                    pmv_src[npmv] = x86_argreg(ireg++);   /* arg reg -> its own */
+                    pmv_dst[npmv] = g_loc[i];             /* allocated register */
+                    npmv++; pmoved[i] = 1;
                 } else {
                     x86_store_arg(text, ireg++, sd[i]);
                 }
                 continue;
             }
             if (n == 0) {
-                /* MEMORY: copy it out of the caller's frame into ours,
-                 * so its address is a normal local. */
+                /* MEMORY: copy it out of the caller's frame into ours, so its
+                 * address is a normal local. RAX carries each eightbyte, so the
+                 * destination pointer needs a DIFFERENT scratch — and not an
+                 * integer arg register (RCX would drop a later scalar param that
+                 * arrives in it). r11 is caller-saved, never an arg register, and
+                 * free at prologue time (params reach their allocated registers
+                 * only in the parallel move that runs after this loop). */
                 int sz = ty_size(pt);
-                x86_lea_reg_slot(text, REG_RCX, sd[i]);
+                x86_lea_reg_slot(text, 11 /*r11*/, sd[i]);
                 for (int off = 0; off < sz; off += 8) {
                     int chunk = sz - off >= 8 ? 8 : sz - off;
                     x86_load_reg_mem(text, REG_RAX, REG_RBP,
                                      incoming + off, chunk >= 8 ? 8 : chunk);
-                    x86_store_mem_reg(text, REG_RCX, off, REG_RAX,
+                    x86_store_mem_reg(text, 11 /*r11*/, off, REG_RAX,
                                       chunk >= 8 ? 8 : chunk);
                 }
                 incoming += (sz + 7) & ~7;
                 continue;
             }
-            /* registers -> the parameter's own storage */
-            x86_lea_reg_slot(text, REG_RCX, sd[i]);
+            /* registers -> the parameter's own storage. The slot-address scratch
+             * must NOT be an integer arg register: RCX (the 4th int arg) would be
+             * clobbered here before a later scalar param arriving in it is stored
+             * (`f(struct{long,long} s, long a, long b)` -> b lost). RAX is free at
+             * prologue time and is never an argument register. */
+            x86_lea_reg_slot(text, REG_RAX, sd[i]);
             for (int k = 0; k < n; k++) {
                 if (cls[k] == CLASS_SSE)
-                    x86_movs_store_base(text, REG_RCX, k * 8, freg++, 8);
+                    x86_movs_store_base(text, REG_RAX, k * 8, freg++, 8);
                 else
-                    x86_store_mem_reg(text, REG_RCX, k * 8,
+                    x86_store_mem_reg(text, REG_RAX, k * 8,
                                       x86_argreg(ireg++), 8);
             }
         }
+        /* Shuffle the collected arg registers into their allocated registers at
+         * once (handles the r8/r9 overlap and any cycle via RAX, which is free
+         * here and never an arg or allocated register). */
+        if (npmv) emit_reg_parallel_move(text, pmv_dst, pmv_src, npmv, REG_RAX);
         va_named_int = ireg;
         va_named_sse = freg;
         va_overflow = incoming;
@@ -1037,18 +1419,34 @@ static void gen_func(struct ir_func *fn, struct code *text,
     /* -O2: params were stored to their slots above; move each register-resident
      * param's incoming value into its register. (Its low bits are the value; a
      * signed read re-extends, so no widening subtlety.) */
-    if (g_regalloc)
+    if (g_regalloc && g_loc)
         for (int p = 0; p < f->nparams; p++) {
-            if (g_loc[p] < 0) continue;
+            if (g_loc[p] < 0 || pmoved[p]) continue;   /* pmoved: already in reg */
             struct type *pt = f->param_tys[p];
             int psz = ty_size(pt);
-            int psign = ty_signed_int(pt);
-            x86_load_slot(text, sd[p], psz, psign, 8);   /* slot -> rax */
-            x86_mov_rr_w(text, g_loc[p], REG_RAX, 8);    /* rax -> reg */
+            /* Load the home slot straight into the param's register — no RAX
+             * detour. Only the low psz bytes matter (a later read re-extends);
+             * regalloc promotes only size-4/8 scalars, and x86_load_reg_mem
+             * zero-extends a 4-byte load, which is the register narrow-value
+             * invariant. Halves the per-param materialisation. */
+            x86_load_reg_mem(text, g_loc[p], REG_RBP, sd[p], psz);
         }
 
     rc_nvars = fn->src->nvars;
     cg_reset();
+    /* Use counts drive comparison/branch fusion below (a compare feeding only
+     * the next branch). Built once; freed after the loop. */
+    int *usecnt = fn->nvregs
+        ? xmalloc((size_t)fn->nvregs * sizeof *usecnt) : (int *)0;
+    if (usecnt) count_vreg_uses(fn, usecnt);
+    /* -O2: with two or more returns each inlining the full callee-restore
+     * sequence, route them through ONE shared epilogue instead — each return
+     * loads its value then `jmp`s to it. Worth the jmp only when there is more
+     * than one return and something to restore; a single return stays inline. */
+    int nret = 0;
+    for (int t = 0; t < fn->nins; t++) if (fn->ins[t].op == IR_RET) nret++;
+    int shared_epi = g_regalloc && nsave >= 1 && nret >= 2;
+    int *epi_patch = NULL, nepi = 0, capepi = 0;
     for (int n = 0; n < fn->nins; n++) {
         struct ir_ins *i = &fn->ins[n];
         /* -g: a row where the source line changes. text->len is the .text
@@ -1081,14 +1479,46 @@ static void gen_func(struct ir_func *fn, struct code *text,
                        "floating point needs SSE, which -mno-sse forbids");
         switch (i->op) {
         case IR_CONST:
-            x86_mov_eax_imm(text, i->imm, i->w);
+            /* Register-resident dest: materialise the constant straight in its
+             * register (`xor D,D` for zero, else `mov $imm,D`), no RAX detour and
+             * no store. RAX is untouched, so a value cached there survives. */
+            if (in_reg(i->dst)) {
+                int D = g_loc[i->dst];
+                if (i->imm == 0) x86_alu_rr(text, '^', D, D, 4);
+                else             x86_mov_reg_imm(text, D, i->imm, i->w);
+                break;
+            }
+            /* -O2: materialise zero with `xor eax,eax` (2 bytes, upper zeroed)
+             * rather than a 7-byte `mov`. Gated to keep -O0/-O1 byte-identical;
+             * safe because no comparison's flags are live across a CONST. */
+            if (g_regalloc && i->imm == 0)
+                x86_zero_eax(text);
+            else
+                x86_mov_eax_imm(text, i->imm, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_MOV:
-            /* a coalesced copy whose source and dest share a register is a
-             * no-op — emit nothing (move coalescing). */
-            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst])
+            /* Two register-resident vregs: a direct reg-reg move (or nothing
+             * when coalesced onto the same register) — no RAX round-trip. */
+            if (cg_reg_move(text, i->dst, i->a, 8))
                 break;
+            /* dst register-resident, source in memory: load straight into dst's
+             * register instead of memory->RAX->dst. Regalloc never hands out
+             * RAX, so g_loc[dst] != RAX and the RAX residency cache is left
+             * intact. Halves the very common LDVAR-of-a-local-into-a-temp
+             * sequence (`mov slot,%rax; mov %rax,%rN` -> `mov slot,%rN`). */
+            if (in_reg(i->dst)) {
+                x86_load_reg_mem(text, g_loc[i->dst], REG_RBP, sd[i->a], 8);
+                break;
+            }
+            /* source register-resident, dest in memory: store straight to the
+             * slot (`mov %rN,slot`) instead of routing through RAX (`mov %rN,%rax;
+             * mov %rax,slot`). RAX and its residency cache are untouched — the
+             * value already in RAX (if any) stays valid. */
+            if (in_reg(i->a)) {
+                x86_store_mem_reg(text, REG_RBP, sd[i->dst], g_loc[i->a], 8);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);
             cg_store(text, sd, i->dst, 8);
             break;
@@ -1108,13 +1538,99 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_movs_store(text, 0, sd[i->dst], i->w);
                 break;
             }
-            cg_load(text, sd, i->a, i->w, 0, i->w);
+            /* Address-generation fusion: an `ADD base, X` whose SOLE use is the
+             * immediately-following memory access folds into that access's
+             * addressing, dropping the address computation. X a constant ->
+             * base+disp (`p->field`); X a register -> base+index (`p[i]`). The
+             * ADD's result is never materialised (the fusion reads base/index,
+             * not the sum), so no register is needed for it. */
+            if (g_regcache && usecnt && i->op == IR_ADD &&
+                in_reg(i->a) && n + 1 < fn->nins && usecnt[i->dst] == 1 &&
+                (i->imm_b ? 1 : in_reg(i->b))) {
+                struct ir_ins *nx = &fn->ins[n + 1];
+                int base = g_loc[i->a], index = i->imm_b ? 0 : g_loc[i->b];
+                if (nx->op == IR_LOAD && nx->a == i->dst) {
+                    if (i->imm_b)
+                        x86_load_basedisp_rax(text, base, (int)i->imm,
+                                              nx->size, nx->sign, nx->w);
+                    else
+                        x86_load_baseindex_rax(text, base, index, 1,
+                                               nx->size, nx->sign, nx->w);
+                    cg_store(text, sd, nx->dst, nx->w);
+                    n++;                           /* consume the fused load */
+                    break;
+                }
+                if (nx->op == IR_STORE && nx->a == i->dst) {
+                    /* value -> rax (rax never aliases base/index), then store
+                     * through the folded address. */
+                    cg_load(text, sd, nx->b, 8, 0, 8);
+                    if (i->imm_b)
+                        x86_store_basedisp_rax(text, base, (int)i->imm, nx->size);
+                    else
+                        x86_store_baseindex_rax(text, base, index, 1, nx->size);
+                    n++;                           /* consume the fused store */
+                    break;
+                }
+            }
             {
                 int aop = i->op == IR_ADD ? '+' :
                           i->op == IR_SUB ? '-' :
                           i->op == IR_MUL ? '*' :
                           i->op == IR_AND ? '&' :
                           i->op == IR_OR ? '|' : '^';
+                /* Operand b folded to an immediate (the optimizer's imm-fold):
+                 * `OP $imm, dst` with no constant materialised in a register. In
+                 * the dest register directly when both dst and a are resident
+                 * (RAX untouched), else through RAX. MUL is never imm-folded. */
+                if (i->imm_b) {
+                    /* MUL by a constant is the three-operand imul: dst = a*imm
+                     * directly, no copy and no rax detour even when dst != a. */
+                    if (i->op == IR_MUL) {
+                        if (in_reg(i->dst) && in_reg(i->a)) {
+                            x86_imul_reg_imm(text, g_loc[i->dst], g_loc[i->a],
+                                             i->imm, i->w);
+                            break;
+                        }
+                        cg_load(text, sd, i->a, i->w, 0, i->w);
+                        x86_imul_reg_imm(text, REG_RAX, REG_RAX, i->imm, i->w);
+                        cg_store(text, sd, i->dst, i->w);
+                        break;
+                    }
+                    if (in_reg(i->dst) && in_reg(i->a)) {
+                        int D = g_loc[i->dst], A = g_loc[i->a];
+                        if (D != A)
+                            x86_mov_rr_w(text, D, A, i->w);
+                        x86_alu_reg_imm(text, aop, D, i->imm, i->w);
+                        break;
+                    }
+                    cg_load(text, sd, i->a, i->w, 0, i->w);
+                    x86_alu_reg_imm(text, aop, REG_RAX, i->imm, i->w);
+                    cg_store(text, sd, i->dst, i->w);
+                    break;
+                }
+                /* All three operands register-resident: compute in the dest
+                 * register, no RAX detour. dst = a OP b becomes an in-place
+                 * `OP b,dst` when dst already holds a (the common case after
+                 * coalescing), else `mov a,dst; OP b,dst`. The one hazard is
+                 * dst sharing b's register with a non-commutative SUB — fall
+                 * back to RAX there. RAX (and its cache) is left untouched. */
+                if (in_reg(i->dst) && in_reg(i->a) && in_reg(i->b)) {
+                    int D = g_loc[i->dst], A = g_loc[i->a], B = g_loc[i->b];
+                    int commut = i->op != IR_SUB;
+                    if (D == A) {
+                        x86_alu_rr(text, aop, D, B, i->w);
+                        break;
+                    } else if (D != B) {
+                        x86_mov_rr_w(text, D, A, i->w);
+                        x86_alu_rr(text, aop, D, B, i->w);
+                        break;
+                    } else if (commut) {              /* D holds b; a OP b == b OP a */
+                        x86_alu_rr(text, aop, D, A, i->w);
+                        break;
+                    }
+                    /* SUB with D == B != A: fall through to the RAX path. */
+                }
+                cg_load(text, sd, i->a, i->w, 0, i->w);
                 /* a register-resident second operand is a reg-reg op; a memory
                  * one keeps the direct memory-operand form (no extra load). */
                 if (in_reg(i->b))
@@ -1147,17 +1663,42 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_SHL:
-        case IR_SHR:
+        case IR_SHR: {
+            int skind = i->op == IR_SHL ? '<' : i->sign ? '>' : 'u';
+            /* Constant shift count folded to an immediate: `shift $k, dst` with
+             * no count loaded into rcx — in the dest register when resident. */
+            if (i->imm_b) {
+                if (in_reg(i->dst) && in_reg(i->a)) {
+                    int D = g_loc[i->dst], A = g_loc[i->a];
+                    if (D != A)
+                        x86_mov_rr_w(text, D, A, i->w);
+                    x86_shift_reg_imm(text, D, skind, (int)i->imm, i->w);
+                    break;
+                }
+                cg_load(text, sd, i->a, i->w, 0, i->w);
+                x86_shift_reg_imm(text, REG_RAX, skind, (int)i->imm, i->w);
+                cg_store(text, sd, i->dst, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->w, 0, i->w);
             cg_load_rcx(text, sd, i->b, 4);  /* byte-identical to the old
                                               * x86_mov_ecx_mem when regalloc off */
-            x86_shift_eax_cl(text,
-                             i->op == IR_SHL ? '<' :
-                             i->sign ? '>' : 'u', i->w);
+            x86_shift_eax_cl(text, skind, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
+        }
         case IR_NEG:
         case IR_BNOT:
+            /* Both register-resident: negate/complement in the dest register
+             * (in place when dst and a coalesced onto one), no RAX detour. */
+            if (in_reg(i->dst) && in_reg(i->a)) {
+                int D = g_loc[i->dst], A = g_loc[i->a];
+                if (D != A)
+                    x86_mov_rr_w(text, D, A, i->w);
+                if (i->op == IR_NEG) x86_neg_reg(text, D, i->w);
+                else                 x86_not_reg(text, D, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->w, 0, i->w);
             if (i->op == IR_NEG)
                 x86_neg_eax(text, i->w);
@@ -1185,11 +1726,40 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 cg_store(text, sd, i->dst, 4);   /* the 0/1 result is an int */
                 break;
             }
-            cg_load(text, sd, i->a, i->w, 0, i->w);
-            if (in_reg(i->b))
-                x86_cmp_rr(text, REG_RAX, g_loc[i->b], i->w);
-            else
-                x86_cmp_eax_mem(text, sd[i->b], i->w);
+            /* Fuse an integer comparison into the branch that solely consumes
+             * it: `cmp; jcc` instead of setcc/movzx/store then load/test/jz.
+             * Sound only when the next op is that branch on this result and the
+             * result is used nowhere else. Gated to the optimizing path so -O0
+             * stays byte-identical (the self-host fixed point). */
+            if (g_regcache && usecnt && n + 1 < fn->nins &&
+                (fn->ins[n + 1].op == IR_BRZ || fn->ins[n + 1].op == IR_BRNZ) &&
+                fn->ins[n + 1].a == i->dst && usecnt[i->dst] == 1) {
+                struct ir_ins *br = &fn->ins[n + 1];
+                cg_icmp_flags(text, sd, i);
+                /* BRNZ jumps when the comparison is true; BRZ when it is false. */
+                enum binop jp = br->op == IR_BRNZ ? i->pred
+                                                  : negate_pred(i->pred);
+                int patch = x86_jcc_rel32(text, cc_for(jp, i->sign));
+                cg_reset();                       /* control splits here */
+                if (nbrs == capbrs) {
+                    capbrs = capbrs ? capbrs * 2 : 16;
+                    brs = xrealloc(brs, (size_t)capbrs * sizeof *brs);
+                }
+                brs[nbrs].patch_off = patch;
+                brs[nbrs].label = br->label;
+                nbrs++;
+                n++;                              /* consume the fused branch */
+                break;
+            }
+            cg_icmp_flags(text, sd, i);
+            /* Register-resident dest: setcc + widen straight into it, no
+             * result-carrying `mov %eax,%rN`. setcc_reg touches only the home
+             * register, so a value cached in RAX (e.g. operand a, if it was
+             * staged) survives. */
+            if (in_reg(i->dst)) {
+                x86_setcc_reg(text, cc_for(i->pred, i->sign), g_loc[i->dst]);
+                break;
+            }
             x86_setcc_eax(text, cc_for(i->pred, i->sign));
             cg_store(text, sd, i->dst, 4);        /* the 0/1 result is an int */
             break;
@@ -1211,18 +1781,48 @@ static void gen_func(struct ir_func *fn, struct code *text,
         case IR_LDVAR:
             /* coalesced plain load whose local and temp share a register: no-op
              * (only when no extension is emitted — see ldvar_plain). */
-            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst] &&
-                ldvar_plain(i->size, i->sign, i->w))
+            /* A plain (non-extending) read of a register-resident local into a
+             * register-resident temp is a direct reg-reg move — no RAX detour.
+             * The narrow-value invariant holds: a 4-byte move zero-extends. */
+            if (ldvar_plain(i->size, i->sign, i->w) &&
+                cg_reg_move(text, i->dst, i->a, i->size == 8 ? 8 : 4))
                 break;
+            /* A plain (non-extending) load into a register-resident temp from a
+             * MEMORY local: load straight into the temp's register instead of
+             * memory->RAX->reg. x86_load_reg_mem zero-extends narrow reads, which
+             * matches ldvar_plain's non-signed-widen loads exactly; regalloc
+             * never hands out RAX so its residency cache is untouched. This is
+             * the hot LDVAR-of-a-param/local case (`mov slot,%rax; mov %rax,%rN`
+             * -> `mov slot,%rN`). */
+            if (ldvar_plain(i->size, i->sign, i->w) && in_reg(i->dst)) {
+                x86_load_reg_mem(text, g_loc[i->dst], REG_RBP, sd[i->a], i->size);
+                break;
+            }
+            /* Extending read (movsx/movzx/movsxd) into a register-resident temp:
+             * extend straight into it, no RAX detour. */
+            if (in_reg(i->dst)) {
+                cg_ext_into(text, sd, g_loc[i->dst], i->a, i->size, i->sign, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STVAR:
-            /* coalesced self-copy (local and value share a register): no-op. The
-             * shared low bytes already carry the (truncated) value; a later read
-             * of the local movsx/movzx-extends from them. */
-            if (in_reg(i->a) && in_reg(i->dst) && g_loc[i->a] == g_loc[i->dst])
+            /* Both register-resident: a direct reg-reg move (coalesced same-reg
+             * writes vanish). The written local keeps the value in its low
+             * i->size bytes; a later read movsx/movzx-extends from them. */
+            if (cg_reg_move(text, i->dst, i->a, i->size))
                 break;
+            /* register-resident source into a MEMORY local: store the register's
+             * low i->size bytes straight to the slot (`mov %rN,slot`) instead of
+             * `mov %rN,%rax; mov %rax,slot`. A local's slot holds only its low
+             * i->size bytes (reads movsx/movzx-extend), so this writes exactly
+             * what the RAX path would, byte-for-byte, at any width. RAX and its
+             * residency cache are untouched. */
+            if (in_reg(i->a) && !in_reg(i->dst)) {
+                x86_store_mem_reg(text, REG_RBP, sd[i->dst], g_loc[i->a], i->size);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);
             if (in_reg(i->dst))                          /* register-resident local */
                 x86_mov_rr_w(text, g_loc[i->dst], REG_RAX, i->size);
@@ -1230,45 +1830,91 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 x86_store_slot(text, sd[i->dst], i->size); /* dst is a local */
             break;
         case IR_ADDR:
+            /* Register-resident dest: lea straight into it, no RAX detour/store. */
+            if (in_reg(i->dst)) { x86_lea_reg_slot(text, g_loc[i->dst], sd[i->a]); break; }
             x86_lea_rax_slot(text, sd[i->a]);
             cg_store(text, sd, i->dst, 8);
             break;
         case IR_STRADDR: {
+            /* The lea's rel32 is relocated whether it targets RAX or a home
+             * register; only the destination register differs. */
+            int D = in_reg(i->dst);
             struct strsite ss;
-            ss.patch_off = x86_lea_rax_rip(text);
+            ss.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
+                             : x86_lea_rax_rip(text);
             ss.str_off = i->label;  /* resolved to an offset below */
             PUSH(st->str, st->nstr, st->capstr, ss);
-            cg_store(text, sd, i->dst, 8);
+            if (!D) cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_GADDR: {
+            int D = in_reg(i->dst);
             struct gsite gs;
-            gs.patch_off = x86_lea_rax_rip(text);
+            gs.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
+                             : x86_lea_rax_rip(text);
             gs.glob = i->glob;
             PUSH(st->g, st->ng, st->capg, gs);
-            cg_store(text, sd, i->dst, 8);
+            if (!D) cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_FADDR: {
+            int D = in_reg(i->dst);
             struct fsite fs;
-            fs.patch_off = x86_lea_rax_rip(text);
+            fs.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
+                             : x86_lea_rax_rip(text);
             fs.target = i->callee;
             PUSH(st->f, st->nf, st->capf, fs);
-            cg_store(text, sd, i->dst, 8);
+            if (!D) cg_store(text, sd, i->dst, 8);
             break;
         }
         case IR_LOAD:
+            /* Register-resident dest: load straight into it, no result-carrying
+             * `mov %rax,%rN`. The address is either already in a register (RAX
+             * wholly untouched — cache preserved) or staged into RAX as the base
+             * (RAX still holds that address afterward, so its cache entry stays
+             * valid — the load reads [rax], it does not overwrite rax). */
+            if (in_reg(i->dst)) {
+                if (in_reg(i->a)) {
+                    x86_load_base_reg(text, g_loc[i->dst], g_loc[i->a],
+                                      i->size, i->sign, i->w);
+                    break;
+                }
+                cg_load(text, sd, i->a, 8, 0, 8);       /* the address -> rax */
+                x86_load_base_reg(text, g_loc[i->dst], REG_RAX,
+                                  i->size, i->sign, i->w);
+                break;
+            }
+            /* Address already in a register: load straight from [reg], skipping
+             * the `mov reg,rax`. dst is a temp (cacheable), so cg_store below
+             * fixes the residency cache. */
+            if (in_reg(i->a)) {
+                x86_load_base_rax(text, g_loc[i->a], i->size, i->sign, i->w);
+                cg_store(text, sd, i->dst, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, 8, 0, 8);       /* the address */
             x86_load_mem_rax(text, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
         case IR_STORE:
+            /* Address already in a register (mirrors IR_LOAD): store straight to
+             * [reg], skipping the slot->rcx load — which is what lets the address
+             * temp be register-allocated at all (its OPAQUE marking is dropped). */
+            if (in_reg(i->a)) {
+                cg_load(text, sd, i->b, 8, 0, 8);           /* the value -> rax */
+                x86_store_mem_reg(text, g_loc[i->a], 0, REG_RAX, i->size);
+                break;
+            }
             x86_mov_rcx_slot(text, sd[i->a]);       /* the address -> rcx */
             cg_load(text, sd, i->b, 8, 0, 8);       /* the value -> rax */
             x86_store_mem_rcx(text, i->size);
             break;
         case IR_EXT:
             /* re-extend from the low `size` bytes of the temp's slot */
+            if (in_reg(i->dst)) {
+                cg_ext_into(text, sd, g_loc[i->dst], i->a, i->size, i->sign, i->w);
+                break;
+            }
             cg_load(text, sd, i->a, i->size, i->sign, i->w);
             cg_store(text, sd, i->dst, i->w);
             break;
@@ -1314,33 +1960,40 @@ static void gen_func(struct ir_func *fn, struct code *text,
             cg_store(text, sd, i->dst, 4);
             break;
         case IR_MEMCPY: {
-            /* a struct copy: 8 bytes at a time, then the tail */
+            /* a struct copy: 8 bytes at a time, then the tail. A register-held
+             * address is used directly as the base (no slot->rcx/rdx load) — the
+             * reason its temp can be register-allocated (OPAQUE dropped). */
             cg_reset();
-            x86_load_slot(text, sd[i->a], 8, 0, 8);
-            x86_mov_reg_reg(text, REG_RCX, REG_RAX);       /* dst */
-            x86_load_slot(text, sd[i->b], 8, 0, 8);
-            x86_mov_reg_reg(text, REG_RDX, REG_RAX);       /* src */
+            int dbase, sbase;
+            if (in_reg(i->a)) dbase = g_loc[i->a];
+            else { x86_load_slot(text, sd[i->a], 8, 0, 8);
+                   x86_mov_reg_reg(text, REG_RCX, REG_RAX); dbase = REG_RCX; }
+            if (in_reg(i->b)) sbase = g_loc[i->b];
+            else { x86_load_slot(text, sd[i->b], 8, 0, 8);
+                   x86_mov_reg_reg(text, REG_RDX, REG_RAX); sbase = REG_RDX; }
             int off = 0;
             while (off < i->size) {
                 int chunk = i->size - off;
                 chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4 : chunk >= 2 ? 2 : 1;
-                x86_load_reg_mem(text, REG_RAX, REG_RDX, off, chunk);
-                x86_store_mem_reg(text, REG_RCX, off, REG_RAX, chunk);
+                x86_load_reg_mem(text, REG_RAX, sbase, off, chunk);
+                x86_store_mem_reg(text, dbase, off, REG_RAX, chunk);
                 off += chunk;
             }
             break;
         }
         case IR_MEMZERO: {
             cg_reset();
-            x86_load_slot(text, sd[i->a], 8, 0, 8);
-            x86_mov_reg_reg(text, REG_RCX, REG_RAX);
+            int dbase;
+            if (in_reg(i->a)) dbase = g_loc[i->a];
+            else { x86_load_slot(text, sd[i->a], 8, 0, 8);
+                   x86_mov_reg_reg(text, REG_RCX, REG_RAX); dbase = REG_RCX; }
             x86_mov_eax_imm(text, 0, 8);
             int off = 0;
             while (off < i->size) {
                 int chunk = i->size - off;
                 chunk = chunk >= 8 ? 8 : chunk >= 4 ? 4
                       : chunk >= 2 ? 2 : 1;
-                x86_store_mem_reg(text, REG_RCX, off, REG_RAX, chunk);
+                x86_store_mem_reg(text, dbase, off, REG_RAX, chunk);
                 off += chunk;
             }
             break;
@@ -1371,6 +2024,27 @@ static void gen_func(struct ir_func *fn, struct code *text,
             nbrs++;
             break;
         }
+        case IR_LABELADDR: {
+            /* dst = &&label: `lea rax,[rip+disp32]`, the disp32 patched to the
+             * label's code offset via the SAME list and formula as a rel32
+             * branch (target - (patch_off + 4)). */
+            int patch = x86_lea_rax_rip(text);
+            if (nbrs == capbrs) {
+                capbrs = capbrs ? capbrs * 2 : 16;
+                brs = xrealloc(brs, (size_t)capbrs * sizeof *brs);
+            }
+            brs[nbrs].patch_off = patch;
+            brs[nbrs].label = i->label;
+            nbrs++;
+            cg_store(text, sd, i->dst, 8);
+            break;
+        }
+        case IR_IGOTO:
+            /* goto *a: jump to the computed code address held in a. */
+            cg_load(text, sd, i->a, 8, 0, 8);
+            cg_reset();
+            x86_jmp_reg(text, REG_RAX);
+            break;
         case IR_CALL: {
             /* SysV walks TWO register files independently: integers and
              * pointers take rdi..r9, floats take xmm0..7. */
@@ -1417,6 +2091,37 @@ static void gen_func(struct ir_func *fn, struct code *text,
                                  scratch_base + i->scratch);
                 ireg++;
             }
+            /* Register arguments already in a register (r8..r15/rbx) are moved
+             * as ONE parallel move: an argument sitting in r8/r9 must not be
+             * clobbered by an earlier argument's write to that same register.
+             * The indirect target (-> r11) joins the same shuffle. Memory- and
+             * xmm-sourced placements read from the frame, so they cannot clobber
+             * a register source and are emitted afterward. rax is the scratch:
+             * not an argument register, and free until the al count below. */
+            int mvdest[16], mvsrc[16], nmv = 0;
+            {
+                int pireg = ireg, pfreg = freg;
+                for (int k = 0; k < i->nargs; k++) {
+                    struct ir_arg *a = &i->argv[k];
+                    if (a->on_stack)
+                        continue;
+                    if (a->is_struct) {
+                        for (int q = 0; q < a->nclass; q++)
+                            if (a->cls[q] == CLASS_SSE) pfreg++; else pireg++;
+                    } else if (a->cls[0] == CLASS_SSE) {
+                        pfreg++;
+                    } else if (in_reg(a->vreg)) {
+                        mvdest[nmv] = x86_argreg(pireg++);
+                        mvsrc[nmv] = g_loc[a->vreg]; nmv++;
+                    } else {
+                        pireg++;
+                    }
+                }
+                if (i->indirect && in_reg(i->a)) {
+                    mvdest[nmv] = 11 /*r11*/; mvsrc[nmv] = g_loc[i->a]; nmv++;
+                }
+            }
+            emit_reg_parallel_move(text, mvdest, mvsrc, nmv, REG_RAX);
             for (int k = 0; k < i->nargs; k++) {
                 struct ir_arg *a = &i->argv[k];
                 if (a->on_stack)
@@ -1436,16 +2141,12 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 if (a->cls[0] == CLASS_SSE)
                     x86_movs_load(text, freg++, sd[a->vreg], a->size);
                 else if (in_reg(a->vreg))
-                    x86_mov_reg_reg(text, x86_argreg(ireg++), g_loc[a->vreg]);
+                    ireg++;              /* already placed by the parallel move */
                 else
                     x86_load_arg(text, ireg++, sd[a->vreg]);
             }
-            if (i->indirect) {
-                if (in_reg(i->a))
-                    x86_mov_reg_reg(text, 11 /*r11*/, g_loc[i->a]);
-                else
-                    x86_mov_r11_slot(text, sd[i->a]);
-            }
+            if (i->indirect && !in_reg(i->a))
+                x86_mov_r11_slot(text, sd[i->a]);   /* in-reg case done above */
             /* al = the number of VECTOR registers used. Zero was right
              * only while no floats existed; a variadic callee reads it
              * to find the register save area, so a wrong al is exactly
@@ -1618,24 +2319,52 @@ static void gen_func(struct ir_func *fn, struct code *text,
                 else
                     x86_load_slot(text, sd[i->a], 8, 0, 8);
             }
-            for (int k = 0; k < nsave; k++)             /* -O2: restore callee regs */
-                x86_load_reg_mem(text, used_callee[k], REG_RBP,
-                                 save_base + k * 8, 8);
-            x86_epilogue(text);
+            if (shared_epi) {                           /* jump to the one epilogue */
+                int p = x86_jmp_rel32(text);
+                if (nepi == capepi) {
+                    capepi = capepi ? capepi * 2 : 8;
+                    epi_patch = xrealloc(epi_patch, (size_t)capepi * sizeof(int));
+                }
+                epi_patch[nepi++] = p;
+            } else {
+                for (int k = 0; k < nsave; k++)         /* -O2: restore callee regs */
+                    x86_load_reg_mem(text, used_callee[k], REG_RBP,
+                                     save_base + k * 8, 8);
+                x86_epilogue(text);
+            }
             break;
         }
     }
-
-    for (int k = 0; k < nsave; k++)                     /* -O2: restore callee regs */
-        x86_load_reg_mem(text, used_callee[k], REG_RBP, save_base + k * 8, 8);
 
     /* Every function ends with an epilogue, whether or not its last
      * statement was a return. A void function may legally fall off the
      * end (sema only demands a return from value-returning ones), and
      * without this it fell straight into the NEXT function's code —
-     * silently, since nothing crashes until a stray ret runs. A dead
-     * `leave; ret` after an explicit return costs two bytes. */
-    x86_epilogue(text);
+     * silently, since nothing crashes until a stray ret runs.
+     *
+     * But when the last instruction is an unconditional terminator (an
+     * explicit return, a tail jump, or a trap) the fall-through is
+     * unreachable, and at -O2 this dead tail also re-emits nsave callee
+     * restores. Drop it there. -O0/-O1 keep the (2-byte) dead `leave; ret`
+     * so their output — the self-host fixed point — stays byte-identical. */
+    int last_terminates = fn->nins > 0 &&
+        (fn->ins[fn->nins - 1].op == IR_RET ||
+         fn->ins[fn->nins - 1].op == IR_JMP ||
+         fn->ins[fn->nins - 1].op == IR_UD2);
+    /* Emit the trailing epilogue when the returns share it (it is their jump
+     * target) OR when control can fall off the end (a void function). */
+    int epi_off = text->len;
+    if (shared_epi || !(g_regalloc && last_terminates)) {
+        for (int k = 0; k < nsave; k++)                 /* -O2: restore callee regs */
+            x86_load_reg_mem(text, used_callee[k], REG_RBP, save_base + k * 8, 8);
+        x86_epilogue(text);
+    }
+    for (int e = 0; e < nepi; e++) {                    /* patch shared-return jumps */
+        int from = epi_patch[e] + 4;
+        code_patch32(text, epi_patch[e],
+                     (unsigned long)(unsigned int)(epi_off - from));
+    }
+    free(epi_patch);
 
     for (int n = 0; n < nbrs; n++) {
         int target = label_off[brs[n].label];
@@ -1652,7 +2381,10 @@ static void gen_func(struct ir_func *fn, struct code *text,
     free(label_off);
     free(sd);
     free(loc);
+    free(usecnt);
     g_loc = NULL;
+    g_regalloc = saved_regalloc;      /* restore (a cgoto function forced them off) */
+    g_regcache = saved_regcache;
 
     f->code_len = text->len - f->code_off;
 }
@@ -1672,6 +2404,7 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
      * so their output stays byte-identical. */
     g_regalloc = regalloc;
     g_regcache = optimize;
+    g_opt_frames = optimize;
     g_no_sse = no_sse;
 
     for (int n = 0; n < iu->nfuncs; n++)
