@@ -8,7 +8,8 @@ The baseline (`-O0`) is deliberately simple: every vreg lives in a stack slot,
 every operation goes through `rax` (and `rcx` for a second operand), so all
 values are in memory across statements. Correct and easy to reason about. On top
 of that the codegen carries several quality passes, each gated by optimization
-level so the lower levels stay reproducible:
+level so the lower levels stay reproducible (`-O0` output is byte-identical
+across changes, which is what keeps the self-hosting fixed point stable):
 
 - **Stack-slot coalescing (always on).** Temporaries whose live ranges do not
   overlap share one slot (`coalesce_temps`, single-basic-block liveness); local
@@ -27,9 +28,14 @@ level so the lower levels stay reproducible:
   (interfering within live-in and within live-out, so a dying operand and a
   fresh result can share); Chaitin-Briggs optimistic colouring assigns registers
   with move-coalescing bias and spills the most-constrained node. Any vreg
-  touching an opaque raw-slot site (a float op, address-of, atomic, memcpy,
-  store-address, va_start, a struct/float call arg, or inline asm — or live
-  across an asm) stays in memory.
+  touching an opaque raw-slot site (a float op, address-of, atomic, va_start, a
+  struct/float call arg, or inline asm — or live across an asm) stays in memory.
+  Store and `memcpy`/`memzero` addresses are allocated too; non-leaf functions
+  additionally get the caller-saved `r10`/`r11` for values that do not cross a
+  call, and `r8`/`r9` join the pool with call arguments set up by a parallel
+  move. Values are materialised straight into their home register — constants,
+  addresses, loads, widening loads, comparison booleans — rather than detouring
+  through `rax`.
 
 ## Target details
 

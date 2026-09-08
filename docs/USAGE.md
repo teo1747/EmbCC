@@ -61,7 +61,7 @@ embcc -c kernel/mm/pmm.c -Ikernel -mno-sse -mno-sse2 -mno-red-zone -O2 -o pmm.o
 ## `embld` — the linker
 
 ```
-usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR] INPUT.o ...
+usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR] [--lma-offset N] INPUT.o|INPUT.a ...
        embld --embx --cap NAME [--cap NAME]... -o OUT.embx INPUT.o ...
 ```
 
@@ -70,8 +70,15 @@ usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR] INPUT.o ...
 | `-o OUT` | Output path. |
 | `-e ENTRY` | Entry-point symbol (e.g. `_start`). |
 | `-Ttext ADDR` | Base virtual address of `.text` (e.g. the higher-half kernel base). |
+| `--lma-offset N` | Subtract `N` from each segment's vaddr to get its load address (`p_paddr`) — how a higher-half kernel is loaded low and run high. |
 | `--embx` | Emit an **EMBX** binary (the OS's native capability-declaring format) instead of a plain ELF. |
 | `--cap NAME` | Declare a capability the EMBX binary requires (repeatable). Names match the OS cap set: `filesystem`, `network`, `gpu`, `audio`, `camera`, `usb`, `serial`, `rawdisk`, `kernel_ext`. The kernel enforces the declared set ⊆ the grantor's at load. |
+
+**Linker-defined symbols** are provided automatically when referenced and
+otherwise undefined, so no linker script is needed: `kernel_end`, `_end`, `end`,
+`__bss_end`, `__kernel_end` (the vaddr past the last `.bss` byte), and the
+`__init_array_start`/`_end`, `__fini_array_*`, `__ctors_*`, `__dtors_*` bracket
+family. A real definition always wins.
 
 ### Examples
 
@@ -100,14 +107,50 @@ The OS side of this — where the ABI lives (`/system/abi`), how apps declare th
 namespace, and how the build is driven — is documented in the OS repo:
 `myos/docs/TOOLCHAIN.md` (building for/on the OS) and `myos/docs/BUILD.md`.
 
-## Roadmap-gated invocations (not yet live)
+## `embas` — the assembler
 
-These are tracked in [todo.md](todo.md) and will error today:
+```
+usage: embas [-f elf64] [-o OUT] INPUT.asm
+```
 
-- **`embcc --asm FILE.asm`** — a standalone assembler front-end (todo **A1**), to
-  drop `nasm` from the build. In progress; not yet accepted.
-- **`embld -T SCRIPT.ld`** — linker-script / symbol-assignment support (todo
-  **L1**, e.g. `kernel_end = .`), so the kernel links with no external tools and
-  no diagnostic stub.
+NASM/Intel syntax. The same code runs when you hand `embcc -c` a `.asm` file, so
+either entry point works:
 
-Run `embcc` or `embld` with no arguments to see the current usage line.
+```sh
+embas -f elf64 boot.asm -o boot.o
+embcc -c boot.asm -o boot.o          # equivalent
+```
+
+Its correctness bar is byte-identity with `nasm -f elf64`, met on all six of the
+kernel's hand-written `.asm`. `-f bin` (flat binary, for the 16/32-bit boot
+stages) is **not** implemented and reports an error rather than miscompiling.
+
+## `embdbg` — reading the debug info back
+
+Compile with `-g`, then:
+
+```sh
+embcc -c foo.c -g -o foo.o
+embld -o foo.elf crt0.o foo.o libc.a
+embdbg foo.elf funcs                 # list functions + ranges
+embdbg foo.elf line 0x401234         # address -> func:file:line
+```
+
+`embdbg FILE` with no subcommand prints the full command list (symbolize,
+inspect locals, disassemble, and a small TUI). It reads the DWARF-4 EmbCC emits
+— no gdb in the loop. See [EMBDBG_Requirements.md](EMBDBG_Requirements.md).
+
+## What is not there
+
+Refused loudly rather than faked, per THE RULE:
+
+- **`embas -f bin`** — flat-binary output; the boot stages still use nasm.
+- **`embld -T SCRIPT.ld`** — full linker scripts. Not needed so far: the
+  end-of-image and bracket symbols above are auto-provided, which is what let
+  the kernel link without one.
+- **VLAs, `_Complex`, 80-bit `long double`** — the remaining C gaps, ranked
+  against a real corpus in [todo.md](todo.md).
+- **C++, `__thread`/TLS, PIE/PIC output** — out of scope by decision
+  (ARCHITECTURE §8, DECISIONS D-008).
+
+Run `embcc`, `embas` or `embld` with no arguments for the current usage line.

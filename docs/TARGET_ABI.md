@@ -15,7 +15,8 @@ LP64, no PIE, no `ld.so`.
 porting foreign source (git/CPython/C++). That target is not going away — it is
 how the OS meets the existing software world.
 
-The **native** target, which EmbCC grows into (DECISIONS D-003, D-009), is:
+The **native** target — reached, and emitted by the toolchain today (DECISIONS
+D-003 revised, D-009; `embld --embx --cap NAME`) — is:
 - **format:** **EMBX** — `myos/docs/EMBX_Specification_v2.md`, byte-exact, with
   a working in-kernel loader. Same SysV/LP64/no-PIE code inside; a different,
   capability-carrying container around it. An EMBX APP is fully linked (no

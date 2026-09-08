@@ -1,38 +1,44 @@
 # EmbCC — a native C compiler for EmbLinkOS
 
-**Status: M3 closed and well past it — EmbCC compiles *itself* (self-hosting
-fixed point holds), and the whole EmbLinkOS **kernel** compiles under EmbCC,
-links with **EmbLD**, and boots to the home desktop with no gcc and no `ld` in
-the loop.** The decision record below still governs. `embcc -c` compiles a
-substantial C subset — the integer types, floats, pointers (incl. function
-pointers), arrays, structs/unions/enums, bitfields, globals, the full operator
-set, GNU/GCC extensions the kernel needs (statement expressions, `__attribute__`,
-`__builtin_*`, a real inline-asm assembler), and a preprocessor that digests
-**real newlib headers** (`#include <stdio.h>` compiles, links and runs) — to
-genuine x86_64-elf relocatable objects, cross-checked against gcc on every test.
-It has an optimizer (`-O1`/`-O2`: folding, strength reduction, CSE, register
-allocation, stack-slot coalescing) and DWARF debug info (`-g`). `embread` dumps
-and verifies EMBX images; **EmbLD** links. `embcc -c foo.asm` (and the standalone
-**`embas`**) assemble the kernel's hand-written NASM/Intel `.asm` — all 6 kernel
-ELF objects come out **byte-identical to nasm**, so the last external tool drops
-for the kernel's own objects (see `docs/todo.md`, A1).
+**Status: the toolchain is real and builds the OS.** EmbCC compiles *itself*
+(the self-hosting fixed point holds over all 16 sources), and the entire
+EmbLinkOS **kernel** — 89 C translation units through `embcc`, 6 hand-written
+`.asm` through `embas`, linked by `embld` — builds and **boots to the home
+desktop** with no gcc, no nasm and no `ld` anywhere in the loop.
 
-EmbCC is the intended *native* C compiler for **EmbLinkOS** — a compiler written
-for, and eventually *by*, the OS itself. It is the next ring of ownership after
-the kernel, the filesystem, the shell, and the build tool: the point at which
-even the toolchain that produces the OS's programs belongs to the OS.
+`embcc -c` compiles C to genuine x86_64-elf relocatable objects, cross-checked
+against gcc on every test: the integer and floating types, pointers (incl.
+function pointers), arrays, structs/unions/enums, bitfields, globals, the full
+operator and statement set, C11 (`_Alignof`/`_Alignas`/`_Atomic`/`_Generic`/
+`_Static_assert`), and the GNU extensions the kernel needs — statement
+expressions, computed `goto`, `typeof`, `__attribute__`, `__builtin_*`, and a
+real inline-asm assembler. Its preprocessor digests **real newlib headers**, so
+`#include <stdio.h>` compiles, links and runs.
 
-## This is not today's compiler
+It has a genuine optimizer (`-O1`/`-O2`: SSA mem2reg, inlining, SCCP,
+dominator-scoped global CSE, redundant-load elimination, strength reduction, and
+a Chaitin-Briggs register allocator), clang-style caret diagnostics, and DWARF-4
+debug info (`-g`) that our own **EmbDBG** reads back. **EmbLD** links, emitting
+ET_EXEC ELF and the native **EMBX**; `embread` verifies EMBX images; **EmbAS**
+assembles NASM/Intel source byte-identically to nasm.
 
-EmbLinkOS already hosts **TCC** (with four local patches) and builds real C on
-itself: static tools, the shell rebuilding the shell, EmbBuild rebuilding
-EmbBuild. TCC + ELF work, ship, and are not going anywhere soon.
+`make test` is **102/102**. The decision record below still governs.
 
-EmbCC is deliberately a **separate, parallel project** so the OS stays honest
-and shippable while the compiler grows on its own clock — until it is genuinely
-good enough to earn adoption. That is exactly how TCC and EmbBuild arrived:
-prove the thing standalone, adopt when it is real. Adoption, when it comes, is a
-one-line change in an EmbBuild manifest.
+## Where it stands next to TCC
+
+EmbLinkOS also hosts **TCC** (with four local patches), and TCC remains what the
+OS ships by default: it works, it builds real C on the metal, and nothing is
+being ripped out on a schedule.
+
+What has changed is that EmbCC is no longer the speculative half of that pair.
+It clears walls TCC does not — it compiles the **kernel**, it emits the native
+**EMBX** format with a declared capability table, it produces debug info, and it
+optimizes. Adoption remains what it always was: a one-line change in an EmbBuild
+manifest, made when a concrete need makes it the better tool (DECISIONS D-006),
+not because we wrote it.
+
+EmbCC still develops in its own repository on its own clock (D-001), so the OS
+stays shippable and honest while the compiler moves.
 
 ## Why it exists
 
@@ -53,43 +59,74 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 
 ## The shape of the plan
 
-- **A C compiler first, not a new language.** Compiling a subset of C to the
-  EmbLink ABI makes every increment testable *on the OS* the day it can emit a
-  valid object. A language of its own is a possible future, not the opening move.
-- **Emit ELF today; grow into EMBX + emlibc.** The *current* target is ELF
-  linked against newlib — the shape the in-kernel loader binds (there is no
-  `ld.so`; **the kernel is the linker**), and the substrate for porting foreign
-  source. The *native* target EmbCC grows into (DECISIONS D-003/D-009) is
-  **EMBX**, EmbLinkOS's own capability-carrying format
+- **A C compiler, not a new language.** Compiling C to the EmbLink ABI made
+  every increment testable *on the OS* from the day it could emit a valid
+  object. A language of our own is not planned (D-008); C++ is the one intended
+  second language.
+- **Both ELF and EMBX, today.** ELF linked against newlib is the shape the
+  in-kernel loader binds (there is no `ld.so`; **the kernel is the linker**) and
+  the substrate for porting foreign source. The *native* target (DECISIONS
+  D-003/D-009) is **EMBX**, EmbLinkOS's own capability-carrying format
   (`myos/docs/EMBX_Specification_v2.md`, byte-exact, working loader), linked
   against **emlibc**, the OS's own non-POSIX libc
   (`myos/docs/EMLIBC_Requirements.md`). ELF stays as the porting lane — a dual
   *loader*, not a converter, mirroring EMBKFS-native-plus-FAT32 for disks. The
   earlier "ELF superset only" plan was **revised** once the capability model
   landed and the OS's author chose to own the format; D-003 records why.
-- **The milestones are loops.** EmbCC compiles a program the OS runs (exit 42);
-  then EmbCC compiles *itself*; then EmbBuild builds EmbCC from `/data/src` on
-  the OS. Each is the self-hosting loop, one ring deeper.
+- **The milestones are loops.** EmbCC compiles a program the OS runs (exit 42
+  — M1, closed); then EmbCC compiles *itself* (M3, closed); then EmbBuild builds
+  EmbCC from `/data/src` on the OS (M4 — the manifest exists and builds it on
+  the host; running it on the metal is the open step). Each is the self-hosting
+  loop, one ring deeper.
 
 ## Documents
 
 | Doc | What it is |
 |---|---|
 | [docs/VISION.md](docs/VISION.md) | Why a native compiler; the ownership thesis; the own-the-stack vs host-the-world tension |
-| [docs/VISION_LONGTERM.md](docs/VISION_LONGTERM.md) | The post-M4 horizon: compiler infrastructure, tooling, deeper analysis — gated by D-006. (Basic optimization has since landed; see `src/opt` + `src/codegen`.) |
+| [docs/VISION_LONGTERM.md](docs/VISION_LONGTERM.md) | The horizon past the named milestones: C++, deeper analysis, compiler services — gated by D-006. Optimization and diagnostics have since landed off this list; see `src/opt`, `src/codegen`, `src/driver/util.c` |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Decisions already made, each with its rationale (ADR-style) |
 | [docs/TARGET_ABI.md](docs/TARGET_ABI.md) | **The grounding doc.** The exact EmbLinkOS contract EmbCC must emit — syscalls, crt0, and the precise ELF the in-kernel loader accepts |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M0–M4, each with a concrete acceptance test |
-| [docs/WORKPLAN.md](docs/WORKPLAN.md) | The team's three parallel streams (core, linker, proving ground) and the process that keeps them off each other's critical path |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M0–M4, each with a concrete acceptance test, and what is open past them |
+| [docs/USAGE.md](docs/USAGE.md) | The `embcc`/`embas`/`embld`/`embdbg` CLI reference |
+| [docs/todo.md](docs/todo.md) | The evidence-backed completeness audit: what C we do not yet compile, ranked by a real corpus |
+| [docs/WORKPLAN.md](docs/WORKPLAN.md) | The team's three streams (core, linker, proving ground), what each is working on now, and the process that keeps them off each other's critical path |
 | [docs/EMBDBG_Requirements.md](docs/EMBDBG_Requirements.md) | Producer-side debug-info requirements + the DWARF-bridge decision (D-010); the byte format & kernel contract live OS-side in `myos/docs/EMBDBG_Specification.md` |
-| [src/embx/embx.h](src/embx/embx.h) | The EMBX container, byte-exact — mirrors the kernel's loader header; read by `embread`, to be written by the linker |
+| [src/embx/embx.h](src/embx/embx.h) | The EMBX container, byte-exact — mirrors the kernel's loader header; written by EmbLD, read by `embread` |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The discipline inherited from EmbLinkOS (prove on the host, selftest the invariant, THE RULE) |
 
-## When work starts
+## Where to start reading
 
-Read [docs/ROADMAP.md](docs/ROADMAP.md) **M0** first. The first milestone emits an
-ELF object for the EmbLink target and runs it on the OS; the compiler then grows
-*backward* from that testable end rather than forward from a lexer. The reason is
-in [CONTRIBUTING.md](CONTRIBUTING.md): in this project a thing is not done because
-it compiles, it is done when a test exercises the invariant.
+For the *why*, read [docs/VISION.md](docs/VISION.md), then
+[docs/DECISIONS.md](docs/DECISIONS.md) — the arguments are settled there, with
+their reopen conditions.
+
+For the *how*, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the phase
+structure, then [docs/TARGET_ABI.md](docs/TARGET_ABI.md), which is the grounding
+doc: the exact contract the OS enforces, and the expensive facts that cost a
+debugging session each.
+
+To build and run it:
+
+```sh
+make && make embdbg     # embdbg is not in `all`, and the golden tests need it
+make test               # 102/102
+```
+
+Then [docs/USAGE.md](docs/USAGE.md) for the CLI.
+
+## What's next
+
+- **M4's OS half** — ship the source and `build.ebm` to `/data/src/embcc/`, run
+  the OS's own EmbBuild on it, and have that on-OS-built EmbCC compile the M1
+  program to exit 42. The manifest and a host reference walker already exist;
+  what remains is orchestration on the metal. This is the total loop, and the
+  last named milestone.
+- **The kernel, through EmbBuild on the OS** — the same step for the bigger
+  prize; the two blockers (an on-OS assembler, `kernel_end`) are closed.
+- **The C gaps that remain** — VLA, `_Complex`, 80-bit `long double`. Each is
+  refused loudly today rather than miscompiled; `docs/todo.md` ranks them
+  against a real corpus.
+- **Past that, only if earned** (D-006): C++ as the second language (D-008),
+  `__thread`/TLS, and dynamic-linking output. Candidates, not commitments.

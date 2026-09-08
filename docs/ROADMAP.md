@@ -5,20 +5,46 @@ a thing is not done when it compiles — it is done when a test exercises the
 invariant. Milestones are ordered by what they *prove*, not by how much code
 they contain.*
 
-**Current position (2026-07-26): M3 closed, and the compiler has grown well
-past it — it emits the native format, builds the OS's own libc (floating point
-included), and gained an optimizer.** The one *named* milestone still open is M4
-(EmbBuild builds EmbCC); everything below it in this file has landed, and a good
-deal the original milestones did not anticipate landed alongside.
+**Current position (2026-09-08): M0–M3 closed; M4's host half done, its OS half
+the one named milestone still open.** Past the milestones the compiler has grown
+a real optimizer, caret diagnostics, debug info with its own debugger, a
+standalone assembler — and, the result none of the milestones named, **it builds
+and boots the EmbLinkOS kernel with no gcc, no nasm and no `ld` in the loop**
+(89 C units via `embcc`, 6 `.asm` via `embas`, linked by `embld`, booting to the
+desktop behaviourally identical to the gcc build).
 
 **Since M3 — the axes the milestones did not name:**
 
-- **The fixed point still holds, now over fifteen sources.** The optimizer
-  (`src/opt/opt.c`) joined the compiler, so the self-host source set grew 12 →
-  15; `test embcc self` is **15/15 byte-identical on the OS**, opt included.
+- **The toolchain owns the whole kernel build.** **EmbAS** (`src/as`, `embas`)
+  assembles the kernel's hand-written NASM/Intel `.asm` **byte-identically to
+  nasm** — code, symbols and relocations — and EmbLD's linker-defined end
+  symbols and higher-half LMA (`p_paddr`) removed the last need for a linker
+  script. That closed the final external dependency for the kernel's own
+  objects.
+- **A real optimizer, verified against a booting kernel.** `-O2` carries SSA
+  mem2reg (dominance frontiers, phi insertion, renaming, out-of-SSA), function
+  inlining, SCCP, dominator-scoped global CSE, redundant-load elimination and a
+  Chaitin-Briggs register allocator. `-O0`, `-O1` and `-O2` kernels all boot.
+  `.text` came from 2.81× down to 1.63× gcc `-O0`; the kernel image from 1.49 MB
+  to 1.09 MB. Three silent miscompiles were found and fixed on the way, and the
+  one the test suite could not see (stale `var_scope` after DCE) is why every
+  optimizing compile now runs an IR verifier (`EMBCC_VERIFY=1`).
+- **Debug info, and our own debugger.** `embcc -g` emits DWARF-4 line, frame and
+  local info; **EmbDBG** (`tools/embdbg/`) reads it back — symbolize, backtrace,
+  disassemble, inspect locals, analyze a kernel crash dump, a TUI — with no gdb
+  in the loop. Aggregate type DIEs are the remaining producer gap.
+- **Diagnostics a human can act on.** clang-style carets with real columns, for
+  semantic errors as well as syntax, across `#include`s: colour, span
+  underlines, "did you mean?", and notes for previous declarations and macro
+  expansions.
+
+- **The fixed point still holds, now over sixteen sources.** The optimizer
+  (`src/opt/opt.c`), the DWARF emitter (`src/debug/dwarf.c`) and the assembler
+  (`src/as/as.c`) each joined the compiler, so the self-host source set grew
+  12 → 16; `test embcc self` is **16/16 byte-identical on the OS**.
 - **EmbLD runs on the OS, and closes the loop *with the link*.** Cross-built into
   an EmbLinkOS binary (`embld.elf`), it makes `test embcc selfhost` have the OS
-  compile all fifteen sources **and relink them** into a working `embcc`,
+  compile all sixteen sources **and relink them** into a working `embcc`,
   byte-identical to the host build — no cross-`ld`, no tcc in the loop. (M3
   proved object determinism; this proves the whole bootstrap on the metal.)
 - **The native format is emitted by the toolchain.** EmbLD emits **EMBX**
@@ -67,7 +93,7 @@ stay OS-side.
 
 ---
 
-**M3 — how it closed (2026-07-24; twelve sources at the time, fifteen now):**
+**M3 — how it closed (2026-07-24; twelve sources at the time, sixteen now):**
 The self-built compiler (`embcc.elf`,
 itself compiled by EmbCC and linked by EmbLD) was staged to EmbLinkOS and,
 under the kernel `test embcc self` oracle, **recompiled all twelve of its
@@ -283,8 +309,12 @@ the OS's programs.
 These are candidates, not commitments, and each needs a stated reason
 (DECISIONS D-006):
 
-- **Codegen quality** — *started*: an optimizer (`src/opt/opt.c`) is in the
-  pipeline and rides through the self-host fixed point (15/15).
+- **Codegen quality** — *substantially done, and open-ended*: `src/opt` runs
+  local and global passes including SSA mem2reg, inlining, SCCP and global CSE;
+  `src/codegen` carries Chaitin-Briggs register allocation. `-O2` `.text` is at
+  1.63× gcc `-O0`, down from 2.81×. It rides through the self-host fixed point
+  (16/16) because `-O0` output is byte-identical by construction. The remaining
+  headroom is real but no longer blocking anything.
 - **`__thread`/TLS** — a real TCC wall; needs `PT_TLS` and the OS's
   `set_fs_base` contract
 - **Dynamic linking output** — would let EmbCC build EmUI/GUI apps
@@ -301,7 +331,16 @@ These are candidates, not commitments, and each needs a stated reason
 
 ## The honest expectation
 
+*Written before M1, kept because it turned out to be right about the shape.*
+
 M1 is reachable in a focused stretch. M2 is where most compilers stall, because
 real headers are unforgiving. M3 is a genuine achievement. M4 is the one worth
 telling people about — and none of it is on a schedule, because EmbLinkOS is the
 parent project and wins any contest for attention (VISION §5).
+
+*(2026-09-08.) M2 was indeed the long grind, and real headers were indeed what
+made it long. M3 closed on the OS and has held through every change since. What
+the estimate did not anticipate is that the work past M3 — the optimizer, the
+assembler, the debugger, and the kernel build — would add up to more than the
+milestones themselves. M4's remaining half is orchestration on the metal, and
+the schedule note still applies: it is not on one.*

@@ -5,7 +5,8 @@
  * fork/exec); this binary exists for host-side development and testing,
  * the way `embread` gives the ELF writer a testable front door.
  *
- * usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR] INPUT.o ...
+ * usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR]
+ *              [--embx [--cap NAME]...] INPUT.o|INPUT.a ...
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,7 +59,8 @@ int main(int argc, char **argv)
         }
     }
     if (!ninputs) {
-        fprintf(stderr, "usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR] INPUT.o ...\n");
+        fprintf(stderr, "usage: embld [-o OUT] [-e ENTRY] [-Ttext ADDR]\n"
+                        "             [--embx [--cap NAME]...] INPUT.o|INPUT.a ...\n");
         return 2;
     }
     return embld_link(inputs, ninputs, out, &opts);
