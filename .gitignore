@@ -24,3 +24,6 @@ compile_commands.json
 *.swp
 .DS_Store
 ref/
+
+# Debug bundles the macOS toolchain leaves beside each -g binary.
+*.dSYM/

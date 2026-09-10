@@ -2100,21 +2100,24 @@ static void gen_func(struct ir_func *fn, struct code *text,
              * not an argument register, and free until the al count below. */
             int mvdest[16], mvsrc[16], nmv = 0;
             {
-                int pireg = ireg, pfreg = freg;
+                /* Only the INTEGER argument registers are walked here: a
+                 * float argument is never register-resident (g_loc leaves
+                 * it in memory), so the xmm index cannot source a move. */
+                int pireg = ireg;
                 for (int k = 0; k < i->nargs; k++) {
                     struct ir_arg *a = &i->argv[k];
                     if (a->on_stack)
                         continue;
                     if (a->is_struct) {
                         for (int q = 0; q < a->nclass; q++)
-                            if (a->cls[q] == CLASS_SSE) pfreg++; else pireg++;
-                    } else if (a->cls[0] == CLASS_SSE) {
-                        pfreg++;
-                    } else if (in_reg(a->vreg)) {
-                        mvdest[nmv] = x86_argreg(pireg++);
-                        mvsrc[nmv] = g_loc[a->vreg]; nmv++;
-                    } else {
-                        pireg++;
+                            if (a->cls[q] != CLASS_SSE) pireg++;
+                    } else if (a->cls[0] != CLASS_SSE) {
+                        if (in_reg(a->vreg)) {
+                            mvdest[nmv] = x86_argreg(pireg++);
+                            mvsrc[nmv] = g_loc[a->vreg]; nmv++;
+                        } else {
+                            pireg++;
+                        }
                     }
                 }
                 if (i->indirect && in_reg(i->a)) {
