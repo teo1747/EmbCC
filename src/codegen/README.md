@@ -52,3 +52,34 @@ across changes, which is what keeps the self-hosting fixed point stable):
 
 Inline asm carrying explicit register constraints is assembled in `../ir` (see
 its README); its operands reach codegen already bound to fixed registers.
+
+## The aarch64 backend
+
+`codegen_arm64.c` is the second backend — IR → AArch64, AAPCS64 (D-011). It
+is a peer of `codegen.c`, not a layer over it: same signature, same site
+lists, so the driver picks one on `--target=` and nothing downstream knows
+which machine produced the image.
+
+It is deliberately at the stage `codegen.c` began at — every vreg in a stack
+slot, every operation through `x9` (with `x10` for a second operand, `x11`/`x12`
+for addresses, `v16`/`v17` for floats). None of the quality passes above are
+shared yet, because all of them are x86-shaped in their current form; D-011
+records when that should change and why not yet.
+
+Two things differ from the x86 backend by necessity rather than by stage:
+
+- **Slots are `[sp, #off]` with a non-negative offset**, not `[rbp-N]`. The
+  scaled 12-bit unsigned-offset load reaches 32 KiB from `sp`; the signed form
+  reaches ±256 from `x29`. Frame-slot access is one instruction because of
+  that choice.
+
+- **Argument placement is recomputed to AAPCS64**, ignoring `ir_arg`'s
+  `on_stack`/`stk_off`, which irgen fills in with the SysV classification.
+  Eight integer argument registers rather than six, floats on their own NSRN
+  counter, composites of 16 bytes or fewer in consecutive `x` registers and
+  anything larger by value on the stack, and no back-filling once an argument
+  has gone to the stack (AAPCS64 rule C.11). The outgoing area is sized from
+  those rules too, not from `fn->outgoing_bytes`.
+
+Refused loudly rather than emitted wrong: inline asm, `va_start`, the atomics,
+HFA struct arguments, and `-g`. See the README table for why each is real work.

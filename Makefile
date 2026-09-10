@@ -22,11 +22,16 @@ SRCS := \
 	src/as/as.c \
 	src/opt/opt.c \
 	src/codegen/codegen.c \
+	src/codegen/codegen_arm64.c \
 	src/debug/dwarf.c \
 	src/asm/emit.c \
+	src/asm/emit_arm64.c \
 	src/asm/topasm.c \
-	src/cpp/predef.c \
+	src/cpp/predef_x86_64.c \
+	src/cpp/predef_aarch64.c \
+	src/cpp/predef_select.c \
 	src/cpp/cpp.c \
+	src/target/target.c \
 	src/elf/write.c
 
 OBJS := $(SRCS:src/%.c=$(BUILD)/%.o)
@@ -81,7 +86,13 @@ $(OBJS): $(wildcard src/*/*.h)
 test: embcc embread embld embdbg
 	tests/run.sh
 
+# The aarch64 suite: compile for the second architecture and RUN the result
+# under qemu-system-aarch64 (tests/harness/aarch64). Separate from `test`
+# because it needs the cross newlib and QEMU, which `test` does not.
+test-arm64: embcc
+	tests/run.sh --target=aarch64-elf
+
 clean:
 	rm -rf $(BUILD) embcc embread embld embdbg embas
 
-.PHONY: all test clean
+.PHONY: all test test-arm64 clean

@@ -3,7 +3,7 @@
 
 #include "predef.h"
 
-const struct predef_macro predef_macros[] = {
+const struct predef_macro predef_macros_x86_64[] = {
     { "_LP64", "1" },
     { "__ATOMIC_ACQUIRE", "2" },
     { "__ATOMIC_ACQ_REL", "4" },
@@ -354,5 +354,5 @@ const struct predef_macro predef_macros[] = {
     { "__x86_64__", "1" },
 };
 
-const int predef_macro_count =
-    (int)(sizeof predef_macros / sizeof predef_macros[0]);
+const int predef_macro_count_x86_64 =
+    (int)(sizeof predef_macros_x86_64 / sizeof predef_macros_x86_64[0]);

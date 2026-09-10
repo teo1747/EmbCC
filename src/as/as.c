@@ -570,7 +570,7 @@ static int write_elf(struct as *a, const char *out){
     struct outrel *rels; int nrel;
     emit_bytes(a, sec, &rels, &nrel);
 
-    struct elfw *w = elfw_new();
+    struct elfw *w = elfw_new(EM_X86_64);
     int shndx[SEC_N]={0,0,0,0};
     /* Emit section headers in source-appearance order (nasm's convention), so
      * both the header table and the section symbols below match byte-for-byte. */

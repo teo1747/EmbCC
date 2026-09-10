@@ -102,6 +102,14 @@ typedef struct {
 #define R_X86_64_GOTPCRELX    41
 #define R_X86_64_REX_GOTPCRELX 42
 
+/* aarch64 (ELF for the Arm 64-bit Architecture, §4.6.3). Only the four
+ * EmbCC emits are named: a `bl`'s 26-bit branch, the adrp/add pair that
+ * materialises a symbol's address, and an absolute 64-bit data slot. */
+#define R_AARCH64_ABS64              257
+#define R_AARCH64_ADR_PREL_PG_HI21   275
+#define R_AARCH64_ADD_ABS_LO12_NC    277
+#define R_AARCH64_CALL26             283
+
 /* e_ident indices and values */
 #define EI_MAG0       0
 #define EI_MAG1       1
@@ -125,6 +133,7 @@ typedef struct {
 #define ET_EXEC       2
 
 #define EM_X86_64     62
+#define EM_AARCH64   183
 
 /* p_type */
 #define PT_NULL       0

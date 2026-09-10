@@ -64,15 +64,17 @@ struct elfw {
     struct buf shstrtab; /* section names */
     struct rela_group relagrp[ELFW_MAX_RELA];
     int nrelagrp;
+    int machine;         /* e_machine, fixed at elfw_new */
 };
 
-struct elfw *elfw_new(void)
+struct elfw *elfw_new(int machine)
 {
     struct elfw *w = calloc(1, sizeof *w);
     if (!w) {
         fprintf(stderr, "embcc: out of memory\n");
         exit(1);
     }
+    w->machine = machine;
     /* Index 0 is reserved in every table it manages. */
     w->nsec = 1; /* SHT_NULL section */
     strtab_add(&w->strtab, "");
@@ -247,7 +249,7 @@ int elfw_write(struct elfw *w, const char *path)
     eh.e_ident[EI_DATA] = ELFDATA2LSB;
     eh.e_ident[EI_VERSION] = EV_CURRENT;
     eh.e_type = ET_REL;
-    eh.e_machine = EM_X86_64;
+    eh.e_machine = (Elf64_Half)w->machine;
     eh.e_version = EV_CURRENT;
     eh.e_shoff = shoff;
     eh.e_ehsize = sizeof(Elf64_Ehdr);

@@ -3,6 +3,7 @@
 
 #include "../asm/emit.h"
 #include "../ir/ir.h"
+#include "../target/target.h"
 
 /* Calls to functions with no definition in this unit cannot be
  * resolved here — each becomes a relocation the driver hands to the
@@ -12,26 +13,28 @@ struct extcall {
     struct func *callee;  /* canonical, !has_defn */
 };
 
-/* String-address sites: lea rax,[rip+rel32] whose rel32 the linker
- * must point into .rodata — one R_X86_64_PC32 against the .rodata
- * section symbol per site (addend = str_off - 4). */
+/* String-address sites: the instruction field the linker must point into
+ * .rodata. One site on x86-64 (a RIP-relative lea's rel32); TWO on aarch64,
+ * where materialising an address takes an adrp/add pair — hence `kind`,
+ * which says which half of the address this site is. */
 struct strsite {
-    int patch_off;        /* offset of the rel32 field in .text */
+    int patch_off;        /* offset of the relocated instruction in .text */
     int str_off;          /* target offset inside .rodata */
+    enum reloc_kind kind;
 };
 
-/* Global-variable address sites: lea rax,[rip+rel32], one
- * R_X86_64_PC32 against the global's own symbol (addend -4). */
+/* Global-variable address sites, against the global's own symbol. */
 struct gsite {
     int patch_off;
     struct global *glob;
+    enum reloc_kind kind;
 };
 
-/* Function-address sites (&f / passing f): lea rax,[rip+rel32] with an
- * R_X86_64_PC32 against the function's symbol. */
+/* Function-address sites (&f / passing f), against the function's symbol. */
 struct fsite {
     int patch_off;
     struct func *target;
+    enum reloc_kind kind;
 };
 
 /* Lowers the unit to x86-64 into one .text image and fills each
@@ -47,5 +50,15 @@ void codegen_unit(struct ir_unit *iu, struct code *text,
                   struct gsite **gs, int *ngs,
                   struct fsite **fs, int *nfs, int want_debug, int optimize,
                   int no_sse, int regalloc);
+
+/* The same lowering for aarch64 (AAPCS64). Same signature, same site
+ * lists, so the driver picks one on --target= and nothing downstream
+ * knows which machine produced the image. */
+void codegen_unit_arm64(struct ir_unit *iu, struct code *text,
+                        struct extcall **ext, int *next,
+                        struct strsite **strs, int *nstrs,
+                        struct gsite **gs, int *ngs,
+                        struct fsite **fs, int *nfs, int want_debug,
+                        int optimize, int no_sse, int regalloc);
 
 #endif

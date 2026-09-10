@@ -1055,13 +1055,16 @@ static void process_file(struct cpp *cpp, const char *path,
     free(lineb.p);
 }
 
-/* Loads the 348-entry predefined table (generated at M0 from
- * x86_64-elf-gcc -dM -E). Function-like entries carry their parameter
- * list in the name: "__INT64_C(c)". */
+/* Loads the selected target's predefined table (tools/gen-predef.sh).
+ * Function-like entries carry their parameter list in the name:
+ * "__INT64_C(c)", and — since gcc 16's aarch64 set includes the SME
+ * attribute helpers — variadic ones like "__arm_in(...)". */
 static void load_predefined(struct cpp *cpp)
 {
-    for (int i = 0; i < predef_macro_count; i++) {
-        const char *name = predef_macros[i].name;
+    int predef_count;
+    const struct predef_macro *predefs = predef_table(&predef_count);
+    for (int i = 0; i < predef_count; i++) {
+        const char *name = predefs[i].name;
         const char *paren = strchr(name, '(');
         struct macro *m = xcalloc(1, sizeof *m);
         if (paren) {
@@ -1069,9 +1072,28 @@ static void load_predefined(struct cpp *cpp)
             m->is_func = 1;
             const char *p = paren + 1;
             while (*p && *p != ')') {
+                if (m->nparams >= MAX_MACRO_PARAMS) {
+                    fprintf(stderr, "embcc: internal error: predefined macro "
+                                    "'%s' has too many parameters\n", name);
+                    exit(1);
+                }
+                if (p[0] == '.' && p[1] == '.' && p[2] == '.') {
+                    m->is_varargs = 1;
+                    m->params[m->nparams++] = "__VA_ARGS__";
+                    p += 3;
+                    continue;
+                }
                 size_t n = 0;
                 while (is_idc(p[n]))
                     n++;
+                if (n == 0) {
+                    /* Not an identifier and not '...': advancing is the only
+                     * thing that matters here — a zero-length token would
+                     * otherwise spin, filling params[] until it overran it
+                     * (which is exactly what gcc 16's "__arm_in(...)" did). */
+                    p++;
+                    continue;
+                }
                 m->params[m->nparams++] = xstrndup(p, n);
                 p += n;
                 if (*p == ',')
@@ -1080,7 +1102,7 @@ static void load_predefined(struct cpp *cpp)
         } else {
             m->name = name;
         }
-        m->body = predef_macros[i].value;
+        m->body = predefs[i].value;
         m->builtin = 1;
         m->next = cpp->macros;
         cpp->macros = m;

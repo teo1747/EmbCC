@@ -6,6 +6,13 @@ EmbLinkOS **kernel** — 89 C translation units through `embcc`, 6 hand-written
 `.asm` through `embas`, linked by `embld` — builds and **boots to the home
 desktop** with no gcc, no nasm and no `ld` anywhere in the loop.
 
+**EmbCC now emits for two machines.** EmbLinkOS became two architectures when
+its aarch64 campaign closed (`myos/docs/ARM64.md`), and `--target=aarch64-elf`
+answers it: one binary, two backends, chosen at run time (D-011). **60 of the
+68 executable tests compile for aarch64 and RUN on it** under
+`qemu-system-aarch64`. The eight that do not are refused loudly, not
+miscompiled — see "Where aarch64 stands" below.
+
 `embcc -c` compiles C to genuine x86_64-elf relocatable objects, cross-checked
 against gcc on every test: the integer and floating types, pointers (incl.
 function pointers), arrays, structs/unions/enums, bitfields, globals, the full
@@ -22,7 +29,17 @@ debug info (`-g`) that our own **EmbDBG** reads back. **EmbLD** links, emitting
 ET_EXEC ELF and the native **EMBX**; `embread` verifies EMBX images; **EmbAS**
 assembles NASM/Intel source byte-identically to nasm.
 
-`make test` is **102/102**. The decision record below still governs.
+The decision record below still governs.
+
+**On test counts, honestly.** `make test` was 102/102 on the Linux x86-64 host
+it was written on, where the host *was* the target: a test compiled with
+`embcc`, linked with the host `cc`, and ran. On the Apple Silicon development
+machine that is no longer true — x86-64 ELF objects neither link nor run there
+— so `make test` reports **20/103**, and the 83 that fail all fail at
+`ld: unknown file type`, not at anything EmbCC emitted. `make test-arm64` is
+**60/68** and is currently the only suite on that machine that actually
+executes compiled code; restoring the x86-64 half needs the same
+QEMU treatment (see "What's next").
 
 ## Where it stands next to TCC
 
@@ -90,6 +107,7 @@ Both are legitimate; EmbCC is the second, entered with eyes open. See
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Intended compiler structure and phases |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M0–M4, each with a concrete acceptance test, and what is open past them |
 | [docs/USAGE.md](docs/USAGE.md) | The `embcc`/`embas`/`embld`/`embdbg` CLI reference |
+| [tests/harness/](tests/harness/) | The aarch64 proving ground: a bare-metal QEMU `virt` image with an ARM-semihosting syscall floor, so compiled code is RUN on the architecture it was compiled for |
 | [docs/todo.md](docs/todo.md) | The evidence-backed completeness audit: what C we do not yet compile, ranked by a real corpus |
 | [docs/WORKPLAN.md](docs/WORKPLAN.md) | The team's three streams (core, linker, proving ground), what each is working on now, and the process that keeps them off each other's critical path |
 | [docs/EMBDBG_Requirements.md](docs/EMBDBG_Requirements.md) | Producer-side debug-info requirements + the DWARF-bridge decision (D-010); the byte format & kernel contract live OS-side in `myos/docs/EMBDBG_Specification.md` |
@@ -111,13 +129,54 @@ To build and run it:
 
 ```sh
 make && make embdbg     # embdbg is not in `all`, and the golden tests need it
-make test               # 102/102
+make test               # x86-64: needs a Linux x86-64 host to run the exec half
+make test-arm64         # aarch64: compiles AND runs, under qemu-system-aarch64
 ```
+
+`make test-arm64` needs `aarch64-elf-gcc`, `qemu-system-aarch64`, and an
+aarch64 newlib (`EMBCC_AARCH64_NEWLIB`, default `~/cross/newlib-aarch64-c99`).
+It links each test into a bare-metal image and runs it on QEMU's `virt`
+machine — the same machine EmbLinkOS itself targets — with ARM semihosting
+carrying stdout and the exit status back to the host. See
+[tests/harness/aarch64/](tests/harness/aarch64/).
 
 Then [docs/USAGE.md](docs/USAGE.md) for the CLI.
 
+## Where aarch64 stands
+
+Working, and proven by running it: the integer and floating types, pointers,
+arrays, structs and unions by value (AAPCS64 — including the composite-return
+rules and the hidden `x8` pointer), the full operator and statement set,
+globals, string literals, computed `goto`, and calls both direct and through
+function pointers. `--target=aarch64-elf` produces real `EM_AARCH64` ET_REL
+objects with `R_AARCH64_CALL26` / `ADR_PREL_PG_HI21` / `ADD_ABS_LO12_NC` /
+`ABS64` relocations that `aarch64-elf-ld` links against stock newlib.
+
+Refused loudly, each with a diagnostic naming what is missing (THE RULE):
+
+| Gap | Why it is not a small fix |
+|---|---|
+| Inline asm | EmbCC's assembler (`src/as`) is x86-64 NASM syntax. aarch64 needs its own, and the kernel's inline asm is the single biggest thing standing between this backend and compiling the ARM kernel. |
+| `va_start` | AAPCS64's `va_list` is a five-field struct over a register save area, not SysV's `__va_list_tag`. Calling a variadic function (`printf`) already works — defining one does not. |
+| Atomics | `__sync_*` lower to `ldxr`/`stxr` retry loops rather than a single locked instruction. |
+| HFA struct arguments | A struct of floats is passed in up to four `v` registers by a rule with no SysV counterpart, so irgen's classification cannot express it. |
+| `-g` | The DWARF emitter describes `rbp`-relative frame offsets; aarch64 slots are `sp`-relative. |
+
+The backend is also naive where the x86 one is not: no slot coalescing, no
+residency cache, no register allocator, so frames are wider and the code is
+longer. That is the same order the x86 backend was built in (D-005), not an
+oversight.
+
 ## What's next
 
+- **An aarch64 assembler**, and with it inline asm — the gate on compiling the
+  EmbLinkOS ARM kernel, which uses it throughout.
+- **The x86-64 exec suite, restored on a non-Linux host.** The aarch64 harness
+  (`tests/harness/`) shows the shape: a bare-metal image under
+  `qemu-system-x86_64` with `isa-debug-exit` where aarch64 uses semihosting.
+  Until then the x86-64 backend's regression cover on this machine is the
+  golden tests — `self-host.sh` and `embbuild-kernel.sh` above all, which do
+  compare real generated code.
 - **M4's OS half** — ship the source and `build.ebm` to `/data/src/embcc/`, run
   the OS's own EmbBuild on it, and have that on-OS-built EmbCC compile the M1
   program to exit 42. The manifest and a host reference walker already exist;

@@ -11,7 +11,7 @@ the loop — the pair compiled and linked the EmbLinkOS kernel to a booting desk
 ## `embcc` — the compiler
 
 ```
-usage: embcc [-E] -c FILE.c [-o FILE.o] [-I DIR]... [flags]
+usage: embcc [-E] -c FILE.c [-o FILE.o] [--target=TRIPLE] [-I DIR]... [flags]
        embcc --version | --dump-predef | --emit-empty-object FILE
 ```
 
@@ -29,6 +29,7 @@ usage: embcc [-E] -c FILE.c [-o FILE.o] [-I DIR]... [flags]
 
 | Flag | Meaning |
 |------|---------|
+| `--target=TRIPLE` | Which machine to emit for: `x86_64-elf` (default) or `aarch64-elf`. Fixed for the whole compile — it selects the backend, the predefined-macro set, `e_machine` and the relocation types together (D-011). Also accepted before `--version`/`--dump-predef`, which then describe that target. |
 | `-o FILE.o` | Output path (default: the input with `.o`). |
 | `-I DIR` | Add a header search directory (repeatable). |
 | `-isystem DIR` | Add a *system* header search directory (repeatable). |
@@ -57,6 +58,27 @@ embcc -E hello.c
 # kernel-grade: freestanding, SSE-off, no red zone, with include roots
 embcc -c kernel/mm/pmm.c -Ikernel -mno-sse -mno-sse2 -mno-red-zone -O2 -o pmm.o
 ```
+
+**Compiling for aarch64**
+
+```sh
+# an object for EmbLinkOS's second architecture
+embcc --target=aarch64-elf -c prog.c -o prog.o
+
+# what the target's headers say it is
+embcc --target=aarch64-elf --dump-predef | grep __aarch64__
+```
+
+The result is a real `EM_AARCH64` ET_REL object that `aarch64-elf-ld` links
+against stock newlib. `embld` does not read or write aarch64 objects yet, and
+`embas` assembles x86-64 NASM syntax only — so an aarch64 link goes through
+binutils for now. What the aarch64 backend refuses (inline asm, `va_start`,
+atomics, HFA arguments, `-g`) it refuses with a diagnostic naming the gap; the
+README's "Where aarch64 stands" table says why each is real work.
+
+To run what it produced, `make test-arm64` links each test into a bare-metal
+image and executes it under `qemu-system-aarch64 -M virt` — see
+`tests/harness/README.md`.
 
 ## `embld` — the linker
 

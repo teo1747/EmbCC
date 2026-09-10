@@ -384,3 +384,60 @@ one step plausibly worth pulling earlier.
 **Reopens if:** EmbDBG's real needs turn out not to fit a DWARF-derived model,
 or the kernel debugging contract (the open question that gates a native
 debugger, D-007) lands and dictates a shape.
+
+## D-011 — A second architecture: **aarch64**, as a peer backend, not a fork
+
+**Decided:** 2026-09-10. **Status:** landed for the C EmbLinkOS userland
+compiles; the kernel's needs (inline asm, atomics) are open.
+
+EmbLinkOS is two architectures now. `myos/docs/ARM64.md` closed its A0–A9
+campaign: the whole shared kernel links and runs on aarch64 under QEMU `virt`,
+four cores, the real syscall table, the full 52-program userland — built by
+`aarch64-elf-gcc`. A compiler whose whole reason to exist is that the OS
+should not need someone else's toolchain cannot answer "except on ARM".
+
+**The target is chosen at run time by `--target=`, not at build time.** One
+`embcc` binary emits for both machines. The alternative — two binaries, or a
+compile-time `#ifdef` — would have made the on-OS build (M4) pick an
+architecture when it was *built* rather than when it is *used*, which is
+exactly backwards for a compiler that is meant to be hosted on the OS it
+compiles for.
+
+**Only the phases that genuinely differ know about the target.** The lexer,
+parser and the bulk of sema are machine-neutral and stay that way; the seam is
+`src/target/` (a small enum plus a machine-neutral relocation *kind*), a second
+`src/asm/emit_arm64.c` and a second `src/codegen/codegen_arm64.c`. The
+relocation indirection is the part that had to be invented rather than copied:
+taking a symbol's address costs ONE relocation on x86-64 (a RIP-relative `lea`)
+and TWO on aarch64 (`adrp`/`add`), so codegen records a kind and the driver
+turns (kind, target) into an ELF type. Without that seam the driver would have
+had to know which machine it was writing for at every relocation site.
+
+**The AAPCS64 argument classification is recomputed in the backend, not read
+from the IR.** irgen fills `ir_arg` with the *SysV* classification, and the two
+ABIs disagree — eight integer argument registers against six, composites by
+value on the stack rather than by MEMORY class, no back-filling once an
+argument has gone to the stack. Reusing the SysV numbers would have been a
+silent miscompile of every call with more than six arguments. Recomputing is
+cheap; the IR keeps carrying the SysV fields for the x86 backend, and the
+aarch64 backend ignores them.
+
+**The naive backend was rebuilt, not shared.** `codegen_arm64.c` starts where
+`codegen.c` started: every vreg in a stack slot, every operation through one
+accumulator. Its slot coalescing, RAX residency cache and Chaitin-Briggs
+allocator are all x86-shaped in their current form, and D-005's "prove it
+first" applies to a second backend as much as it did to the first. What the
+two DO share is the IR, the optimizer, the ELF writer and the driver — which
+is the split that matters.
+
+**What is refused loudly rather than emitted wrong** (THE RULE): inline asm
+(EmbCC's assembler is x86-64 NASM syntax; an aarch64 assembler is its own
+piece of work), `va_start` (the AAPCS64 register save area and its five-field
+`va_list` are not built), the atomics (`ldxr`/`stxr` pairs), HFA struct
+arguments, and `-g`. Each fails with a diagnostic naming what is missing.
+
+**Reopen if:** the two backends start duplicating real algorithms — a register
+allocator written twice is the signal that the shared layer is in the wrong
+place, and the answer then is to lift the machine-independent half out of
+`codegen.c`, deriving the shared shape from two WORKING backends rather than
+inventing it from one (the discipline `myos` ARM64.md §2.3 used for the HAL).

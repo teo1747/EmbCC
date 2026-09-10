@@ -13,7 +13,11 @@
 
 struct elfw;
 
-struct elfw *elfw_new(void);
+/* `machine` is the ELF e_machine of the object being built (EM_X86_64 /
+ * EM_AARCH64). Passed in rather than read from a global so this writer
+ * stays a library: embas builds x86-64 objects with it while the compiler
+ * driver builds whatever --target= selected. */
+struct elfw *elfw_new(int machine);
 void elfw_free(struct elfw *w);
 
 /* Returns the section header index, for use as a symbol's st_shndx.
@@ -35,8 +39,9 @@ int elfw_add_symbol(struct elfw *w, const char *name, Elf64_Addr value,
 void elfw_add_rela(struct elfw *w, int target_ndx, Elf64_Addr offset,
                    int sym, int type, long addend);
 
-/* Writes the ET_REL/EM_X86_64 object. Returns 0, or -1 with a message on
- * stderr. Always emits .symtab/.strtab/.shstrtab after the user sections. */
+/* Writes the ET_REL object for the machine elfw_new was given. Returns 0,
+ * or -1 with a message on stderr. Always emits .symtab/.strtab/.shstrtab
+ * after the user sections. */
 int elfw_write(struct elfw *w, const char *path);
 
 #endif

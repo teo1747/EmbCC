@@ -1843,6 +1843,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             ss.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
                              : x86_lea_rax_rip(text);
             ss.str_off = i->label;  /* resolved to an offset below */
+            ss.kind = RK_PCREL32;
             PUSH(st->str, st->nstr, st->capstr, ss);
             if (!D) cg_store(text, sd, i->dst, 8);
             break;
@@ -1853,6 +1854,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             gs.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
                              : x86_lea_rax_rip(text);
             gs.glob = i->glob;
+            gs.kind = RK_PCREL32;
             PUSH(st->g, st->ng, st->capg, gs);
             if (!D) cg_store(text, sd, i->dst, 8);
             break;
@@ -1863,6 +1865,7 @@ static void gen_func(struct ir_func *fn, struct code *text,
             fs.patch_off = D ? x86_lea_reg_rip(text, g_loc[i->dst])
                              : x86_lea_rax_rip(text);
             fs.target = i->callee;
+            fs.kind = RK_PCREL32;
             PUSH(st->f, st->nf, st->capf, fs);
             if (!D) cg_store(text, sd, i->dst, 8);
             break;

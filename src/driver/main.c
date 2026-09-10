@@ -21,6 +21,7 @@
 #include "../opt/opt.h"
 #include "../parse/parse.h"
 #include "../sema/sema.h"
+#include "../target/target.h"
 #include "util.h"
 
 #define EMBCC_VERSION "1.0.0-m2.complete"
@@ -28,8 +29,8 @@
 static void print_version(void)
 {
     /* Honest: names what exists and what does not. */
-    printf("EmbCC %s — C compiler for EmbLinkOS, target x86_64-elf\n",
-           EMBCC_VERSION);
+    printf("EmbCC %s — C compiler for EmbLinkOS, target %s\n",
+           EMBCC_VERSION, target_triple(target_get()));
     printf("C subset: the integer types, pointers incl. function "
            "pointers, arrays, structs/unions/enums, typedef, ?:, the "
            "comma operator, string literals, globals, sizeof, casts, "
@@ -37,7 +38,7 @@ static void print_version(void)
            "by value (SysV); compile with -c — #include <stdio.h> works "
            "against real newlib headers.\n");
     printf("Preprocessor: #include (-I), #define incl. variadic/#/##, "
-           "conditionals, the x86_64-elf predefined set; -E to see it. "
+           "conditionals, the target's predefined set; -E to see it. "
            "No linker yet (M3) — link with the existing toolchain.\n");
 }
 
@@ -45,6 +46,7 @@ static void print_usage(FILE *out)
 {
     fprintf(out,
             "usage: embcc [-E] -c FILE.c|FILE.asm [-o FILE.o]\n"
+            "             [--target=x86_64-elf|aarch64-elf]\n"
             "             [-I DIR]... [-isystem DIR]... [-g] [-O0|-O1|-O2]\n"
             "             [-mno-sse] [-mno-red-zone] [-mcmodel=kernel] ...\n"
             "       embcc --version | --dump-predef"
@@ -53,9 +55,10 @@ static void print_usage(FILE *out)
 
 static void dump_predef(void)
 {
-    for (int i = 0; i < predef_macro_count; i++)
-        printf("#define %s %s\n",
-               predef_macros[i].name, predef_macros[i].value);
+    int n;
+    const struct predef_macro *tab = predef_table(&n);
+    for (int i = 0; i < n; i++)
+        printf("#define %s %s\n", tab[i].name, tab[i].value);
 }
 
 /* An empty but genuine relocatable object: the smallest output readelf,
@@ -63,7 +66,7 @@ static void dump_predef(void)
  * testable independently of the compiler. */
 static int emit_empty_object(const char *path)
 {
-    struct elfw *w = elfw_new();
+    struct elfw *w = elfw_new(target_elf_machine(target_get()));
     int text = elfw_add_section(w, ".text", SHT_PROGBITS,
                                 SHF_ALLOC | SHF_EXECINSTR, NULL, 0, 16);
     elfw_add_symbol(w, "empty.c", 0, 0,
@@ -151,6 +154,13 @@ static int compile(const char *in, const char *out, int pp_only)
      * its own template, not on code layout — and mark its call targets used.
      * The placement pass further down reuses these already-assembled bytes. */
     for (struct topasm *ta = u->topasm; ta; ta = ta->next) {
+        /* The built-in assembler is NASM/Intel x86-64 (src/as). There is no
+         * aarch64 assembler yet, so file-scope asm on that target must fail
+         * loudly rather than emit x86 bytes into an aarch64 image. */
+        if (target_get() == TARGET_AARCH64)
+            diag_fatal(in, 0,
+                       "file-scope asm is not supported for aarch64 yet — "
+                       "EmbCC's assembler is x86-64 NASM syntax");
         topasm_assemble(ta);
         for (int r = 0; r < ta->nrels; r++)
             for (struct func *f = u->funcs; f; f = f->next)
@@ -168,9 +178,15 @@ static int compile(const char *in, const char *out, int pp_only)
     struct gsite *gs;
     struct fsite *fs;
     int next, nstrs, ngs, nfs;
-    codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
-                 &fs, &nfs, want_debug, opt_level >= 1, no_sse,
-                 opt_level >= 2);
+    enum target_arch ta = target_get();
+    if (ta == TARGET_AARCH64)
+        codegen_unit_arm64(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
+                           &fs, &nfs, want_debug, opt_level >= 1, no_sse,
+                           opt_level >= 2);
+    else
+        codegen_unit(iu, &text, &ext, &next, &strs, &nstrs, &gs, &ngs,
+                     &fs, &nfs, want_debug, opt_level >= 1, no_sse,
+                     opt_level >= 2);
 
     /* Lay out the defined globals: initialized -> .data, zero -> .bss,
      * each aligned to its (element) size. */
@@ -257,7 +273,7 @@ static int compile(const char *in, const char *out, int pp_only)
     if (want_debug)
         dwarf_emit(iu, in, &dw);
 
-    struct elfw *w = elfw_new();
+    struct elfw *w = elfw_new(target_elf_machine(target_get()));
     int text_ndx = elfw_add_section(w, ".text", SHT_PROGBITS,
                                     SHF_ALLOC | SHF_EXECINSTR,
                                     text.p, (Elf64_Xword)text.len, 16);
@@ -369,7 +385,8 @@ static int compile(const char *in, const char *out, int pp_only)
                                               STT_NOTYPE),
                                 SHN_UNDEF);
         elfw_add_rela(w, text_ndx, (Elf64_Addr)ext[i].patch_off,
-                      callee->sym_ndx, R_X86_64_PLT32, -4);
+                      callee->sym_ndx, target_reloc_type(ta, RK_CALL),
+                      target_reloc_addend(ta, RK_CALL, 0));
     }
     free(ext);
 
@@ -398,15 +415,17 @@ static int compile(const char *in, const char *out, int pp_only)
      * addend = target offset - 4, because rel32 is measured from the
      * end of the instruction, four bytes past r_offset. */
     for (int i = 0; i < nstrs; i++)
-        elfw_add_rela(w, text_ndx, (Elf64_Addr)strs[i].patch_off,
-                      rodata_sym, R_X86_64_PC32, strs[i].str_off - 4);
+        elfw_add_rela(w, text_ndx, (Elf64_Addr)strs[i].patch_off, rodata_sym,
+                      target_reloc_type(ta, strs[i].kind),
+                      target_reloc_addend(ta, strs[i].kind, strs[i].str_off));
     free(strs);
 
     /* Global-variable addresses: PC32 against the global's own symbol
      * (defined or UNDEF alike — the linker fills in either way). */
     for (int i = 0; i < ngs; i++)
         elfw_add_rela(w, text_ndx, (Elf64_Addr)gs[i].patch_off,
-                      gs[i].glob->sym_ndx, R_X86_64_PC32, -4);
+                      gs[i].glob->sym_ndx, target_reloc_type(ta, gs[i].kind),
+                      target_reloc_addend(ta, gs[i].kind, 0));
     free(gs);
 
     /* Pointer slots in .data initialized by an address: an absolute 64-bit
@@ -439,7 +458,7 @@ static int compile(const char *in, const char *out, int pp_only)
             }
             elfw_add_rela(w, data_ndx,
                           (Elf64_Addr)(g->off + g->relocs[i].off),
-                          sym, R_X86_64_64, add);
+                          sym, target_reloc_type(ta, RK_ABS64), add);
         }
     }
 
@@ -452,8 +471,9 @@ static int compile(const char *in, const char *out, int pp_only)
                 w, tf->name, 0, 0,
                 ELF64_ST_INFO(tf->is_weak ? STB_WEAK : STB_GLOBAL,
                               STT_NOTYPE), SHN_UNDEF);
-        elfw_add_rela(w, text_ndx, (Elf64_Addr)fs[i].patch_off,
-                      tf->sym_ndx, R_X86_64_PC32, -4);
+        elfw_add_rela(w, text_ndx, (Elf64_Addr)fs[i].patch_off, tf->sym_ndx,
+                      target_reloc_type(ta, fs[i].kind),
+                      target_reloc_addend(ta, fs[i].kind, 0));
     }
     free(fs);
 
@@ -509,13 +529,32 @@ int main(int argc, char **argv)
         print_usage(stderr);
         return 1;
     }
-    if (strcmp(argv[1], "--version") == 0) {
-        print_version();
-        return 0;
+    /* Scanned ahead of everything else: --version and --dump-predef must
+     * describe the target that was asked for, not the default. */
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--target=", 9) != 0)
+            continue;
+        enum target_arch a;
+        if (!target_from_triple(argv[i] + 9, &a)) {
+            fprintf(stderr,
+                    "embcc: error: unknown target '%s' — EmbCC emits "
+                    "x86_64-elf and aarch64-elf\n", argv[i] + 9);
+            return 1;
+        }
+        target_set(a);
     }
-    if (strcmp(argv[1], "--dump-predef") == 0) {
-        dump_predef();
-        return 0;
+    /* Scanned across the whole command line, not just argv[1]: these
+     * describe the TARGET, so `--target=aarch64-elf --dump-predef` has to
+     * mean the aarch64 table rather than an unknown-argument error. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0) {
+            print_version();
+            return 0;
+        }
+        if (strcmp(argv[i], "--dump-predef") == 0) {
+            dump_predef();
+            return 0;
+        }
     }
     if (strcmp(argv[1], "--emit-empty-object") == 0) {
         if (argc != 3) {
@@ -526,7 +565,9 @@ int main(int argc, char **argv)
     }
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-c") == 0) {
+        if (strncmp(argv[i], "--target=", 9) == 0) {
+            /* already applied in the pre-scan above */
+        } else if (strcmp(argv[i], "-c") == 0) {
             compile_mode = 1;
         } else if (strcmp(argv[i], "-E") == 0) {
             pp_only = 1;
